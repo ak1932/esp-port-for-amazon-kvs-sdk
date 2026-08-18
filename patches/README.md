@@ -36,6 +36,7 @@ flow is now upstream (awslabs#2214, in 1.20.0).
 | 0001 | ESP-IDF platform adaptations + robustness — including the `PREFER_DYNAMIC_ALLOCS` / dynamic-signaling-payload work (heap-allocate the payload in `parseSignalingMessage`) and the IceAgent `turnChannelData` heap-allocation | mixed | partial: [awslabs#2146](https://github.com/awslabs/amazon-kinesis-video-streams-webrtc-sdk-c/pull/2146) for the dynamic-allocs portion |
 | 0002 | PeerConnection: cap peer Opus encoder at 16kHz mono via `DEFAULT_OPUS_FMTP` | ESP-specific | n/a — narrow-Opus negotiation keeps decode under the 20 ms frame budget on P4 |
 | 0003 | Ice: accept already-connected TCP in `socketConnectionIsConnected` (lwIP reports `EALREADY`, not `EISCONN`; use `getpeername`) | ESP-IDF/lwIP-specific | candidate — low-priority portability PR to upstream; drop if it lands |
+| 0004 | Crypto: gate `mbedtls_entropy_*` on `MBEDTLS_ENTROPY_C` and fall back to PSA (`psa_crypto_init` + `mbedtls_psa_get_random`) in DTLS/TLS sessions | portability | candidate — needed by any build with `MBEDTLS_PSA_CRYPTO_EXTERNAL_RNG` (all ESP-IDF v6 targets); PR to upstream |
 
 > **Not carried as patches:** the upstream `Network.c` uses POSIX `getifaddrs()`,
 > which ESP-IDF does not ship, so the ESP-IDF adaptation lives as a full port file
@@ -94,5 +95,6 @@ matching PRs land:
 | Local patch | Removed when |
 |-------------|--------------|
 | 0001 (aligned / dynamic-allocs half) | `awslabs#2146` merges |
+| 0004 | an equivalent entropy-module guard lands upstream |
 
 Keep this file up-to-date as patches are added, removed, or split.

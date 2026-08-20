@@ -1,0 +1,89 @@
+--- a/src/device/esp_video_usb_uvc_device.c
++++ b/src/device/esp_video_usb_uvc_device.c
+@@ -350,6 +350,20 @@
+     return ret;
+ }
+ 
++/* Last started UVC stream, so a caller outside this driver can ask the camera for a key
++ * frame. Passthrough streaming needs that: the camera's own key-frame interval can be
++ * many seconds, which leaves a joining viewer undecodable and makes loss recovery
++ * unbounded. */
++static uvc_host_stream_hdl_t s_active_stream_hdl;
++
++esp_err_t esp_video_uvc_request_key_frame(void)
++{
++    if (s_active_stream_hdl == NULL) {
++        return ESP_ERR_INVALID_STATE;
++    }
++    return uvc_host_stream_request_key_frame(s_active_stream_hdl);
++}
++
+ static esp_err_t uvc_video_start(struct esp_video *video, uint32_t type)
+ {
+     esp_err_t ret = ESP_OK;
+@@ -402,11 +416,31 @@
+         .format = device->uvc_stream_format,
+     };
+     ESP_GOTO_ON_ERROR(uvc_host_stream_format_select(device->stream_hdl, &uvc_format), fail1, TAG, "Failed to set UVC format");
++#if CONFIG_ESP_VIDEO_UVC_H264_BITRATE_BPS > 0
++    /* Bring the camera's own encoder into a range the uplink can carry, with a short
++     * key-frame period so a joining viewer gets something decodable quickly. Both live in
++     * the H.264 extension unit; cameras without it simply refuse and keep their defaults. */
++    if (uvc_host_stream_h264_set_rate(device->stream_hdl,
++                                      CONFIG_ESP_VIDEO_UVC_H264_BITRATE_BPS,
++                                      CONFIG_ESP_VIDEO_UVC_H264_IFRAME_PERIOD_MS) != ESP_OK) {
++        ESP_LOGW(TAG, "camera kept its own H.264 bitrate/GOP (no usable H.264 extension unit)");
++    }
++#endif
++
+     ESP_GOTO_ON_ERROR(uvc_host_stream_start(device->stream_hdl), fail1, TAG, "Failed to start UVC stream");
+ 
++    s_active_stream_hdl = device->stream_hdl;
++
++
++    /* First frames must be decodable on their own. */
++    if (uvc_host_stream_request_key_frame(device->stream_hdl) != ESP_OK) {
++        ESP_LOGD(TAG, "camera has no on-demand key-frame control");
++    }
++
+     return ESP_OK;
+ 
+ fail1:
++    s_active_stream_hdl = NULL;
+     uvc_host_stream_close(device->stream_hdl);
+     device->stream_hdl = NULL;
+ fail0:
+--- a/Kconfig
++++ b/Kconfig
+@@ -179,6 +179,31 @@
+ 
+     if ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
+ 
++        config ESP_VIDEO_UVC_H264_BITRATE_BPS
++            int "Bitrate to request from the camera's H.264 encoder (0 = leave alone)"
++            default 800000
++            help
++                Applied through the UVC H.264 extension unit at stream start. A camera left
++                to itself picks a rate independent of resolution (~3 Mbps observed), which a
++                constrained uplink cannot carry.
++
++        config ESP_VIDEO_UVC_H264_IFRAME_PERIOD_MS
++            int "Key-frame period to request from the camera (ms, 0 = leave alone)"
++            default 1000
++            help
++                Every key frame carries the parameter sets a decoder needs to start, so a
++                multi-second default leaves joining viewers blank and makes loss recovery
++                unbounded.
++
++        config ESP_VIDEO_UVC_H264_XU_UNIT_ID
++            hex "bUnitID of the camera's H.264 extension unit"
++            default 0x0c
++
++        config ESP_VIDEO_UVC_VC_INTERFACE
++            int "VideoControl interface number"
++            default 0
++
++
+         config USB_UVC_VIDEO_DEVICE_URB_SIZE
+             int "USB UVC Video Device URB Size"
+             default 10240

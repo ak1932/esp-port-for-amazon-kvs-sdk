@@ -1,0 +1,216 @@
+--- a/uvc_control.c
++++ b/uvc_control.c
+@@ -103,6 +103,171 @@
+     return ret;
+ }
+ 
++/* UVC H.264 Extension Unit (GUID A29E7641-DE04-47E3-8B2B-F4341AFF003B), as defined by
++ * the USB Video Class H.264 payload spec and implemented by H.264-capable UVC cameras.
++ * It is the only way to reach the camera's own encoder settings: bitrate and key-frame
++ * period. Without it a camera streams at whatever rate it likes (~3 Mbps measured, at
++ * every resolution) with a multi-second GOP, which no constrained uplink can carry and
++ * no viewer can start decoding. */
++#define UVCX_VIDEO_CONFIG_PROBE   0x01
++#define UVCX_VIDEO_CONFIG_COMMIT  0x02
++#define UVCX_PICTURE_TYPE_CONTROL 0x09
++
++#define UVCX_HINT_BITRATE         0x0002
++#define UVCX_HINT_IFRAME_PERIOD   0x2000
++
++typedef struct __attribute__((packed)) {
++    uint32_t dwFrameInterval;
++    uint32_t dwBitRate;
++    uint16_t bmHints;
++    uint16_t wConfigurationIndex;
++    uint16_t wWidth;
++    uint16_t wHeight;
++    uint16_t wSliceUnits;
++    uint16_t wSliceMode;
++    uint16_t wProfile;
++    uint16_t wIFramePeriod;
++    uint16_t wEstimatedVideoDelay;
++    uint16_t wEstimatedMaxConfigDelay;
++    uint8_t  bUsageType;
++    uint8_t  bRateControlMode;
++    uint8_t  bTemporalScaleMode;
++    uint8_t  bSpatialScaleMode;
++    uint8_t  bSNRScaleMode;
++    uint8_t  bStreamMuxOption;
++    uint8_t  bStreamFormat;
++    uint8_t  bEntropyCABAC;
++    uint8_t  bTimestamp;
++    uint8_t  bNumOfReorderFrames;
++    uint8_t  bPreviewFlipped;
++    uint8_t  bView;
++    uint8_t  bReserved1;
++    uint8_t  bReserved2;
++    uint8_t  bStreamID;
++    uint8_t  bSpatialLayerRatio;
++    uint16_t wLeakyBucketSize;
++} uvcx_video_config_t;
++
++static esp_err_t uvcx_xfer(uvc_host_stream_hdl_t stream_hdl, uint8_t unit_id, uint8_t vc_intf,
++                           uint8_t selector, enum uvc_req_code req, void *data, uint16_t len)
++{
++    uint8_t bmRequestType = USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_INTERFACE;
++    bmRequestType |= (req == UVC_SET_CUR) ? USB_BM_REQUEST_TYPE_DIR_OUT : USB_BM_REQUEST_TYPE_DIR_IN;
++
++    /* Unit controls address the VideoControl interface: wIndex carries the unit ID in the
++     * high byte, the interface number in the low byte. */
++    return uvc_host_usb_ctrl(stream_hdl, bmRequestType, (uint8_t) req,
++                             (uint16_t) selector << 8,
++                             ((uint16_t) unit_id << 8) | vc_intf,
++                             len, (uint8_t *) data);
++}
++
++/* GUID of the H.264 extension unit, little-endian as it appears in the descriptor. */
++static const uint8_t uvcx_h264_guid[16] = {
++    0x41, 0x76, 0x9e, 0xa2, 0x04, 0xde, 0xe3, 0x47,
++    0x8b, 0x2b, 0xf4, 0x34, 0x1a, 0xff, 0x00, 0x3b
++};
++
++/* Locate the H.264 extension unit by GUID rather than trusting a configured ID: unit
++ * numbering is per-camera, and this camera alone exposes six extension units. */
++static esp_err_t uvcx_find_h264_unit(const usb_config_desc_t *cfg_desc, uint8_t *unit_id, uint8_t *vc_intf)
++{
++    int offset = 0;
++    const usb_standard_desc_t *desc = (const usb_standard_desc_t *) cfg_desc;
++    uint8_t current_vc_intf = 0;
++
++    while ((desc = usb_parse_next_descriptor(desc, cfg_desc->wTotalLength, &offset)) != NULL) {
++        if (desc->bDescriptorType == USB_B_DESCRIPTOR_TYPE_INTERFACE) {
++            const usb_intf_desc_t *intf = (const usb_intf_desc_t *) desc;
++            if (intf->bInterfaceSubClass == UVC_SC_VIDEOCONTROL) {
++                current_vc_intf = intf->bInterfaceNumber;
++            }
++            continue;
++        }
++        if (desc->bDescriptorType != UVC_CS_INTERFACE || desc->bLength < 24) {
++            continue;
++        }
++        const uint8_t *raw = (const uint8_t *) desc;
++        if (raw[2] != UVC_VC_DESC_SUBTYPE_EXTENSION_UNIT) {
++            continue;
++        }
++        /* Layout: bLength, bDescriptorType, bDescriptorSubType, bUnitID, guid[16]... */
++        if (memcmp(&raw[4], uvcx_h264_guid, sizeof(uvcx_h264_guid)) == 0) {
++            *unit_id = raw[3];
++            *vc_intf = current_vc_intf;
++            return ESP_OK;
++        }
++    }
++    return ESP_ERR_NOT_FOUND;
++}
++
++esp_err_t uvc_host_stream_h264_set_rate(uvc_host_stream_hdl_t stream_hdl, uint32_t bitrate_bps,
++                                        uint16_t iframe_period_ms)
++{
++    UVC_CHECK(stream_hdl != NULL, ESP_ERR_INVALID_ARG);
++    uvc_stream_t *uvc_stream = (uvc_stream_t *) stream_hdl;
++    const usb_config_desc_t *cfg_desc;
++    uint8_t unit_id = 0, vc_intf = 0;
++    uvcx_video_config_t cfg = {0};
++
++    ESP_RETURN_ON_ERROR(usb_host_get_active_config_descriptor(uvc_stream->constant.dev_hdl, &cfg_desc),
++                        TAG, "Could not read the configuration descriptor");
++    ESP_RETURN_ON_ERROR(uvcx_find_h264_unit(cfg_desc, &unit_id, &vc_intf),
++                        TAG, "No H.264 extension unit on this camera");
++    ESP_LOGI(TAG, "H.264 extension unit: bUnitID %u on VideoControl interface %u", unit_id, vc_intf);
++
++    /* Read what the camera is doing now, change only what we care about, then probe so it
++     * can clamp our values, and commit whatever it agreed to. */
++    ESP_RETURN_ON_ERROR(uvcx_xfer(stream_hdl, unit_id, vc_intf, UVCX_VIDEO_CONFIG_PROBE,
++                                  UVC_GET_CUR, &cfg, sizeof(cfg)),
++                        TAG, "H.264 XU not readable (camera may not implement it)");
++
++    ESP_LOGI(TAG, "camera H.264 config: %ux%u, %" PRIu32 " bps, IFramePeriod %u ms, rc_mode %u",
++             cfg.wWidth, cfg.wHeight, cfg.dwBitRate, cfg.wIFramePeriod, cfg.bRateControlMode);
++
++    if (bitrate_bps) {
++        cfg.dwBitRate = bitrate_bps;
++        cfg.bmHints |= UVCX_HINT_BITRATE;
++    }
++    if (iframe_period_ms) {
++        cfg.wIFramePeriod = iframe_period_ms;
++        cfg.bmHints |= UVCX_HINT_IFRAME_PERIOD;
++    }
++
++    ESP_RETURN_ON_ERROR(uvcx_xfer(stream_hdl, unit_id, vc_intf, UVCX_VIDEO_CONFIG_PROBE,
++                                  UVC_SET_CUR, &cfg, sizeof(cfg)),
++                        TAG, "H.264 XU probe rejected");
++    ESP_RETURN_ON_ERROR(uvcx_xfer(stream_hdl, unit_id, vc_intf, UVCX_VIDEO_CONFIG_PROBE,
++                                  UVC_GET_CUR, &cfg, sizeof(cfg)),
++                        TAG, "H.264 XU probe read-back failed");
++    ESP_RETURN_ON_ERROR(uvcx_xfer(stream_hdl, unit_id, vc_intf, UVCX_VIDEO_CONFIG_COMMIT,
++                                  UVC_SET_CUR, &cfg, sizeof(cfg)),
++                        TAG, "H.264 XU commit rejected");
++
++    ESP_LOGI(TAG, "camera H.264 committed: %" PRIu32 " bps, IFramePeriod %u ms",
++             cfg.dwBitRate, cfg.wIFramePeriod);
++    return ESP_OK;
++}
++
++esp_err_t uvc_host_stream_request_key_frame(uvc_host_stream_hdl_t stream_hdl)
++{
++    UVC_CHECK(stream_hdl != NULL, ESP_ERR_INVALID_ARG);
++    uvc_stream_t *uvc_stream = (uvc_stream_t *)stream_hdl;
++
++    /* UVC 1.5 A.9.8: a one-byte SET_CUR of the VideoStreaming Generate Key Frame
++     * control asks the camera to emit a key frame now (value 1). Cameras with long
++     * default GOPs otherwise leave a joining viewer waiting seconds for an IDR - and
++     * on a lossy link the rare large IDR may never arrive intact at all. */
++    uint8_t generate = 1;
++    const uint8_t bmRequestType = USB_BM_REQUEST_TYPE_TYPE_CLASS | USB_BM_REQUEST_TYPE_RECIP_INTERFACE |
++                                  USB_BM_REQUEST_TYPE_DIR_OUT;
++
++    return uvc_host_usb_ctrl(stream_hdl, bmRequestType, UVC_SET_CUR,
++                             UVC_VS_GENERATE_KEY_FRAME_CONTROL << 8,
++                             uvc_stream->constant.bInterfaceNumber,
++                             sizeof(generate), &generate);
++}
++
+ static inline esp_err_t uvc_control_probe_set(uvc_host_stream_hdl_t stream_hdl, uvc_vs_ctrl_t *vs_control, const uvc_host_stream_format_t *vs_format)
+ {
+     return uvc_host_stream_control(stream_hdl, vs_control, (uvc_host_stream_format_t *)vs_format, UVC_SET_CUR, false);
+--- a/include/usb/uvc_host.h
++++ b/include/usb/uvc_host.h
+@@ -305,6 +305,39 @@
+  *     - ESP_ERR_INVALID_ARG: stream_hdl is NULL
+  *     - Else: USB lib error
+  */
++/**
++ * @brief Ask the camera to emit a key frame now
++ *
++ * Issues the UVC VideoStreaming Generate Key Frame control. Useful when a viewer joins
++ * mid-GOP or after packet loss: without it, recovery is bounded by the camera's own
++ * (often multi-second) key-frame interval.
++ *
++ * @param[in] stream_hdl UVC handle obtained from uvc_host_stream_open()
++ * @return
++ *     - ESP_OK: key frame requested
++ *     - ESP_ERR_INVALID_ARG: invalid handle
++ *     - ESP_ERR_NOT_SUPPORTED / ESP_ERR_INVALID_RESPONSE: camera rejected the control
++ */
++/**
++ * @brief Set bitrate and key-frame period on a camera's own H.264 encoder
++ *
++ * Uses the UVC H.264 Extension Unit (GUID A29E7641-DE04-47E3-8B2B-F4341AFF003B). Needed
++ * when passing the camera's H.264 through: otherwise the camera picks its own bitrate and
++ * a multi-second key-frame interval, which a constrained uplink cannot carry and a joining
++ * viewer cannot start decoding.
++ *
++ * The unit is located by its GUID, so no per-camera configuration is needed.
++ *
++ * @param[in] stream_hdl       UVC handle obtained from uvc_host_stream_open()
++ * @param[in] bitrate_bps      Target bitrate, 0 to leave unchanged
++ * @param[in] iframe_period_ms Key-frame period in ms, 0 to leave unchanged
++ * @return ESP_OK if the camera committed the configuration
++ */
++esp_err_t uvc_host_stream_h264_set_rate(uvc_host_stream_hdl_t stream_hdl, uint32_t bitrate_bps,
++                                        uint16_t iframe_period_ms);
++
++esp_err_t uvc_host_stream_request_key_frame(uvc_host_stream_hdl_t stream_hdl);
++
+ esp_err_t uvc_host_stream_stop(uvc_host_stream_hdl_t stream_hdl);
+ 
+ /**

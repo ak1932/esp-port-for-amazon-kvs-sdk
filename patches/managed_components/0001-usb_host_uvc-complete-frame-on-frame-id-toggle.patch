@@ -1,0 +1,37 @@
+--- a/uvc_isoc.c
++++ b/uvc_isoc.c
+@@ -139,11 +139,30 @@
+                     goto next_isoc_packet;
+                 }
+             } else {
+-                // We received SoF but current_frame is not NULL: We missed EoF - reset the frame buffer
+-                ESP_EARLY_LOGW(TAG, "missed EoF");
+-                uvc_stream->single_thread.skip_current_frame = true;
+-                uvc_frame_reset(uvc_stream->dynamic.current_frame);
++                /* SoF with a frame still open: this camera never sets the EoF bit, so
++                 * treat the frame-ID toggle as the frame boundary and hand the frame we
++                 * already have to the user, instead of discarding a complete frame. */
++                uvc_host_frame_t *this_frame = uvc_stream->dynamic.current_frame;
++                uvc_stream->dynamic.current_frame = NULL;
++                const bool invoke_fb_callback = (uvc_stream->dynamic.streaming && uvc_stream->constant.frame_cb &&
++                                                 this_frame && !uvc_stream->single_thread.skip_current_frame);
+                 UVC_EXIT_CRITICAL();
++
++                bool return_frame = true;
++                if (invoke_fb_callback) {
++                            return_frame = uvc_stream->constant.frame_cb(this_frame, uvc_stream->constant.cb_arg);
++                }
++                if (return_frame && this_frame) {
++                    uvc_host_frame_return(uvc_stream, this_frame);
++                }
++
++                /* Start a fresh frame for the payload that triggered this SoF. */
++                uvc_stream->single_thread.skip_current_frame = payload_header->bmHeaderInfo.error;
++                uvc_stream->dynamic.current_frame = uvc_frame_get_empty(uvc_stream);
++                if (uvc_stream->dynamic.current_frame == NULL) {
++                    uvc_stream->single_thread.skip_current_frame = true;
++                    goto next_isoc_packet;
++                }
+             }
+         }
+ 

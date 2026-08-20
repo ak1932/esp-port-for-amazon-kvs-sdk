@@ -10,3 +10,7 @@ __pycache__/
 *.pem
 *.key
 !**/cacert.pem
+
+# ...but the patches we carry for those components are source, not generated output.
+!patches/managed_components/
+!patches/managed_components/**

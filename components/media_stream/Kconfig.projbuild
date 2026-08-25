@@ -4,6 +4,7 @@ menu "Media Stream Configuration"
             bool "Use ESP Video Interface"
             default y if IDF_TARGET_ESP32P4
             default y if IDF_TARGET_ESP32S3
+            default y if IDF_TARGET_ESP32S31
             help
                 Use ESP Video Interface for video capture.
 

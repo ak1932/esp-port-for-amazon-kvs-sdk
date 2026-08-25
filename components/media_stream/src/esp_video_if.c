@@ -13,7 +13,8 @@
  * (S3 uses DVP, not CSI). Compile to empty on non-P4 — callers
  * already gate their use of esp_video_if_* behind
  * CONFIG_IDF_TARGET_ESP32P4 in MJPEGFrameGrabber / video_capture_adapter. */
-#if CONFIG_IDF_TARGET_ESP32P4
+#include "media_stream_caps.h"
+#if MEDIA_STREAM_HAS_ESP_VIDEO_CAPTURE
 
 #if !CONFIG_BSP_SELECT_NONE
 #include "bsp/esp-bsp.h"
@@ -1529,4 +1530,8 @@ esp_err_t esp_video_if_cleanup(void)
     return ESP_OK;
 }
 
-#endif /* CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32S3 */
+/* esp_video_uvc_request_key_frame() is deliberately not defined here.
+ * and is brought through a patch on esp_video
+ */
+
+#endif /* MEDIA_STREAM_HAS_ESP_VIDEO_CAPTURE */

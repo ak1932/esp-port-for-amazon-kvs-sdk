@@ -19,7 +19,7 @@ dependencies:
   # bump has to pin esp_audio_codec below 2.6.0 (see its `matches` rule) and be
   # re-validated on P4 hardware.
   espressif/esp_video:
-    version: "~2.0.1"
+    version: "~2.4.1"
     rules:
       - if: "target not in [esp32]"
 

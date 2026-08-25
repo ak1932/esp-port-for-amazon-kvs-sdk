@@ -1128,7 +1128,17 @@ static VOID onIceCandidateHandler(UINT64 customData, PCHAR candidateJson)
             ice_msg.payload_len = (UINT32)STRLEN(candidateJson);
             ice_msg.correlation_id[0] = '\0';
 
+            /* At DEBUG: the local candidate types we manage to gather and trickle out
+             * (host / srflx / relay) are the fastest way to tell a host-only session
+             * from a fully gathered one, but that only matters when something is wrong.
+             * Raise the kvs_webrtc tag to DEBUG to see them. */
+            ESP_LOGD(TAG, "Local ICE candidate trickled to peer %s: %.*s%s", session->peer_id,
+                     96, candidateJson, STRLEN(candidateJson) > 96 ? "..." : "");
+
             session->on_message_received(session->custom_data, &ice_msg);
+        } else {
+            ESP_LOGD(TAG, "Local ICE candidate NOT sent to peer %s (trickle disabled on %s side)",
+                     session->peer_id, session->is_initiator ? "local" : "remote");
         }
     }
 
@@ -2088,7 +2098,7 @@ static STATUS kvs_handleRemoteCandidate(kvs_pc_session_t* session, webrtc_messag
     CHK(session != NULL && message != NULL, STATUS_NULL_ARG);
     CHK(message->message_type == WEBRTC_MESSAGE_TYPE_ICE_CANDIDATE, STATUS_INVALID_ARG);
 
-    ESP_LOGD(TAG, "Handling ICE candidate from peer: %s", session->peer_id);
+    ESP_LOGD(TAG, "Remote ICE candidate from peer %s", session->peer_id);
 
     MEMSET(&iceCandidate, 0x00, SIZEOF(RtcIceCandidateInit));
 
@@ -2096,7 +2106,7 @@ static STATUS kvs_handleRemoteCandidate(kvs_pc_session_t* session, webrtc_messag
     CHK_STATUS(deserializeRtcIceCandidateInit(message->payload, message->payload_len, &iceCandidate));
 
     if (iceCandidate.candidate[0] == '\0') {
-        ESP_LOGD(TAG, "Ignoring empty ICE candidate");
+        ESP_LOGD(TAG, "Remote ICE candidate ignored: empty (end-of-candidates)");
         CHK(FALSE, STATUS_SUCCESS);
     }
 
@@ -2107,21 +2117,27 @@ static STATUS kvs_handleRemoteCandidate(kvs_pc_session_t* session, webrtc_messag
         CHK(FALSE, STATUS_SUCCESS);
     }
 
-    // Skip TCP candidates – ESP flow typically uses UDP only
-    if (STRSTR(iceCandidate.candidate, " tcp ") != NULL) {
-        ESP_LOGD(TAG, "Skipping TCP ICE candidate");
-        CHK(FALSE, STATUS_SUCCESS);
-    }
-
-    // Ensure UDP appears as protocol token
-    if (STRSTR(iceCandidate.candidate, " udp ") == NULL) {
-        ESP_LOGD(TAG, "Skipping non-UDP ICE candidate");
-        CHK(FALSE, STATUS_SUCCESS);
-    }
-
-    // Add the candidate
+    /* Do NOT pre-filter on the transport token here.
+     *
+     * There used to be `STRSTR(candidate, " tcp ")` / `STRSTR(candidate, " udp ")`
+     * checks in this spot. RFC 5245 spells the transport in the candidate attribute
+     * as the *uppercase* "UDP" in its ABNF, and real viewers do send it that way
+     * (mobile stacks in particular), so a case-sensitive search for " udp " rejected
+     * every candidate a peer offered - all of them, silently, leaving ICE with no
+     * remote candidates at all and failing with STATUS_ICE_NO_CONNECTED_CANDIDATE_PAIR.
+     *
+     * The filter was also redundant: parseIceCandidateString() inside
+     * iceAgentAddRemoteCandidate() already compares the token with STRNCMPI() and
+     * rejects TCP itself with STATUS_ICE_CANDIDATE_STRING_IS_TCP, which the SDK
+     * deliberately does not treat as an error. Let it do the parsing. */
     {
         STATUS s = addIceCandidate(session->peer_connection, iceCandidate.candidate);
+        if (s == STATUS_ICE_CANDIDATE_STRING_IS_TCP) {
+            /* Expected and harmless: this port only gathers UDP locally, so a TCP
+             * remote candidate could not pair with anything anyway. */
+            ESP_LOGD(TAG, "Remote ICE candidate skipped: TCP transport");
+            CHK(FALSE, STATUS_SUCCESS);
+        }
         if (STATUS_FAILED(s)) {
             ESP_LOGE(TAG, "addIceCandidate failed: 0x%08" PRIx32 " for '%.*s%s'", (UINT32) s,
                      64, iceCandidate.candidate,
@@ -2130,7 +2146,12 @@ static STATUS kvs_handleRemoteCandidate(kvs_pc_session_t* session, webrtc_messag
             goto CleanUp;
         }
     }
-    ESP_LOGD(TAG, "Added ICE candidate OK");
+    /* At DEBUG. With the SDK logger at WARN this is the only evidence that a remote
+     * candidate ever arrived, so raise the kvs_webrtc tag to DEBUG when diagnosing an
+     * ICE failure - silence here is otherwise indistinguishable from "the viewer sent
+     * nothing". */
+    ESP_LOGD(TAG, "Remote ICE candidate added: %.*s%s", 96, iceCandidate.candidate,
+             STRLEN(iceCandidate.candidate) > 96 ? "..." : "");
 
 CleanUp:
     return retStatus;

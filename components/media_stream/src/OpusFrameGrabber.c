@@ -28,8 +28,14 @@ static volatile bool s_mic_muted = false;  /* TEMP: was true (push-to-talk via G
 
 #if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4
 #if CONFIG_IDF_TARGET_ESP32P4
-#include "bsp/esp-bsp.h"
+/* esp_codec_dev is its own component, needed whatever the board:
+ * esp_codec_dev_handle_t and esp_codec_dev_read() are used throughout below. */
 #include "esp_codec_dev.h"
+#endif
+/* A BSP that describes no board declares no codec symbols - same guard as
+ * OpusAudioPlayer.c / media_stream.c. */
+#if CONFIG_IDF_TARGET_ESP32P4 && !CONFIG_BSP_SELECT_ESP_BSP_DEVKIT
+#include "bsp/esp-bsp.h"
 #endif
 
 /* Mic open rate. Must match the Opus encoder's sample_rate passed in via
@@ -428,6 +434,14 @@ void *opus_encoder_init_internal(audio_capture_config_t *config)
 
     // Initialize audio hardware
 #if CONFIG_IDF_TARGET_ESP32P4
+/* The mic is opened through the board's codec wiring, so a BSP that describes no
+ * board has no way in - esp_bsp_devkit declares no bsp_audio_codec_* at all. Note
+ * this cannot fall through to the #else below - that is the ESP32-S3 i2s_init()
+ * path. */
+#if CONFIG_BSP_SELECT_ESP_BSP_DEVKIT
+    ESP_LOGE(TAG, "the selected BSP has no audio codec: microphone unavailable");
+    goto cleanup;
+#else
     if (mic_codec_dev == NULL) {
         /* bsp_audio_codec_microphone_init() runs bsp_i2c_init() internally
          * (idempotent); media_stream_init() also brings the bus up once before
@@ -490,7 +504,8 @@ void *opus_encoder_init_internal(audio_capture_config_t *config)
             NULL, I2S_READ_TASK_PRIO,
             s_enc_data.i2s_read_task_stack, s_enc_data.i2s_read_task_buffer);
     }
-#else
+#endif /* CONFIG_BSP_SELECT_ESP_BSP_DEVKIT */
+#else /* !CONFIG_IDF_TARGET_ESP32P4 */
     i2s_init();
 #endif
 

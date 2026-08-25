@@ -25,7 +25,7 @@
  * so the header is missing on c-series builds. BSP_CAPS_* macros it
  * defines fall through to undefined (= 0), correctly disabling the
  * codec/display blocks below. */
-#if !CONFIG_IDF_TARGET_ESP32C5 && !CONFIG_IDF_TARGET_ESP32C6
+#if !CONFIG_BSP_SELECT_ESP_BSP_DEVKIT && !CONFIG_IDF_TARGET_ESP32C5 && !CONFIG_IDF_TARGET_ESP32C6
 #include "bsp/esp-bsp.h"
 #if CONFIG_IDF_TARGET_ESP32P4
 #include "esp_codec_dev.h"

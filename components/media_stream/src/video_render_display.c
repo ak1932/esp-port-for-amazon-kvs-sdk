@@ -28,7 +28,10 @@
  * NO-PLAYER stub branch (selected via
  * CONFIG_MEDIA_STREAM_ENABLE_VIDEO_PLAYER=n) never calls the symbols
  * defined below. */
-#if CONFIG_MEDIA_STREAM_ENABLE_VIDEO_PLAYER
+/* !BSP_SELECT_ESP_BSP_DEVKIT is redundant with the Kconfig `depends on` but kept
+ * explicit: every bsp_display_* call below needs a board, and a hand-edited
+ * sdkconfig can still set the player symbol. */
+#if CONFIG_MEDIA_STREAM_ENABLE_VIDEO_PLAYER && !CONFIG_BSP_SELECT_ESP_BSP_DEVKIT
 
 #include <inttypes.h>
 #include <stdlib.h>
@@ -637,4 +640,4 @@ void video_render_display_deinit(video_render_display_handle_t handle)
     heap_caps_free(handle);
 }
 
-#endif /* CONFIG_IDF_TARGET_ESP32P4 */
+#endif /* CONFIG_MEDIA_STREAM_ENABLE_VIDEO_PLAYER && !CONFIG_BSP_SELECT_ESP_BSP_DEVKIT */

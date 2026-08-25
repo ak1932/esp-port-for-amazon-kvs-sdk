@@ -111,7 +111,9 @@ idf.py --preview -D "SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.defaults.es
 idf.py --preview build flash monitor
 ```
 
-The S31 has no BSP (`CONFIG_BSP_SELECT_NONE=y`), no MIPI-CSI camera, and no H.264
+The S31 has no board BSP of its own — it takes the generic `esp_bsp_devkit`
+(`CONFIG_BSP_SELECT_ESP_BSP_DEVKIT=y`, NoGLIB, `BSP_ERROR_CHECK=n`, and no I2C pins:
+nothing on this board needs that bus) — no MIPI-CSI camera, and no H.264
 encoder or ISP at all. Its overlay selects a **USB-UVC camera that emits H.264
 itself**, forwarded to both sinks without re-encoding — `CONFIG_ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE=y`
 plus `CONFIG_MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR=y` (both needed; the second

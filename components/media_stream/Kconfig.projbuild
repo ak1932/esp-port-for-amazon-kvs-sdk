@@ -496,7 +496,7 @@ menu "Media Stream Configuration"
                             cause issues with some sensors or longer cable connections.
                 endif
 
-                if BSP_SELECT_NONE
+                if BSP_SELECT_ESP_BSP_DEVKIT
                     config MEDIA_STREAM_MIPI_CSI_SCCB_I2C_SCL_PIN
                         int "SCCB(I2C) SCL Pin"
                         default 8
@@ -658,7 +658,7 @@ menu "Media Stream Configuration"
                         - 20000000 Hz (20MHz): Standard for most DVP sensors
                         - 24000000 Hz (24MHz): Alternative for some sensors
 
-                if BSP_SELECT_NONE
+                if BSP_SELECT_ESP_BSP_DEVKIT
                     config MEDIA_STREAM_DVP_SCCB_I2C_SCL_PIN
                         int "SCCB(I2C) SCL Pin"
                         default 8 if IDF_TARGET_ESP32P4
@@ -952,7 +952,7 @@ menu "Media Stream Configuration"
                             LEDC timer channel for camera clock output.
                 endif
 
-                if BSP_SELECT_NONE
+                if BSP_SELECT_ESP_BSP_DEVKIT
                     config MEDIA_STREAM_SPI_CAM_0_SCCB_I2C_SCL_PIN
                         int "SCCB(I2C) SCL Pin"
                         default 8 if IDF_TARGET_ESP32P4
@@ -1344,7 +1344,7 @@ menu "Media Stream Configuration"
                             LEDC timer channel for camera clock output.
                 endif
 
-                if BSP_SELECT_NONE
+                if BSP_SELECT_ESP_BSP_DEVKIT
                     config MEDIA_STREAM_SPI_CAM_1_SCCB_I2C_SCL_PIN
                         int "SCCB(I2C) SCL Pin"
                         default 5 if IDF_TARGET_ESP32P4
@@ -1425,7 +1425,7 @@ menu "Media Stream Configuration"
 
         menuconfig MEDIA_STREAM_SCCB_I2C_INIT_BY_APP
             bool "Use Pre-initialized SCCB(I2C) Bus for All Camera Sensors And Motors"
-            default y if !BSP_SELECT_NONE
+            default y if !BSP_SELECT_ESP_BSP_DEVKIT
             help
                 Enable this option to use an I2C bus that has been explicitly
                 initialized by your application before camera initialization.
@@ -1460,7 +1460,7 @@ menu "Media Stream Configuration"
                 range 0 30 if IDF_TARGET_ESP32C6
                 range 0 29 if IDF_TARGET_ESP32C61
                 range 0 28 if IDF_TARGET_ESP32C5
-                depends on BSP_SELECT_NONE
+                depends on BSP_SELECT_ESP_BSP_DEVKIT
                 help
                     GPIO pin for I2C clock signal to all camera sensors and motors.
 
@@ -1474,7 +1474,7 @@ menu "Media Stream Configuration"
                 range 0 30 if IDF_TARGET_ESP32C6
                 range 0 29 if IDF_TARGET_ESP32C61
                 range 0 28 if IDF_TARGET_ESP32C5
-                depends on BSP_SELECT_NONE
+                depends on BSP_SELECT_ESP_BSP_DEVKIT
                 help
                     GPIO pin for I2C data signal to all camera sensors and motors.
         endif
@@ -1532,7 +1532,7 @@ menu "Media Stream Configuration"
             # (bsp_display_start + lvgl.h), which only the GLIB BSP variants
             # provide — with a NoGLIB BSP the player has nothing to draw on,
             # so it must drop out of the build instead of failing to compile.
-            depends on IDF_TARGET_ESP32P4 && BSP_SELECT_GLIB
+            depends on IDF_TARGET_ESP32P4 && BSP_SELECT_GLIB && !BSP_SELECT_ESP_BSP_DEVKIT
             default y
             help
                 Enable the video player in media_stream so the device can

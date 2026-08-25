@@ -2,11 +2,12 @@
 
 #include "sdkconfig.h"
 
-/* Board camera pins now come from the selected BSP (bsp_camera_start owns
- * reset/pwdn/xclk/power). Only the no-BSP case needs a static pin table, which
- * lives in the customized board header — edit it for a bare/custom board. The
- * interface-common macros below (device path, SCCB freq) are board-agnostic. */
-#if CONFIG_BSP_SELECT_NONE
+/* Board camera pins come from the selected BSP (bsp_camera_start owns
+ * reset/pwdn/xclk/power). A BSP that describes no board has no camera to start, so
+ * that case needs a static pin table, which lives in the customized board header —
+ * edit it for a bare/custom board. The interface-common macros below (device path,
+ * SCCB freq) are board-agnostic. */
+#if CONFIG_BSP_SELECT_ESP_BSP_DEVKIT
 #include "boards/customized/example_video_common_board.h"
 #endif
 

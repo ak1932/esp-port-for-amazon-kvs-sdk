@@ -14,11 +14,11 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "media_stream.h"
-/* bsp_selector is gated to `target not in [esp32c5, esp32c6]` in
- * idf_component.yml — the header is missing on c-series builds. The
- * sole use of a BSP symbol (bsp_i2c_init at l.680) is already inside
- * a `#if CONFIG_IDF_TARGET_ESP32P4 && !CONFIG_BSP_SELECT_NONE` gate. */
-#if !CONFIG_IDF_TARGET_ESP32C5 && !CONFIG_IDF_TARGET_ESP32C6
+/* esp_bsp_devkit is the generic BSP for a board with no BSP of its own - it has no
+ * codec and no display. The c-series is excluded separately: bsp_selector is not a
+ * dependency there at all, so bsp/esp-bsp.h does not exist and no BSP_SELECT_* symbol
+ * is defined. */
+#if !CONFIG_BSP_SELECT_ESP_BSP_DEVKIT && !CONFIG_IDF_TARGET_ESP32C5 && !CONFIG_IDF_TARGET_ESP32C6
 #include "bsp/esp-bsp.h"
 #endif
 #include "driver/i2c_master.h"
@@ -676,17 +676,23 @@ esp_err_t media_stream_init(video_capture_handle_t *video_handle, audio_capture_
         .codec_specific = NULL
     };
 
-#if CONFIG_IDF_TARGET_ESP32P4 && !CONFIG_BSP_SELECT_NONE
+#if CONFIG_IDF_TARGET_ESP32P4 && !CONFIG_BSP_SELECT_ESP_BSP_DEVKIT
     /* Bring the BSP I2C bus up once, here. Camera SCCB (via
      * bsp_i2c_get_handle()) and the ES8311 codec init both share this bus,
      * and the BSP's own bsp_i2c_init() is idempotent — letting the BSP own
      * the bus avoids the previous wrapper, which tried to second-guess
      * pull-up / handle state and ended up racing with the codec init at
-     * session start. */
+     * session start.
+     *
+     * Not fatal. A BSP whose I2C pins are left unset answers ESP_ERR_INVALID_ARG here,
+     * and that is a legitimate board: a UVC camera carries its own control channel over
+     * USB and needs no SCCB at all. Whatever does need the bus - the codec, an SCCB
+     * sensor - fails later with a message about itself, which is the more useful place
+     * to find out. */
     ret = bsp_i2c_init();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "bsp_i2c_init failed: %s", esp_err_to_name(ret));
-        return ret;
+        ESP_LOGW(TAG, "bsp_i2c_init failed (%s); continuing without the board I2C bus",
+                 esp_err_to_name(ret));
     }
 #endif
 

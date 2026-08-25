@@ -120,6 +120,13 @@ CONFIG_ESP_VIDEO_UVC_H264_IFRAME_PERIOD_MS=1000
 # CONFIG_ESP_VIDEO_IF_VERBOSE_DRIVER_LOGS=y
 # CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
 
-# There is no BSP for the S31, so nothing else configures the board.
-CONFIG_BSP_SELECT_NONE=y
+# The S31 has no board of its own. Take esp_bsp_devkit - the one BSP with no target
+# dependency - rather than BSP_SELECT_NONE, which makes bsp_selector's CMakeLists
+# FATAL_ERROR out. NoGLIB because there is no display, and BSP_ERROR_CHECK off so the
+# devkit's init functions return an error instead of aborting: its pin assignments
+# default to -1, which is precisely the "this board has no such peripheral" case, and
+# it has to be survivable at runtime rather than fatal.
+CONFIG_BSP_SELECT_ESP_BSP_DEVKIT=y
+CONFIG_BSP_SELECT_GLIB=n
+CONFIG_BSP_ERROR_CHECK=n
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=4096

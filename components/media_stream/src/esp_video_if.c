@@ -16,7 +16,7 @@
 #include "media_stream_caps.h"
 #if MEDIA_STREAM_HAS_ESP_VIDEO_CAPTURE
 
-#if !CONFIG_BSP_SELECT_NONE
+#if !CONFIG_BSP_SELECT_ESP_BSP_DEVKIT
 #include "bsp/esp-bsp.h"
 #endif
 #include <assert.h>
@@ -1021,7 +1021,7 @@ esp_err_t esp_video_if_start(void)
  * also sits on, so esp_video must not own it. Without a BSP there is nobody
  * else to open it, so we do, from the pins the board header exports. */
 #if CONFIG_MEDIA_STREAM_SCCB_I2C_INIT_BY_APP
-#if !CONFIG_BSP_SELECT_NONE
+#if !CONFIG_BSP_SELECT_ESP_BSP_DEVKIT
 #define SCCB_I2C_HANDLE()   bsp_i2c_get_handle()
 #else
 static i2c_master_bus_handle_t s_sccb_i2c_handle;
@@ -1030,7 +1030,7 @@ static i2c_master_bus_handle_t s_sccb_i2c_handle;
 
 static esp_err_t sccb_i2c_bus_init(void)
 {
-#if !CONFIG_BSP_SELECT_NONE
+#if !CONFIG_BSP_SELECT_ESP_BSP_DEVKIT
     /* media_stream_init() already brought the BSP I2C bus up; bsp_i2c_init()
      * itself is idempotent, so call it again defensively in case this path
      * is reached without media_stream_init() running first. */
@@ -1125,10 +1125,10 @@ static esp_err_t esp_video_hw_init(void)
 #endif
 
 /* The pin-based CSI config only compiles when Kconfig defines the pins, which it does
- * only under BSP_SELECT_NONE (Kconfig.projbuild: `if BSP_SELECT_NONE`). With a BSP
- * selected the board owns power, reset, XCLK and SCCB, and bsp_camera_start() below
- * performs the bring-up instead. */
-#if MEDIA_STREAM_ENABLE_MIPI_CSI_CAM_SENSOR && CONFIG_BSP_SELECT_NONE
+ * only when the BSP describes no board (Kconfig.projbuild: `if BSP_SELECT_ESP_BSP_DEVKIT`).
+ * With a real board BSP the board owns power, reset, XCLK and SCCB, and
+ * bsp_camera_start() below performs the bring-up instead. */
+#if MEDIA_STREAM_ENABLE_MIPI_CSI_CAM_SENSOR && CONFIG_BSP_SELECT_ESP_BSP_DEVKIT
     const esp_video_init_csi_config_t csi_config = {
         .sccb_config = {
 #if !CONFIG_MEDIA_STREAM_SCCB_I2C_INIT_BY_APP
@@ -1313,7 +1313,7 @@ static esp_err_t esp_video_hw_init(void)
 #endif /* MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR */
 
     const esp_video_init_config_t cam_config = {
-#if MEDIA_STREAM_ENABLE_MIPI_CSI_CAM_SENSOR && CONFIG_BSP_SELECT_NONE
+#if MEDIA_STREAM_ENABLE_MIPI_CSI_CAM_SENSOR && CONFIG_BSP_SELECT_ESP_BSP_DEVKIT
         .csi = &csi_config,
 #if MEDIA_STREAM_ENABLE_MIPI_CSI_CAM_MOTOR
         .cam_motor = &cam_motor_config,
@@ -1342,7 +1342,7 @@ static esp_err_t esp_video_hw_init(void)
      * be undone — so a retry must never call it again. */
     s_esp_video_registered = true;
 
-#if !CONFIG_BSP_SELECT_NONE && !MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR
+#if !CONFIG_BSP_SELECT_ESP_BSP_DEVKIT && !MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR
     /* BSP path: the selected board's BSP owns the camera pins, power and XCLK and
      * registers the CSI sensor with esp_video itself. Boards whose camera enable sits
      * behind an I2C IO expander (M5Stack Tab5) or a power switch (P4-EYE) only come up

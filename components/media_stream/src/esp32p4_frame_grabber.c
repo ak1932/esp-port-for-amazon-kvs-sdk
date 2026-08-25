@@ -35,7 +35,11 @@
 #include "video_rate_ctrl.h"
 #include "esp_video_if_cam_sel.h"   /* MEDIA_STREAM_ENABLE_*_CAM_SENSOR selection */
 
+#if !CONFIG_BSP_SELECT_ESP_BSP_DEVKIT
+/* Only the legacy (non-esp_video) camera path and the SDCARD_SAVE debug hook call
+ * bsp_*, and a BSP that describes no board does not define them. */
 #include "bsp/esp-bsp.h"
+#endif
 #if !USE_ESP_VIDEO_IF
 /* Old camera API path - only available with local component override */
 /* Define camera clock rate constants if not using esp_video_if */
@@ -49,20 +53,26 @@
 /* This path requires local component override */
 #include "bsp/camera.h"
 #endif
+/* Kept above the #if below, which would otherwise be evaluated before the define
+ * exists and leave the debug hook without its driver headers. */
+#define H264_ENCODE     1
+// #define SDCARD_SAVE     1
+
+#if SDCARD_SAVE
+/* Only the SDCARD_SAVE debug hook mounts a card; the sdmmc driver is not a
+ * dependency of this component on every target. */
 #include "sdmmc_cmd.h"
 #include "driver/sdmmc_host.h"
+#endif
 
 #include "webrtc_mem_utils.h"
 #include "video_capture.h"
 #include "video_sink_priv.h"
-#include "esp_h264_alloc.h"
 #if USE_ESP_VIDEO_IF
 #include "esp_video_if.h"
 #endif
 
 static const char *TAG = "esp32p4_frame_grabber";
-#define H264_ENCODE     1
-// #define SDCARD_SAVE     1
 
 /* Annex-B helpers for camera-supplied H.264 (UVC passthrough).
  *

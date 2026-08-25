@@ -247,6 +247,34 @@ webrtc_config.video_capture = my_custom_camera_if_get();
 - **ESP32** with external camera/audio via I2S/SPI
 - **Custom hardware** via interface implementation
 
+### A target with no BSP of its own
+
+`bsp_selector` always resolves to something — it `FATAL_ERROR`s if you pick
+`BSP_SELECT_NONE` — so "is a BSP selected" is never the useful question. The useful
+one is whether the selected BSP describes a board, and the predicate for that is
+`CONFIG_BSP_SELECT_ESP_BSP_DEVKIT`.
+
+`esp_bsp_devkit` is the only entry in the choice with no `depends on IDF_TARGET_*`,
+which is what makes it selectable on an ESP32-S31. It provides I2C, SPIFFS, SD card,
+buttons and LEDs — and **no audio codec, no display and no camera**, so anything
+reaching for `bsp_codec_*`, `bsp_display_*` or `bsp_camera_start()` has to drop out of
+the build rather than fail at runtime; those symbols do not exist to link against.
+Its pin assignments also default to `-1`, so `bsp_i2c_init()` returns
+`ESP_ERR_INVALID_ARG`. With `CONFIG_BSP_ERROR_CHECK=n` that is a return value rather
+than an abort, and `media_stream_init()` treats it as a warning: on a UVC-only board
+nothing sits on that bus, and whatever does need it fails later with a message about
+itself.
+
+The S31 overlay therefore sets `CONFIG_BSP_SELECT_ESP_BSP_DEVKIT=y`,
+`CONFIG_BSP_SELECT_GLIB=n` (no display to draw on) and `CONFIG_BSP_ERROR_CHECK=n`,
+and leaves the I2C pins unset. No patch to `bsp_selector` is involved; an earlier one
+that downgraded its `FATAL_ERROR` to `STATUS` has been dropped.
+
+The c-series is a third case and is still spelled out separately where it matters:
+`bsp_selector` is not a dependency there at all (`target not in [esp32c5, esp32c6]` in
+`idf_component.yml`), so `bsp/esp-bsp.h` does not exist and no `BSP_SELECT_*` symbol is
+defined — `!CONFIG_BSP_SELECT_ESP_BSP_DEVKIT` alone would wrongly read as "has a board".
+
 ## Video Player (receive path)
 
 The receive path lets the device decode an inbound H.264 video stream from a

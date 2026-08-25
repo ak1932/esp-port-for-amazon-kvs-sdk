@@ -76,6 +76,12 @@ typedef struct {
     // Client-level data channel configuration (defaults for all sessions)
     webrtc_data_channel_config_t client_dc_config;
     bool has_client_dc_config;
+
+    /* TRUE only after set_ice_servers(client, NULL, 0) deliberately cleared the
+     * ICE configuration. An all-zero config means "nobody has set ICE servers
+     * yet", which must not be treated as an instruction to gather host
+     * candidates only - see kvs_initializePeerConnection(). */
+    bool ice_servers_cleared;
 } kvs_pc_client_t;
 
 /**

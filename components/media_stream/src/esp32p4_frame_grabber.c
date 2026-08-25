@@ -713,90 +713,96 @@ static void video_encoder_task(void *arg)
             }
         }
 
-        // Encode the raw frame, or pass it through if the camera already encoded it
-        esp_h264_out_buf_t *frame = NULL;
-        {
-            if (!is_passthrough) {
-#if MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR && !CONFIG_MEDIA_STREAM_UVC_PASSTHROUGH_H264
-                /* A UVC camera delivers YUY2; the hardware encoder only takes
-                 * O_UYY_E_VYY, so repack before handing it over. */
-                video_resolution_t enc_res = {0};
-                if (esp_video_if_get_resolution(&enc_res) == ESP_OK && enc_res.width && enc_res.height) {
-                    const size_t need = (size_t) enc_res.width * enc_res.height * 3 / 2;
-                    if (s_conv_buf_len < need) {
-                        if (s_conv_buf) {
-                            heap_caps_free(s_conv_buf);
-                        }
-                        s_conv_buf = heap_caps_aligned_calloc(64, 1, need, MALLOC_CAP_SPIRAM);
-                        s_conv_buf_len = s_conv_buf ? need : 0;
-                    }
-                    if (s_conv_buf) {
-                        yuy2_to_o_uyy_e_vyy(raw_frame->buf, s_conv_buf, enc_res.width, enc_res.height);
-                        frame = esp_h264_hw_enc_encode_frame(s_conv_buf, need);
-                    }
-                }
-#else
-                frame = esp_h264_hw_enc_encode_frame(raw_frame->buf, raw_frame->len);
-#endif
-            } else {
-                /* Camera already delivers H.264: pass it through. Assign to the outer
-                 * `frame` - a shadowing declaration here left it NULL, so every frame
-                 * was treated as an encode failure and leaked both allocations. */
-                frame = heap_caps_aligned_calloc(64, 1, sizeof(esp_h264_out_buf_t), MALLOC_CAP_SPIRAM);
-                if (frame != NULL) {
-                    h264_au_info_t au;
-                    h264_scan_au(raw_frame->buf, raw_frame->len, &au);
-
-                    /* A keyframe without parameter sets is undecodable for a viewer
-                     * that joined after the camera last sent them, so prepend the
-                     * cached copies. */
-                    const bool prepend_ps = (au.has_idr && (!au.has_sps || !au.has_pps) &&
-                                             s_sps_len && s_pps_len);
-                    const uint32_t ps_len = prepend_ps ? (s_sps_len + s_pps_len) : 0;
-
-                    frame->buffer = heap_caps_aligned_calloc(64, 1, ps_len + raw_frame->len, MALLOC_CAP_SPIRAM);
-                    if (frame->buffer == NULL) {
-                        heap_caps_free(frame);
-                        frame = NULL;
-                    } else {
-                        if (prepend_ps) {
-                            memcpy(frame->buffer, s_sps, s_sps_len);
-                            memcpy(frame->buffer + s_sps_len, s_pps, s_pps_len);
-                        }
-                        memcpy(frame->buffer + ps_len, raw_frame->buf, raw_frame->len);
-                        frame->len = ps_len + raw_frame->len;
-                        /* Classify from the bitstream: the RTP packetizer uses this for
-                         * IDR handling, and marking every frame IDR leaves joining
-                         * viewers without parameter sets. */
-                        frame->type = au.has_idr ? ESP_H264_FRAME_TYPE_IDR : ESP_H264_FRAME_TYPE_P;
-                    }
-                }
-        /* Hand the frame to the raw sink - the H.264 encoder - which encodes and
-         * fans the result out to the encoded sinks. The camera buffer is still
-         * checked out until the release below, so this is on the camera's
-         * critical path. */
-        {
+        /* Not passthrough: the camera handed us a raw surface. Give it to the raw
+         * sink - the H.264 encoder - which encodes and fans the result out to the
+         * encoded sinks, then start the next iteration. Nothing below this point
+         * applies: it all operates on a camera-supplied access unit.
+         *
+         * The inline esp_h264_hw_enc_encode_frame() that used to run here as well is
+         * gone. It predates the sink registry, and keeping both meant encoding and
+         * publishing every frame twice - the sink already publishes. */
+        if (!is_passthrough) {
+            uint8_t *enc_src = raw_frame->buf;
+            size_t   enc_src_len = raw_frame->len;
             video_resolution_t enc_res = {0};
-            video_frame_raw_t raw_for_sink = {
-                .buffer = raw_frame->buf,
-                .len    = raw_frame->len,
-                .pixfmt = PIXFMT_YUV420,
-            };
-            if (esp_video_if_get_resolution(&enc_res) == ESP_OK) {
-                raw_for_sink.width  = enc_res.width;
-                raw_for_sink.height = enc_res.height;
+            const bool have_res = (esp_video_if_get_resolution(&enc_res) == ESP_OK &&
+                                   enc_res.width && enc_res.height);
+#if MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR && !CONFIG_MEDIA_STREAM_UVC_PASSTHROUGH_H264
+            /* A UVC camera delivers YUY2; the hardware encoder only takes
+             * O_UYY_E_VYY, so repack before handing it over. */
+            if (have_res) {
+                const size_t need = (size_t) enc_res.width * enc_res.height * 3 / 2;
+                if (s_conv_buf_len < need) {
+                    if (s_conv_buf) {
+                        heap_caps_free(s_conv_buf);
+                    }
+                    s_conv_buf = heap_caps_aligned_calloc(64, 1, need, MALLOC_CAP_SPIRAM);
+                    s_conv_buf_len = s_conv_buf ? need : 0;
+                }
+                if (s_conv_buf) {
+                    yuy2_to_o_uyy_e_vyy(raw_frame->buf, s_conv_buf, enc_res.width, enc_res.height);
+                    enc_src = s_conv_buf;
+                    enc_src_len = need;
+                }
             }
-            if (video_raw_sink_dispatch(&raw_for_sink) != ESP_OK) {
+#endif
+            video_frame_raw_t raw_for_sink = {
+                .buffer = enc_src,
+                .len    = enc_src_len,
+                .pixfmt = PIXFMT_YUV420,
+                .width  = have_res ? enc_res.width : 0,
+                .height = have_res ? enc_res.height : 0,
+            };
+            const esp_err_t sink_ret = video_raw_sink_dispatch(&raw_for_sink);
+
+            /* Released only after the dispatch returns: the sink borrows this buffer. */
+            esp_video_if_release_frame(raw_frame);
+            if (sink_ret != ESP_OK) {
                 /* Encoder hiccup or no sink registered - back off a little so a
                  * persistent failure does not spin the task. */
-                esp_video_if_release_frame(raw_frame);
                 vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
+            }
+            continue;
+        }
+
+        /* Camera already delivers H.264: pass it through, copied into a frame we own. */
+        esp_h264_out_buf_t *frame = heap_caps_aligned_calloc(64, 1, sizeof(esp_h264_out_buf_t),
+                                                            MALLOC_CAP_SPIRAM);
+        if (frame != NULL) {
+            h264_au_info_t au;
+            h264_scan_au(raw_frame->buf, raw_frame->len, &au);
+
+            /* A keyframe without parameter sets is undecodable for a viewer that
+             * joined after the camera last sent them, so prepend the cached copies. */
+            const bool prepend_ps = (au.has_idr && (!au.has_sps || !au.has_pps) &&
+                                     s_sps_len && s_pps_len);
+            const uint32_t ps_len = prepend_ps ? (s_sps_len + s_pps_len) : 0;
+
+            frame->buffer = heap_caps_aligned_calloc(64, 1, ps_len + raw_frame->len, MALLOC_CAP_SPIRAM);
+            if (frame->buffer == NULL) {
+                heap_caps_free(frame);
+                frame = NULL;
+            } else {
+                if (prepend_ps) {
+                    memcpy(frame->buffer, s_sps, s_sps_len);
+                    memcpy(frame->buffer + s_sps_len, s_pps, s_pps_len);
+                }
+                memcpy(frame->buffer + ps_len, raw_frame->buf, raw_frame->len);
+                frame->len = ps_len + raw_frame->len;
+                /* Classify from the bitstream: the RTP packetizer uses this for IDR
+                 * handling, and marking every frame IDR leaves joining viewers
+                 * without parameter sets. */
+                frame->type = au.has_idr ? ESP_H264_FRAME_TYPE_IDR : ESP_H264_FRAME_TYPE_P;
             }
         }
 
-        // Release the raw frame as we're done with it
+        // Release the raw frame as we're done with it - the copy above is ours
         esp_video_if_release_frame(raw_frame);
+        if (frame == NULL) {
+            /* Out of memory: the stream now has a hole, so resync on the next IDR. */
+            s_wait_for_idr = true;
+            continue;
+        }
 #else
         static int frames_cnt = 0;
         esp_err_t ret = esp_h264_hw_enc_process_one_frame();
@@ -834,8 +840,6 @@ static void video_encoder_task(void *arg)
         esp_cache_msync(h264_out_data.buffer, (h264_out_data.len + 63) & ~63, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
         publish_encoded_frame(h264_out_data.buffer, h264_out_data.len, h264_out_data.type);
 #endif
-        bool queue_full = false;
-
 #if MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR && CONFIG_MEDIA_STREAM_UVC_PASSTHROUGH_H264
         /* Bound the key-frame interval ourselves. The camera's own is multi-second (~12 s
          * measured), and since a key frame is the largest frame it is also the least
@@ -848,7 +852,6 @@ static void video_encoder_task(void *arg)
                    CONFIG_MEDIA_STREAM_UVC_KEY_FRAME_INTERVAL_MS > 0 &&
                    (esp_timer_get_time() - s_last_key_frame_us) >
                    (int64_t) CONFIG_MEDIA_STREAM_UVC_KEY_FRAME_INTERVAL_MS * 1000) {
-            extern esp_err_t esp_video_uvc_request_key_frame(void);
             const esp_err_t kf_ret = esp_video_uvc_request_key_frame();
             if (kf_ret != ESP_OK) {
                 /* Cameras that do not implement the control STALL EP0 on every attempt,
@@ -883,40 +886,22 @@ static void video_encoder_task(void *arg)
             s_wait_for_idr = false;
         }
 
-        if (xQueueSend(s_p4_enc_data.frame_queue, frame, pdMS_TO_TICKS(QUEUE_SEND_WAIT_MS)) != pdTRUE) {
-            free(frame->buffer);
-            vTaskDelay(pdMS_TO_TICKS(10));
-            queue_full = true;
-            s_wait_for_idr = true;   /* resync: the stream now has a hole */
-        }
+        /* Hand the frame to every enabled sink. s_p4_enc_data.frame_queue and its
+         * QUEUE_SEND_WAIT_MS were removed when the sink registry replaced the pull
+         * API, but this dispatch site was left pointing at them - so the file has not
+         * compiled since. publish_encoded_frame() BORROWS the buffer for the duration
+         * of the dispatch (same contract as the encode path above) and also owns the
+         * 1 s enc_fps window, which is why the duplicate window that used to live here
+         * is gone with the queue that fed its q_full_drops counter. */
+        publish_encoded_frame(frame->buffer, frame->len, frame->type);
+        free(frame->buffer);
         free(frame);
-
-        /* 1 s sliding-window encoder-out fps. Compare against the KVS DIAG
-         * `ok` counter and the receive-side `fps: rx=…` line to pinpoint
-         * where the pipeline saturates. */
-        static uint64_t enc_fps_window_start_us;
-        static uint32_t enc_fps_window_out;
-        static uint32_t enc_fps_window_full_drops;
-        enc_fps_window_out++;
-        if (queue_full) enc_fps_window_full_drops++;
-        uint64_t enc_now_us = esp_timer_get_time();
-        if (enc_fps_window_start_us == 0) {
-            enc_fps_window_start_us = enc_now_us;
-        } else if (enc_now_us - enc_fps_window_start_us >= 1000000ULL) {
-            uint64_t enc_window_us = enc_now_us - enc_fps_window_start_us;
-            uint32_t enc_fps = (uint32_t)((uint64_t)enc_fps_window_out * 1000000ULL / enc_window_us);
-            ESP_LOGI(TAG, "enc_fps: out=%" PRIu32 " (q_full_drops=%" PRIu32 ")",
-                     enc_fps, enc_fps_window_full_drops);
-            enc_fps_window_start_us = enc_now_us;
-            enc_fps_window_out = 0;
-            enc_fps_window_full_drops = 0;
-        }
     }
 
     ESP_LOGE(TAG, "Video encoder task unexpectedly exited!");
 }
 
-void esp32p4_frame_grabber_init(video_frame_preprocess_fn_t frame_preprocess_fn)
+esp_err_t esp32p4_frame_grabber_init(video_frame_preprocess_fn_t frame_preprocess_fn)
 {
     // Singleton pattern: encoder task remains, but check if esp_video_if needs reinitialization
     if (s_p4_enc_data.encoder_initialized) {
@@ -926,11 +911,13 @@ void esp32p4_frame_grabber_init(video_frame_preprocess_fn_t frame_preprocess_fn)
         // esp_video_if_init() will check internally and return early if already initialized
         esp_err_t ret = esp_video_if_init();
         if (ret != ESP_OK) {
+            /* Must be reported, not just logged: the caller starts the encoder task
+               next, and that task would immediately DQBUF a camera that is not there. */
             ESP_LOGE(TAG, "Failed to reinitialize video interface: %s", esp_err_to_name(ret));
-            return;
+            return ret;
         }
 #endif
-        return;
+        return ESP_OK;
     }
 
     init_chip();
@@ -1103,7 +1090,7 @@ void esp32p4_frame_grabber_init(video_frame_preprocess_fn_t frame_preprocess_fn)
     s_p4_enc_data.encoder_initialized = true;
 
     ESP_LOGD(TAG, "ESP32P4 frame grabber initialized as singleton (stopped, use start() to begin)");
-    return;
+    return ESP_OK;
 
 cleanup:
     // Conditional cleanup based on what was allocated
@@ -1120,6 +1107,7 @@ cleanup:
         s_p4_enc_data.run_semaphore = NULL;
     }
     ESP_LOGE(TAG, "ESP32P4 frame grabber initialization failed");
+    return ESP_FAIL;
 }
 
 esp_err_t esp32p4_frame_grabber_start(void)

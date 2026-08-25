@@ -245,6 +245,13 @@ typedef struct {
     // Check if ICE configuration refresh is needed (immediate, non-blocking check)
     WEBRTC_STATUS (*is_ice_refresh_needed)(void *pSignalingClient, bool *refreshNeeded);
 
+    /* Is a cached ICE configuration available to read without any network I/O?
+     * Optional. TRUE means get_ice_servers() is served from the cache and is safe
+     * to call on a latency-sensitive path. This is NOT the negation of
+     * is_ice_refresh_needed, which also reports "no refresh" when a refresh is
+     * merely rate-limited and the cache is empty. */
+    WEBRTC_STATUS (*has_valid_ice_config)(void *pSignalingClient, bool *pHasValidConfig);
+
     // Trigger ICE configuration refresh (background operation)
     WEBRTC_STATUS (*refresh_ice_configuration)(void *pSignalingClient);
 

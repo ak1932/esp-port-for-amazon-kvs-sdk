@@ -887,6 +887,33 @@ CleanUp:
     return retStatus;
 }
 
+/*
+ * Is there a cached ICE configuration that can be handed out right now without
+ * going on the wire?
+ *
+ * This deliberately mirrors the early-exit condition in refreshIceConfiguration()
+ * (amazon-.../src/source/Signaling/Signaling.c): when it holds, a subsequent
+ * signalingClientGetIceConfigInfo{Count,}() call cannot drive the signaling state
+ * machine, so reading the config is cheap and safe on a latency-sensitive path.
+ *
+ * Do NOT substitute !signaling_is_ice_config_refresh_needed() for this: that
+ * function also answers FALSE when a refresh is merely rate-limited, which can
+ * happen with iceConfigCount == 0 after a failed fetch. Acting on that would send
+ * a blocking GetIceServerConfig from whatever thread asked.
+ */
+BOOL signaling_has_valid_ice_config(PSignalingClient pSignalingClient)
+{
+    UINT64 curTime;
+
+    if (pSignalingClient == NULL) {
+        return FALSE;
+    }
+
+    curTime = SIGNALING_GET_CURRENT_TIME(pSignalingClient);
+
+    return (pSignalingClient->iceConfigCount > 0 && curTime <= pSignalingClient->iceConfigExpiration);
+}
+
 BOOL signaling_is_ice_config_refresh_needed(PSignalingClient pSignalingClient)
 {
     ENTERS();

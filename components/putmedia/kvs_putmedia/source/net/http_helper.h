@@ -122,7 +122,13 @@ put_media_err_t Http_openChunkedRequest(const char *pcHost, const char *pcPort, 
                                         unsigned int *puHttpStatus, esp_http_client_handle_t *ppClient);
 
 /**
- * @brief Send http chunk over esp_http_client
+ * @brief Send one buffer as one http chunk.
+ *
+ * The chunk carries exactly these bytes, so a caller with a header and a
+ * payload to send together has to join them before calling: two calls would
+ * emit two chunks, and a 13-byte MKV block header costs more in framing than it
+ * carries in payload. Joining is the caller's job because only the caller knows
+ * which buffers belong in one chunk - see Kvs_putMediaUpdate().
  *
  * On failure the chunk header may already have been written, in which case the
  * request body is truncated mid-chunk and the connection MUST NOT be reused:
@@ -135,12 +141,17 @@ put_media_err_t Http_openChunkedRequest(const char *pcHost, const char *pcPort, 
  */
 put_media_err_t Http_write_chunk(esp_http_client_handle_t http_client, const char *pBuffer, size_t uBytesToSend);
 
+
 /**
  * @brief Send the final chunk terminator ("0\r\n\r\n") to close a chunked request body.
  *
  * Call once, after the last Http_write_chunk(), to end the request cleanly.
  * Must not be called if a previous Http_write_chunk() failed, since the body is
  * then already malformed.
+ *
+ * On IDF 6.1+ this also closes the final chunk, whose trailer is held back until
+ * the request ends so that one esp_http_client_chunk_write_end() can do both -
+ * see prvWriteFramedChunk().
  *
  * @param[in] http_client esp_http_client handle
  * @return 0 on success, non-zero put_media error otherwise

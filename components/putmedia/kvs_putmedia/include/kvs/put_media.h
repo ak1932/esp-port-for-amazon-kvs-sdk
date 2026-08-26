@@ -51,7 +51,9 @@ typedef put_media_err_t (*get_mkv_ebml_hdr_func)(mkv_buf_info_t *mkv_buf_info);
  * @param pSecretKeyLen     Length of the Secret Access Key.
  * @param pSessionToken     Output pointer to AWS Session Token (optional).
  * @param pSessionTokenLen  Length of the Session Token.
- * @param pExpiration       Credential expiration time in seconds from now.
+ * @param pExpiration       Seconds from now until the credential expires.
+ *                          UINT32_MAX means it does not expire, which is what
+ *                          long-lived IAM keys should report.
  *
  * @return
  *  - 0 on success
@@ -108,7 +110,6 @@ typedef struct {
 typedef void (*put_media_event_handler_t)(const put_media_event_data_t *event_data, void *user_ctx);
 
 // TODO: Add support for IoT credentials
-// TODO: Add NetIO parameters
 
 /**
  * @brief Configuration structure for initializing the PutMedia component.
@@ -143,6 +144,24 @@ typedef struct {
 
     /** User context passed to event_handler (optional) */
     void *event_handler_user_ctx;
+
+    /**
+     * Depth of the queue between put_media_enqueue() and the upload task, in
+     * buffers. Zero selects the default.
+     *
+     * The muxer emits two buffers per frame, so this is roughly
+     * 2 * frames_buffered. It has to span a whole cluster (one GOP) plus margin:
+     * a buffer dropped because the queue was full corrupts the cluster it
+     * belonged to, costing everything up to the next key frame. Each queued
+     * buffer also holds a PSRAM copy of its payload, so deeper is not free.
+     */
+    unsigned int uUploadQueueDepth;
+
+    /**
+     * How long put_media_enqueue() waits for queue space before dropping the
+     * buffer, in milliseconds. Zero selects the default.
+     */
+    unsigned int uEnqueueTimeoutMs;
 } put_media_config_t;
 
 /**
@@ -168,6 +187,29 @@ put_media_err_t put_media_init(put_media_config_t config);
 bool put_media_is_started();
 
 /**
+ * @brief Check whether a PutMedia HTTP session is open right now.
+ *
+ * @return
+ *  - true if a PutMedia request is open and accepting data
+ *  - false while starting, reopening, or stopped
+ */
+bool put_media_is_session_live(void);
+
+/**
+ * @brief Number of buffers waiting in the upload queue.
+ *
+ * A congestion signal: it rises when the upload cannot keep pace with the muxer,
+ * and buffers start being dropped once it reaches uUploadQueueDepth. Sample it to
+ * shed load upstream - at frame granularity, before muxing - which is lossless as
+ * far as the MKV container is concerned, unlike dropping muxed buffers.
+ *
+ * @return
+ *  - queued buffer count
+ *  - 0 if PutMedia is not started
+ */
+unsigned int put_media_get_pending_count(void);
+
+/**
  * @brief Start streaming task to the Kinesis Video Stream using PutMedia.
  *
  * This function only signals the task to run and returns.
@@ -190,7 +232,16 @@ put_media_err_t put_media_start();
  *
  * @return
  *  - PUT_MEDIA_ERRNO_NONE on success
- *  - PUT_MEDIA_ERROR_* on failure
+ *  - PUT_MEDIA_ERROR_AWAITING_RESYNC if the buffer was deliberately refused
+ *    because it cannot form part of a whole cluster - the session is reopening,
+ *    or an earlier loss left the stream waiting for the next CLUSTER_HEADER.
+ *    Expected, not a failure: the loss it stems from was already reported, so
+ *    count it separately and keep muxing.
+ *  - PUT_MEDIA_ERROR_TIMEOUT if the upload queue stayed full for
+ *    uEnqueueTimeoutMs, PUT_MEDIA_ERROR_OUT_OF_MEMORY if the payload copy could
+ *    not be allocated. Both lose this buffer and its cluster.
+ *  - PUT_MEDIA_ERROR_INVALID_STATE if PutMedia is not started
+ *  - PUT_MEDIA_ERROR_* on other failures
  */
 put_media_err_t put_media_enqueue(mkv_buf_info_t mkv_buf_info);
 

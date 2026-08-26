@@ -674,7 +674,13 @@ mkv_app_handle mkv_app_init(mkv_app_config_t *config)
     if ((pMkv = (mkv_app_t *)kvsMalloc(sizeof(mkv_app_t))) == NULL) {
         res = MKV_ERROR_OUT_OF_MEMORY;
         ESP_LOGE(TAG, "OOM: pMkv");
-    } else if (!(task_stack = heap_caps_malloc_prefer(MKV_MUX_TASK_STACK_SIZE, 1, MALLOC_CAP_INTERNAL)) ||
+        /* The muxer task stack prefers PSRAM: 8 KB of internal RAM is worth more
+         * elsewhere, and this task never runs with the flash cache disabled. That
+         * needs CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY, which every example
+         * carrying this component sets; without it the allocation still succeeds
+         * and xTaskCreateStatic() rejects the stack, so the fallback to internal
+         * matters. */
+    } else if (!(task_stack = heap_caps_malloc_prefer(MKV_MUX_TASK_STACK_SIZE, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT, MALLOC_CAP_INTERNAL)) ||
                !(task_buffer = heap_caps_calloc(1, sizeof(StaticTask_t), MALLOC_CAP_INTERNAL))) {
         res = MKV_ERROR_OUT_OF_MEMORY;
     } else {

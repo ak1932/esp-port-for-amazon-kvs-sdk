@@ -53,6 +53,12 @@ typedef enum {
     PUT_MEDIA_ERROR_TLSF_FAILED_TO_CREATE_POOL            = (-(PUT_MEDIA_ERROR_COMMON_BASE + 0x0008)),
     PUT_MEDIA_ERROR_INVALID_STATE                         = (-(PUT_MEDIA_ERROR_COMMON_BASE + 0x0009)),
     PUT_MEDIA_ERROR_TIMEOUT                               = (-(PUT_MEDIA_ERROR_COMMON_BASE + 0x000a)),
+    /* Buffer deliberately refused because it cannot be part of a whole cluster:
+     * either the session is being reopened, or a loss left the stream waiting for
+     * the next CLUSTER_HEADER. Not data loss the caller has to account for - the
+     * loss that caused it was already reported - so callers should count these
+     * separately from a real failure to enqueue. */
+    PUT_MEDIA_ERROR_AWAITING_RESYNC                       = (-(PUT_MEDIA_ERROR_COMMON_BASE + 0x000b)),
 
     /* Transport layer errors */
     PUT_MEDIA_ERROR_NETIO_SEND_MORE_THAN_REMAINING_DATA   = (-(PUT_MEDIA_ERROR_COMMON_BASE + 0x0041)),

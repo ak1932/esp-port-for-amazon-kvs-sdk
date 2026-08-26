@@ -20,7 +20,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <net/netio.h>
 
 /* Third party headers */
 #include "azure_c_shared_utility/httpheaders.h"
@@ -37,16 +36,43 @@
 
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "esp_idf_version.h"
+
+#include "esp_heap_caps.h"
 
 #define TAG "PUT_MEDIA_HTTP"
+
+/*
+ * esp_http_client_chunk_write_begin() / _end() landed after v6.0.2 - v6.1 is the
+ * first release carrying them. Older IDFs get the hand-rolled framing below, so
+ * this component still builds on v5.4 / v5.5
+ */
+#ifndef HTTP_USE_NATIVE_CHUNK_API
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(6, 1, 0)
+#define HTTP_USE_NATIVE_CHUNK_API 1
+#else
+#define HTTP_USE_NATIVE_CHUNK_API 0
+#endif
+#endif
 
 /* Amazon Root CA 1 - used for *.amazonaws.com server verification when esp_crt_bundle is not available */
 
 #define DEFAULT_HTTP_RECV_BUFSIZE  2048
 #define MAX_HTTP_RESPONSE_BODY     (64 * 1024)
 #define URL_MAX_LEN                512
-/* KVS requests have many headers (Host, Authorization, x-amz-*, etc.); need larger than default 512 */
-#define HTTP_CLIENT_BUFFER_SIZE    4096
+/* KVS requests have many headers (Host, Authorization, x-amz-*, etc.); need larger
+ * than the 512-byte default. Split TX from RX rather than paying 4 KB twice per
+ * client: esp_http_client takes both from the ordinary heap, and on a part where
+ * malloc() is internal-only that is 8 KB of the scarcest pool for each of the
+ * three clients this file opens.
+ *
+ * TX has to hold the whole request head in one buffer - the SigV4 Authorization
+ * header plus a ~1.5 KB x-amz-security-token when STS credentials are in use - so
+ * it keeps the full 4 KB. RX only ever reads response headers and short JSON
+ * bodies (the body itself is accumulated separately, see MAX_HTTP_RESPONSE_BODY),
+ * so 2 KB is ample. */
+#define HTTP_CLIENT_TX_BUFFER_SIZE 4096
+#define HTTP_CLIENT_RX_BUFFER_SIZE 2048
 
 typedef struct {
     char *pBuf;
@@ -67,7 +93,7 @@ static esp_err_t prvHttpEventHandler(esp_http_client_event_t *pEvt)
             break;
         }
 
-        ESP_LOGI(TAG, "response len: %d", pEvt->data_len);
+        ESP_LOGD(TAG, "response len: %d", pEvt->data_len);
 
         size_t need = pCtx->uCur + (size_t)pEvt->data_len + 1;
         if (need > pCtx->uCap) {
@@ -100,7 +126,7 @@ static esp_err_t prvHttpEventHandler(esp_http_client_event_t *pEvt)
     }
 
     default: {
-        ESP_LOGW(TAG, "Event %d not handled", pEvt->event_id);
+        ESP_LOGD(TAG, "Event %d not handled", pEvt->event_id);
         break;
     }
     }
@@ -197,28 +223,6 @@ static int prvMapEspErrToPutMedia(esp_err_t err)
     return PUT_MEDIA_ERROR_RECV_ZERO_SIZED_HTTP_DATA;
 }
 
-//
-// int replace_fn(unsigned int uRecvTimeoutMs, unsigned int uSendTimeoutMs, const char *pcHost, const char *pcPort) {
-//     NetIoHandle xNetIoHandle;
-//     put_media_err_t res = PUT_MEDIA_ERRNO_NONE;
-//     if ((xNetIoHandle = NetIo_create()) == NULL) {
-//         res = PUT_MEDIA_ERROR_FAIL_TO_CREATE_NETIO_HANDLE;
-//         ESP_LOGE(TAG, "Failed to create NetIo handle");
-//     } else if (
-//         (res = NetIo_setRecvTimeout(xNetIoHandle, uRecvTimeoutMs)) != PUT_MEDIA_ERRNO_NONE ||
-//         (res = NetIo_setSendTimeout(xNetIoHandle, uSendTimeoutMs)) != PUT_MEDIA_ERRNO_NONE ||
-//         (res = NetIo_connect(xNetIoHandle, pcHost, PORT_HTTPS)) != PUT_MEDIA_ERRNO_NONE) {
-//         ESP_LOGE(TAG, "Failed to connect to %s", pcHost);
-//         /* Propagate the res error */
-//     } else if ((res = Http_executeHttpReq(xNetIoHandle, HTTP_METHOD_POST, KVS_URI_CREATE_STREAM, xHttpReqHeaders, STRING_c_str(xStHttpBody))) != PUT_MEDIA_ERRNO_NONE) {
-//         ESP_LOGE(TAG, "Failed send http request to %s", pcHost);
-//         /* Propagate the res error */
-//     } else if ((res = Http_recvHttpRsp(xNetIoHandle, &uHttpStatusCode, &pRspBody, &uRspBodyLen)) != PUT_MEDIA_ERRNO_NONE) {
-//         ESP_LOGE(TAG, "Failed recv http response from %s", pServPara->pcHost);
-//         /* Propagate the res error */
-//     }
-// }
-
 int Http_performRequest(const char *pcHost, const char *pcPort, const char *pcUri,
                         esp_http_client_method_t http_method, HTTP_HEADERS_HANDLE xHttpReqHeaders,
                         const char *pcBody, unsigned int uRecvTimeoutMs, unsigned int uSendTimeoutMs,
@@ -251,8 +255,8 @@ int Http_performRequest(const char *pcHost, const char *pcPort, const char *pcUr
     // cfg.cert_pem = s_amazon_root_ca_1_pem;
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
     // cfg.cert_pem = server_cert;
-    cfg.buffer_size = (int)HTTP_CLIENT_BUFFER_SIZE;
-    cfg.buffer_size_tx = (int)HTTP_CLIENT_BUFFER_SIZE;
+    cfg.buffer_size = (int)HTTP_CLIENT_RX_BUFFER_SIZE;
+    cfg.buffer_size_tx = (int)HTTP_CLIENT_TX_BUFFER_SIZE;
 
     h = esp_http_client_init(&cfg);
     if (h == NULL) {
@@ -339,8 +343,8 @@ put_media_err_t Http_performRequestWithX509(const char *pcHost, const char *pcPo
     // } else {
     //     cfg.cert_pem = s_amazon_root_ca_1_pem;
     // }
-    cfg.buffer_size = (int)HTTP_CLIENT_BUFFER_SIZE;
-    cfg.buffer_size_tx = (int)HTTP_CLIENT_BUFFER_SIZE;
+    cfg.buffer_size = (int)HTTP_CLIENT_RX_BUFFER_SIZE;
+    cfg.buffer_size_tx = (int)HTTP_CLIENT_TX_BUFFER_SIZE;
 
     h = esp_http_client_init(&cfg);
     if (h == NULL) {
@@ -387,67 +391,155 @@ put_media_err_t Http_performRequestWithX509(const char *pcHost, const char *pcPo
 }
 
 /*
- * Write uBytesToSend bytes to an already-open connection.
+ * Emit one complete chunk: size line, payload, trailer.
  *
- * Note on the n <= 0 test: esp_http_client_write() returns whatever
- * esp_transport_write() returned, and ssl_write() returns its *poll* result,
- * which is 0 (not negative) when the socket does not become writable within
- * timeout_ms. Treating only n < 0 as an error would spin forever on a stalled
- * link, so anything that is not forward progress is a failure here.
+ * Two implementations, chosen by IDF version:
+ *
+ *   native (6.1+)  esp_http_client_chunk_write_begin()/_end(). No allocation and
+ *                  no copy of the payload; three transport writes per chunk.
+ *   hand-framed    one buffer, one transport write; costs one malloc and one copy
+ *                  of the payload per chunk. Keeps the component building on v5.4
+ *                  and v5.5, where the chunk APIs do not exist.
  */
-static put_media_err_t prvWriteFully(esp_http_client_handle_t http_client, const char *pBuffer, size_t uBytesToSend)
-{
-    size_t bytes_sent = 0;
+#if HTTP_USE_NATIVE_CHUNK_API
 
-    while (bytes_sent < uBytesToSend) {
-        int n = esp_http_client_write(http_client, pBuffer + bytes_sent, (int)(uBytesToSend - bytes_sent));
-        if (n <= 0) {
-            ESP_LOGE(TAG, "esp_http_client_write returned %d after %zu/%zu bytes", n, bytes_sent, uBytesToSend);
-            return PUT_MEDIA_ERROR_NETIO_UNABLE_TO_SEND_CONTENT;
-        }
-        bytes_sent += (size_t)n;
+/*
+ * Whether the chunk most recently begun still owes its trailer.
+ *
+ * esp_http_client_chunk_write_end(client, true) is meant to close the LAST chunk
+ * - it emits that chunk's "\r\n" and the "0\r\n\r\n" terminator together, and
+ * its documented precondition is that a chunk was started with
+ * chunk_write_begin(). Calling it standalone after every chunk has closed itself
+ * would emit a trailer for a chunk that is not open, leaving a blank line where
+ * the parser expects the last-chunk size.
+ */
+static bool s_bChunkTrailerPending;
+
+/* Emit the deferred "\r\n" for the chunk still open, and the end-of-body
+ * terminator with it when this closes the last one. No-op when nothing is open. */
+static put_media_err_t prvCloseOpenChunk(esp_http_client_handle_t http_client, bool bLastChunk)
+{
+    if (!s_bChunkTrailerPending) {
+        return PUT_MEDIA_ERRNO_NONE;
+    }
+
+    int nRes = esp_http_client_chunk_write_end(http_client, bLastChunk);
+
+    /* Cleared either way: on failure the body is unusable and the session is
+     * going away, and the next open must not inherit this. */
+    s_bChunkTrailerPending = false;
+
+    if (nRes != 0) {
+        ESP_LOGE(TAG, "Chunk trailer failed, HTTP stream is no longer usable");
+        return PUT_MEDIA_ERROR_NETIO_UNABLE_TO_SEND_CONTENT;
     }
 
     return PUT_MEDIA_ERRNO_NONE;
 }
 
-put_media_err_t Http_write_chunk(esp_http_client_handle_t http_client, const char *pBuffer, size_t uBytesToSend)
+static put_media_err_t prvWriteFramedChunk(esp_http_client_handle_t http_client, const char *pBuffer, size_t uPayload)
 {
-    put_media_err_t err = PUT_MEDIA_ERRNO_NONE;
-
-    /* esp_http_client_chunk_write_begin() takes an int length. */
-    if (http_client == NULL || pBuffer == NULL || uBytesToSend == 0 || uBytesToSend > INT_MAX) {
-        err = PUT_MEDIA_ERROR_INVALID_ARGUMENT;
-    } else if (esp_http_client_chunk_write_begin(http_client, (int)uBytesToSend) != 0) {
-        err = PUT_MEDIA_ERROR_NETIO_UNABLE_TO_SEND_CONTENT;
-    } else if ((err = prvWriteFully(http_client, pBuffer, uBytesToSend)) != PUT_MEDIA_ERRNO_NONE) {
-        /*
-         * The chunk header is already on the wire but the body is short: the
-         * request body is now unparseable and the connection cannot be reused.
-         * The caller is responsible for tearing the session down.
-         */
-        ESP_LOGE(TAG, "Chunk body truncated, HTTP stream is no longer usable");
-    } else if (esp_http_client_chunk_write_end(http_client, false) != 0) {
-        err = PUT_MEDIA_ERROR_NETIO_UNABLE_TO_SEND_CONTENT;
+    /* Close the previous chunk - its trailer was held back in case it turned out
+     * to be the last one. It did not. */
+    put_media_err_t err = prvCloseOpenChunk(http_client, false);
+    if (err != PUT_MEDIA_ERRNO_NONE) {
+        return err;
     }
 
-    return err;
+    int nRes = esp_http_client_chunk_write_begin(http_client, (int)uPayload);
+
+    if (nRes != 0) {
+        ESP_LOGE(TAG, "Chunk size line failed for %zu bytes, HTTP stream is no longer usable", uPayload);
+        return PUT_MEDIA_ERROR_NETIO_UNABLE_TO_SEND_CONTENT;
+    }
+
+    s_bChunkTrailerPending = true;
+
+    int nWritten = esp_http_client_write(http_client, pBuffer, (int)uPayload);
+
+    if (nWritten != (int)uPayload) {
+        /* The size line is already out, so this body is short by an unknown
+         * amount and the stream cannot be repaired. */
+        ESP_LOGE(TAG, "Chunk body wrote %d of %zu bytes, HTTP stream is no longer usable", nWritten, uPayload);
+        return PUT_MEDIA_ERROR_NETIO_UNABLE_TO_SEND_CONTENT;
+    }
+
+    return PUT_MEDIA_ERRNO_NONE;
+}
+
+#else /* !HTTP_USE_NATIVE_CHUNK_API */
+
+static put_media_err_t prvWriteFramedChunk(esp_http_client_handle_t http_client, const char *pBuffer, size_t uPayload)
+{
+    char pcSizeLine[20];
+
+    int nSizeLen = snprintf(pcSizeLine, sizeof(pcSizeLine), "%zx\r\n", uPayload);
+    if (nSizeLen <= 0 || (size_t)nSizeLen >= sizeof(pcSizeLine)) {
+        return PUT_MEDIA_ERROR_INVALID_ARGUMENT;
+    }
+
+    size_t uFramed = (size_t)nSizeLen + uPayload + 2;
+    char *pcFrame = heap_caps_malloc_prefer(uFramed, 2, MALLOC_CAP_SPIRAM, MALLOC_CAP_INTERNAL);
+    if (pcFrame == NULL) {
+        ESP_LOGE(TAG, "No memory to frame a %zu byte chunk", uPayload);
+        return PUT_MEDIA_ERROR_OUT_OF_MEMORY;
+    }
+
+    memcpy(pcFrame, pcSizeLine, (size_t)nSizeLen);
+    memcpy(pcFrame + nSizeLen, pBuffer, uPayload);
+    memcpy(pcFrame + nSizeLen + uPayload, "\r\n", 2);
+
+    int nWritten = esp_http_client_write(http_client, pcFrame, (int)uFramed);
+
+    free(pcFrame);
+
+    if (nWritten != (int)uFramed) {
+        ESP_LOGE(TAG, "Chunk wrote %d of %zu bytes, HTTP stream is no longer usable", nWritten, uFramed);
+        return PUT_MEDIA_ERROR_NETIO_UNABLE_TO_SEND_CONTENT;
+    }
+
+    return PUT_MEDIA_ERRNO_NONE;
+}
+
+#endif /* HTTP_USE_NATIVE_CHUNK_API */
+
+put_media_err_t Http_write_chunk(esp_http_client_handle_t http_client, const char *pBuffer, size_t uBytesToSend)
+{
+    if (http_client == NULL || pBuffer == NULL || uBytesToSend == 0 || uBytesToSend > INT_MAX) {
+        return PUT_MEDIA_ERROR_INVALID_ARGUMENT;
+    }
+
+    return prvWriteFramedChunk(http_client, pBuffer, uBytesToSend);
 }
 
 put_media_err_t Http_finishChunkedRequest(esp_http_client_handle_t http_client)
 {
-    /*
-     * Written directly rather than via esp_http_client_chunk_write_end(client, true):
-     * that API always emits a "\r\n" chunk trailer before the terminator, which
-     * would inject a stray CRLF after an already-completed chunk.
-     */
-    static const char terminator[] = "0\r\n\r\n";
-
     if (http_client == NULL) {
         return PUT_MEDIA_ERROR_INVALID_ARGUMENT;
     }
 
-    return prvWriteFully(http_client, terminator, sizeof(terminator) - 1);
+#if HTTP_USE_NATIVE_CHUNK_API
+    /* The last chunk is still open, holding its trailer for exactly this: one
+     * call closes it and emits the terminator, which is the sequence
+     * esp_http_client_chunk_write_end() is built for. */
+    if (s_bChunkTrailerPending) {
+        return prvCloseOpenChunk(http_client, true);
+    }
+
+    /* No chunk was ever written on this connection, so there is nothing for
+     * chunk_write_end() to close and its precondition is not met. The body is
+     * just the terminator. */
+#endif
+
+    static const char terminator[] = "0\r\n\r\n";
+    const int nLen = (int)(sizeof(terminator) - 1);
+
+    if (esp_http_client_write(http_client, terminator, nLen) != nLen) {
+        ESP_LOGE(TAG, "Failed to write the end-of-body terminator");
+        return PUT_MEDIA_ERROR_NETIO_UNABLE_TO_SEND_CONTENT;
+    }
+
+    return PUT_MEDIA_ERRNO_NONE;
 }
 
 put_media_err_t Http_openChunkedRequest(const char *pcHost, const char *pcPort, const char *pcUri,
@@ -461,6 +553,12 @@ put_media_err_t Http_openChunkedRequest(const char *pcHost, const char *pcPort, 
     esp_http_client_handle_t h = NULL;
     esp_err_t err;
     int status;
+
+#if HTTP_USE_NATIVE_CHUNK_API
+    /* A previous session may have been torn down mid-chunk; this one starts
+     * owing nothing. */
+    s_bChunkTrailerPending = false;
+#endif
 
     if (pcHost == NULL || pcPort == NULL || pcUri == NULL || xHttpReqHeaders == NULL ||
             puHttpStatus == NULL || ppClient == NULL) {
@@ -476,8 +574,8 @@ put_media_err_t Http_openChunkedRequest(const char *pcHost, const char *pcPort, 
     cfg.method = HTTP_METHOD_POST;
     cfg.timeout_ms = (int)uRecvTimeoutMs;
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
-    cfg.buffer_size = (int)HTTP_CLIENT_BUFFER_SIZE;
-    cfg.buffer_size_tx = (int)HTTP_CLIENT_BUFFER_SIZE;
+    cfg.buffer_size = (int)HTTP_CLIENT_RX_BUFFER_SIZE;
+    cfg.buffer_size_tx = (int)HTTP_CLIENT_TX_BUFFER_SIZE;
     cfg.event_handler = prvHttpEventHandler;
 
     h = esp_http_client_init(&cfg);

@@ -42,6 +42,7 @@
 #include "misc/json_helper.h"
 #include "net/http_helper.h"
 #include "esp_http_client.h"
+#include "esp_heap_caps.h"
 
 #include "esp_log.h"
 
@@ -955,12 +956,34 @@ int Kvs_putMediaUpdate(PutMediaHandle xPutMediaHandle, uint8_t *pMkvHeader, size
     if (pPutMedia == NULL || pMkvHeader == NULL || uMkvHeaderLen == 0) {
         res = PUT_MEDIA_ERROR_INVALID_ARGUMENT;
         ESP_LOGE(TAG, "Invalid argument");
-    } else {
+    } else if (uDataLen == 0) {
         if ((res = prvWriteChunkChecked(pPutMedia, pMkvHeader, uMkvHeaderLen)) != PUT_MEDIA_ERRNO_NONE) {
             ESP_LOGE(TAG, "Failed to send MKV header chunk");
-        } else if (uDataLen > 0 &&
-                   (res = prvWriteChunkChecked(pPutMedia, pData, uDataLen)) != PUT_MEDIA_ERRNO_NONE) {
-            ESP_LOGE(TAG, "Failed to send data frame");
+        }
+    } else if (uMkvHeaderLen + uDataLen < uMkvHeaderLen) {
+        res = PUT_MEDIA_ERROR_INVALID_ARGUMENT;
+        ESP_LOGE(TAG, "Block length overflows");
+    } else {
+        /*
+         * The MKV header and the frame it describes go out as one chunk.
+         * TODO: verify if this actually improves
+         */
+        size_t uBlockLen = uMkvHeaderLen + uDataLen;
+        uint8_t *pBlock = (uint8_t *)heap_caps_malloc_prefer(uBlockLen, 2, MALLOC_CAP_SPIRAM, MALLOC_CAP_INTERNAL);
+
+        if (pBlock == NULL) {
+            res = PUT_MEDIA_ERROR_OUT_OF_MEMORY;
+            ESP_LOGE(TAG, "No memory to join a %zu byte block", uBlockLen);
+        } else {
+            memcpy(pBlock, pMkvHeader, uMkvHeaderLen);
+            memcpy(pBlock + uMkvHeaderLen, pData, uDataLen);
+
+            res = prvWriteChunkChecked(pPutMedia, pBlock, uBlockLen);
+            free(pBlock);
+
+            if (res != PUT_MEDIA_ERRNO_NONE) {
+                ESP_LOGE(TAG, "Failed to send data frame");
+            }
         }
     }
 

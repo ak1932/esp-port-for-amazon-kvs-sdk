@@ -1,0 +1,39 @@
+menu "AWS KVS PutMedia"
+
+    config PUT_MEDIA_UPLOAD_QUEUE_DEPTH
+        int "Upload queue depth (buffers)"
+        range 32 4096
+        default 1024 if IDF_TARGET_ESP32S31
+        default 128
+        help
+            Depth of the queue between put_media_enqueue() and the upload task,
+            counted in BUFFERS, not frames: the muxer emits two per frame (a
+            header and a block), so this is roughly 2 * frames_buffered.
+
+            Size it to span a whole cluster (one GOP) plus margin. A buffer
+            dropped because the queue was full corrupts the cluster it belonged
+            to, so the cost of an overflow is every frame up to the next key
+            frame - not the one buffer that was lost.
+
+            Deeper is not free, in two separate ways:
+
+            - The queue storage is depth * sizeof(mkv_buf_info_t) (24 bytes) of
+              INTERNAL RAM, because xQueueCreate() does not allocate from PSRAM.
+              1024 buffers therefore costs about 24 KB of internal RAM up front,
+              whether or not the queue ever fills.
+
+            - Every queued buffer additionally owns a PSRAM copy of its payload.
+              A deep queue that actually fills can hold several seconds of video,
+              which is memory and latency both.
+
+            The larger default on ESP32-S31 follows from that target's UVC H.264
+            passthrough path: the camera owns bitrate, GOP length and key-frame
+            placement there, so video_rate_ctrl cannot throttle the producer when
+            the uplink slows down, and the queue is the only thing left to absorb
+            a stall. Targets that own the encoder shed load upstream instead, and
+            do not need the depth.
+
+            put_media_config_t.uUploadQueueDepth overrides this at runtime; this
+            value is what a zero in that field selects.
+
+endmenu

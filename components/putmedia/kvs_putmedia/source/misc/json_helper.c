@@ -14,7 +14,6 @@
  */
 
 #include <inttypes.h>
-#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -22,53 +21,94 @@
 #include "misc/json_helper.h"
 #include "os/allocator.h"
 
-char *json_object_dotget_serialize_to_string(const JSON_Object *pxRootObject, const char *pcName, bool bRemoveQuotes)
+/* Longest key any caller looks up is "FragmentTimecode". */
+#define JSON_MAX_KEY_LEN 64
+
+/**
+ * @brief Copy a NUL-terminated string into allocator memory.
+ *
+ * Values handed back to callers are freed with kvsFree, so they cannot come
+ * straight out of cJSON's own allocator.
+ */
+static char *prvDupToKvs(const char *pcVal)
 {
     char *pcRes = NULL;
-    char *pcVal = NULL;
-    size_t uValLen = 0;
-    JSON_Value *pxJsonValue = NULL;
+    size_t uLen = 0;
 
-    if (pxRootObject != NULL) {
-        if ((pxJsonValue = json_object_dotget_value(pxRootObject, pcName)) != NULL) {
-            if ((pcVal = json_serialize_to_string(pxJsonValue)) != NULL) {
-                uValLen = strlen(pcVal);
-                if (bRemoveQuotes) {
-                    if (uValLen > 2 && (pcRes = kvsMalloc(uValLen - 1)) != NULL) {
-                        memcpy(pcRes, pcVal + 1, uValLen - 2);
-                        pcRes[uValLen - 2] = '\0';
-                    }
-                    json_free_serialized_string(pcVal);
-                } else {
-                    if (uValLen > 0 && (pcRes = kvsMalloc(uValLen + 1)) != NULL) {
-                        memcpy(pcRes, pcVal, uValLen);
-                        pcRes[uValLen] = '\0';
-                    }
-                    json_free_serialized_string(pcVal);
-                }
-            }
-        }
+    if (pcVal != NULL && (uLen = strlen(pcVal)) > 0 && (pcRes = (char *)kvsMalloc(uLen + 1)) != NULL) {
+        memcpy(pcRes, pcVal, uLen + 1);
     }
 
     return pcRes;
 }
 
-uint64_t json_object_dotget_uint64(const JSON_Object *pxRootObject, const char *pcName, int xBase)
+/**
+ * @brief Walk a dot-separated path from the root object.
+ */
+static const cJSON *prvDotGet(const cJSON *pxRoot, const char *pcPath)
 {
-    uint64_t uVal = 0;
-    char *pcValue = NULL;
-    JSON_Value *pxJsonValue = NULL;
+    const cJSON *pxItem = pxRoot;
+    const char *pcSeg = pcPath;
+    const char *pcDot = NULL;
+    char pcKey[JSON_MAX_KEY_LEN] = {0};
+    size_t uSegLen = 0;
 
-    if (pxRootObject != NULL) {
-        pxJsonValue = json_object_dotget_value(pxRootObject, pcName);
-        if (pxJsonValue != NULL) {
-            pcValue = json_serialize_to_string(pxJsonValue);
-            if (pcValue != NULL) {
-                /* We have a valid string value here. */
-                uVal = strtoull(pcValue, NULL, xBase);
-                json_free_serialized_string(pcValue);
-            }
+    if (pxItem == NULL || pcSeg == NULL || *pcSeg == '\0') {
+        return NULL;
+    }
+
+    while (pcSeg != NULL) {
+        pcDot = strchr(pcSeg, '.');
+        uSegLen = (pcDot != NULL) ? (size_t)(pcDot - pcSeg) : strlen(pcSeg);
+
+        if (uSegLen == 0 || uSegLen >= sizeof(pcKey)) {
+            return NULL;
         }
+        memcpy(pcKey, pcSeg, uSegLen);
+        pcKey[uSegLen] = '\0';
+
+        if ((pxItem = cJSON_GetObjectItemCaseSensitive(pxItem, pcKey)) == NULL) {
+            return NULL;
+        }
+
+        pcSeg = (pcDot != NULL) ? pcDot + 1 : NULL;
+    }
+
+    return pxItem;
+}
+
+char *json_dotget_string(const cJSON *pxRoot, const char *pcPath)
+{
+    const cJSON *pxItem = prvDotGet(pxRoot, pcPath);
+    char *pcSerialized = NULL;
+    char *pcRes = NULL;
+
+    if (pxItem == NULL) {
+        /* noop */
+    } else if (cJSON_IsString(pxItem)) {
+        pcRes = prvDupToKvs(cJSON_GetStringValue(pxItem));
+    } else if ((pcSerialized = cJSON_PrintUnformatted(pxItem)) != NULL) {
+        pcRes = prvDupToKvs(pcSerialized);
+        cJSON_free(pcSerialized);
+    }
+
+    return pcRes;
+}
+
+uint64_t json_dotget_uint64(const cJSON *pxRoot, const char *pcPath, int xBase)
+{
+    const cJSON *pxItem = prvDotGet(pxRoot, pcPath);
+    uint64_t uVal = 0;
+
+    if (pxItem == NULL) {
+        /* noop */
+    } else if (cJSON_IsNumber(pxItem)) {
+        /* KVS sends epoch-millisecond timecodes, well inside the 2^53 a double holds exactly. */
+        if (pxItem->valuedouble > 0.0) {
+            uVal = (uint64_t)pxItem->valuedouble;
+        }
+    } else if (cJSON_IsString(pxItem) && pxItem->valuestring != NULL) {
+        uVal = strtoull(pxItem->valuestring, NULL, xBase);
     }
 
     return uVal;

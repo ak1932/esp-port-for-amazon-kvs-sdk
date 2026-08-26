@@ -13,9 +13,8 @@ dependencies:
     path: "../kvs_producer"
     version: "*"
 
-  parson:
-    path: "../parson"
-    version: "*"
+  espressif/cjson:
+    version: "^1.7.15"
 
   c_utility:
     path: "../c_utility"

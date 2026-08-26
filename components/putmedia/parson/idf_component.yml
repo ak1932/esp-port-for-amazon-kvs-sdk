@@ -1,6 +1,0 @@
-## IDF Component Manager Manifest File
-description: "Parson - lightweight JSON parser and serializer (vendored, MIT)"
-version: "1.4.0"
-dependencies:
-  idf:
-    version: ">=5.4.0"

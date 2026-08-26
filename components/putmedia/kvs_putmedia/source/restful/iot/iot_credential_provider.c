@@ -19,7 +19,6 @@
 /* Thirdparty headers */
 #include "azure_c_shared_utility/httpheaders.h"
 #include "azure_c_shared_utility/strings.h"
-#include "parson.h"
 
 /* Public headers */
 #include "kvs/put_media_errors.h"
@@ -41,34 +40,23 @@
 static int parseIoTCredential(const char *pcJsonSrc, size_t uJsonSrcLen, IotCredentialToken_t *pToken)
 {
     int res = PUT_MEDIA_ERRNO_NONE;
-    STRING_HANDLE xStJson = NULL;
-    JSON_Value *pxRootValue = NULL;
-    JSON_Object *pxRootObject = NULL;
-
-    json_set_escape_slashes(0);
+    cJSON *pxRoot = NULL;
 
     if (pcJsonSrc == NULL || uJsonSrcLen == 0 || pToken == NULL) {
         res = PUT_MEDIA_ERROR_INVALID_ARGUMENT;
         ESP_LOGE(TAG, "Invalid argument");
-    } else if ((xStJson = STRING_construct_n(pcJsonSrc, uJsonSrcLen)) == NULL) {
-        res = PUT_MEDIA_ERROR_OUT_OF_MEMORY;
-        ESP_LOGE(TAG, "OOM: parse IoT credential");
     } else if (
-        (pxRootValue = json_parse_string(STRING_c_str(xStJson))) == NULL || (pxRootObject = json_value_get_object(pxRootValue)) == NULL ||
-        (pToken->pAccessKeyId = json_object_dotget_serialize_to_string(pxRootObject, "credentials.accessKeyId", true)) == NULL ||
-        (pToken->pSecretAccessKey = json_object_dotget_serialize_to_string(pxRootObject, "credentials.secretAccessKey", true)) == NULL ||
-        (pToken->pSessionToken = json_object_dotget_serialize_to_string(pxRootObject, "credentials.sessionToken", true)) == NULL) {
+        (pxRoot = cJSON_ParseWithLength(pcJsonSrc, uJsonSrcLen)) == NULL ||
+        (pToken->pAccessKeyId = json_dotget_string(pxRoot, "credentials.accessKeyId")) == NULL ||
+        (pToken->pSecretAccessKey = json_dotget_string(pxRoot, "credentials.secretAccessKey")) == NULL ||
+        (pToken->pSessionToken = json_dotget_string(pxRoot, "credentials.sessionToken")) == NULL) {
         res = PUT_MEDIA_ERROR_FAIL_TO_PARSE_JSON_OF_IOT_CREDENTIAL;
         ESP_LOGE(TAG, "Failed to parse IoT credential");
     } else {
         /* nop */
     }
 
-    if (pxRootValue != NULL) {
-        json_value_free(pxRootValue);
-    }
-
-    STRING_delete(xStJson);
+    cJSON_Delete(pxRoot);
 
     return res;
 }

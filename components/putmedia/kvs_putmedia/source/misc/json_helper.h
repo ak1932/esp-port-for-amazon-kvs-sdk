@@ -17,24 +17,33 @@
 #define JSON_HELPER_H
 
 #include <inttypes.h>
-#include <stdbool.h>
-#include "parson.h"
+
+#include "cJSON.h"
 
 /**
- * @brief Get string value of a JSON value
+ * @brief Look up a dot-separated path and return a copy of its value as a string.
  *
- * @param pxRootObject[in] The root JSON object, which created from parson library.
- * @param pcName[in] The name of the property
- * @param bRemoveQuotes[in] Remove quotes if it's true
- * @return The value of the property on success, or NULL on error.
+ * cJSON has no dot-path getter, so the path is walked one segment at a time with
+ * cJSON_GetObjectItemCaseSensitive(). A JSON string is returned unquoted; any other
+ * kind of value is returned in its serialized form.
+ *
+ * @param[in] pxRoot The parsed JSON object
+ * @param[in] pcPath Dot-separated path, e.g. "credentials.accessKeyId"
+ * @return The value on success (caller must kvsFree), or NULL on error.
  */
-char *json_object_dotget_serialize_to_string(const JSON_Object *pxRootObject, const char *pcName, bool bRemoveQuotes);
+char *json_dotget_string(const cJSON *pxRoot, const char *pcPath);
 
 /**
- * @brief Get UINT64 value of a JSON value
+ * @brief Look up a dot-separated path and return its value as a uint64_t.
  *
- * @param
+ * Accepts both a JSON number and a JSON string, since KVS is inconsistent about
+ * which one it sends for a timecode.
+ *
+ * @param[in] pxRoot The parsed JSON object
+ * @param[in] pcPath Dot-separated path, e.g. "FragmentTimecode"
+ * @param[in] xBase Numeric base used when the value is a JSON string
+ * @return The value, or 0 if the path is absent or the value is not convertible.
  */
-uint64_t json_object_dotget_uint64(const JSON_Object *pxRootObject, const char *pcName, int xBase);
+uint64_t json_dotget_uint64(const cJSON *pxRoot, const char *pcPath, int xBase);
 
 #endif

@@ -27,7 +27,6 @@
 #include "azure_c_shared_utility/httpheaders.h"
 #include "azure_c_shared_utility/lock.h"
 #include "azure_c_shared_utility/strings.h"
-#include "parson.h"
 
 /* Public headers */
 #include "kvs/put_media_errors.h"
@@ -113,11 +112,11 @@ typedef struct PutMedia {
 #define JSON_KEY_FRAGMENT_TIMECODE "FragmentTimecode"
 #define JSON_KEY_ERROR_ID "ErrorId"
 
-#define EVENT_TYPE_BUFFERING "\"BUFFERING\""
-#define EVENT_TYPE_RECEIVED "\"RECEIVED\""
-#define EVENT_TYPE_PERSISTED "\"PERSISTED\""
-#define EVENT_TYPE_ERROR "\"ERROR\""
-#define EVENT_TYPE_IDLE "\"IDLE\""
+#define EVENT_TYPE_BUFFERING "BUFFERING"
+#define EVENT_TYPE_RECEIVED "RECEIVED"
+#define EVENT_TYPE_PERSISTED "PERSISTED"
+#define EVENT_TYPE_ERROR "ERROR"
+#define EVENT_TYPE_IDLE "IDLE"
 
 /*-----------------------------------------------------------*/
 
@@ -234,23 +233,16 @@ static AwsSigV4Handle prvSign(KvsServiceParameter_t *pServPara, char *pcUri, cha
 static int prvParseDataEndpoint(const char *pcJsonSrc, size_t uJsonSrcLen, char **ppcEndpoint)
 {
     int res = PUT_MEDIA_ERRNO_NONE;
-    STRING_HANDLE xStJson = NULL;
-    JSON_Value *pxRootValue = NULL;
-    JSON_Object *pxRootObject = NULL;
+    cJSON *pxRoot = NULL;
     char *pcDataEndpoint = NULL;
     size_t uEndpointLen = 0;
-
-    json_set_escape_slashes(0);
 
     if (pcJsonSrc == NULL || uJsonSrcLen == 0 || ppcEndpoint == NULL) {
         res = PUT_MEDIA_ERROR_INVALID_ARGUMENT;
         ESP_LOGE(TAG, "Invalid argument");
-    } else if ((xStJson = STRING_construct_n(pcJsonSrc, uJsonSrcLen)) == NULL) {
-        res = PUT_MEDIA_ERROR_OUT_OF_MEMORY;
-        ESP_LOGE(TAG, "OOM: parse data endpoint");
     } else if (
-        (pxRootValue = json_parse_string(STRING_c_str(xStJson))) == NULL || (pxRootObject = json_value_get_object(pxRootValue)) == NULL ||
-        (pcDataEndpoint = json_object_dotget_serialize_to_string(pxRootObject, "DataEndpoint", true)) == NULL) {
+        (pxRoot = cJSON_ParseWithLength(pcJsonSrc, uJsonSrcLen)) == NULL ||
+        (pcDataEndpoint = json_dotget_string(pxRoot, "DataEndpoint")) == NULL) {
         res = PUT_MEDIA_ERROR_FAIL_TO_PARSE_DATA_ENDPOINT;
         ESP_LOGE(TAG, "Failed to parse data endpoint");
     } else {
@@ -273,11 +265,7 @@ static int prvParseDataEndpoint(const char *pcJsonSrc, size_t uJsonSrcLen, char 
         kvsFree(pcDataEndpoint);
     }
 
-    if (pxRootValue != NULL) {
-        json_value_free(pxRootValue);
-    }
-
-    STRING_delete(xStJson);
+    cJSON_Delete(pxRoot);
 
     return res;
 }
@@ -359,15 +347,15 @@ static ePutMediaFragmentAckEventType prvGetEventType(char *pcEventType)
     ePutMediaFragmentAckEventType ev = eUnknown;
 
     if (pcEventType != NULL) {
-        if (strncmp(pcEventType, EVENT_TYPE_BUFFERING, sizeof(EVENT_TYPE_BUFFERING) - 1) == 0) {
+        if (strcmp(pcEventType, EVENT_TYPE_BUFFERING) == 0) {
             ev = eBuffering;
-        } else if (strncmp(pcEventType, EVENT_TYPE_RECEIVED, sizeof(EVENT_TYPE_RECEIVED) - 1) == 0) {
+        } else if (strcmp(pcEventType, EVENT_TYPE_RECEIVED) == 0) {
             ev = eReceived;
-        } else if (strncmp(pcEventType, EVENT_TYPE_PERSISTED, sizeof(EVENT_TYPE_PERSISTED) - 1) == 0) {
+        } else if (strcmp(pcEventType, EVENT_TYPE_PERSISTED) == 0) {
             ev = ePersisted;
-        } else if (strncmp(pcEventType, EVENT_TYPE_ERROR, sizeof(EVENT_TYPE_ERROR) - 1) == 0) {
+        } else if (strcmp(pcEventType, EVENT_TYPE_ERROR) == 0) {
             ev = eError;
-        } else if (strncmp(pcEventType, EVENT_TYPE_IDLE, sizeof(EVENT_TYPE_IDLE) - 1) == 0) {
+        } else if (strcmp(pcEventType, EVENT_TYPE_IDLE) == 0) {
             ev = eIdle;
         }
     }
@@ -375,40 +363,35 @@ static ePutMediaFragmentAckEventType prvGetEventType(char *pcEventType)
     return ev;
 }
 
-static int parseFragmentMsg(const char *pcFragmentMsg, FragmentAck_t *pxFragmentAck)
+static int parseFragmentMsg(const char *pcFragmentMsg, size_t uFragmentMsgLen, FragmentAck_t *pxFragmentAck)
 {
     int res = PUT_MEDIA_ERRNO_NONE;
-    JSON_Value *pxRootValue = NULL;
-    JSON_Object *pxRootObject = NULL;
+    cJSON *pxRoot = NULL;
     char *pcEventType = NULL;
 
-    json_set_escape_slashes(0);
-
-    if (pcFragmentMsg == NULL || pxFragmentAck == NULL) {
+    if (pcFragmentMsg == NULL || uFragmentMsgLen == 0 || pxFragmentAck == NULL) {
         res = PUT_MEDIA_ERROR_INVALID_ARGUMENT;
         ESP_LOGE(TAG, "Invalid argument");
-    } else if ((pxRootValue = json_parse_string(pcFragmentMsg)) == NULL || (pxRootObject = json_value_get_object(pxRootValue)) == NULL) {
+    } else if ((pxRoot = cJSON_ParseWithLength(pcFragmentMsg, uFragmentMsgLen)) == NULL) {
         res = PUT_MEDIA_ERROR_FAIL_TO_PARSE_FRAGMENT_ACK_MSG;
-        ESP_LOGI(TAG, "Failed to parse fragment msg:%s", pcFragmentMsg);
-    } else if ((pcEventType = json_object_dotget_serialize_to_string(pxRootObject, JSON_KEY_EVENT_TYPE, false)) == NULL) {
+        ESP_LOGI(TAG, "Failed to parse fragment msg:%.*s", (int)uFragmentMsgLen, pcFragmentMsg);
+    } else if ((pcEventType = json_dotget_string(pxRoot, JSON_KEY_EVENT_TYPE)) == NULL) {
         res = PUT_MEDIA_ERROR_UNKNOWN_FRAGMENT_ACK_TYPE;
-        ESP_LOGI(TAG, "Unknown fragment ack:%s", pcFragmentMsg);
+        ESP_LOGI(TAG, "Unknown fragment ack:%.*s", (int)uFragmentMsgLen, pcFragmentMsg);
     } else {
         pxFragmentAck->eventType = prvGetEventType(pcEventType);
         kvsFree(pcEventType);
 
         if (pxFragmentAck->eventType == eBuffering || pxFragmentAck->eventType == eReceived || pxFragmentAck->eventType == ePersisted ||
                 pxFragmentAck->eventType == eError) {
-            pxFragmentAck->uFragmentTimecode = json_object_dotget_uint64(pxRootObject, JSON_KEY_FRAGMENT_TIMECODE, 10);
+            pxFragmentAck->uFragmentTimecode = json_dotget_uint64(pxRoot, JSON_KEY_FRAGMENT_TIMECODE, 10);
             if (pxFragmentAck->eventType == eError) {
-                pxFragmentAck->uErrorId = (unsigned int)json_object_dotget_uint64(pxRootObject, JSON_KEY_ERROR_ID, 10);
+                pxFragmentAck->uErrorId = (unsigned int)json_dotget_uint64(pxRoot, JSON_KEY_ERROR_ID, 10);
             }
         }
     }
 
-    if (pxRootValue != NULL) {
-        json_value_free(pxRootValue);
-    }
+    cJSON_Delete(pxRoot);
 
     return res;
 }
@@ -418,7 +401,6 @@ static int prvParseFragmentAck(char *pcSrc, size_t uLen, FragmentAck_t *pxFragAc
     int res = PUT_MEDIA_ERRNO_NONE;
     size_t uMsgLen = 0;
     size_t uBytesRead = 0;
-    STRING_HANDLE xStFragMsg = NULL;
 
     if (pcSrc == NULL || uLen == 0 || pxFragAck == NULL || puFragAckLen == NULL) {
         res = PUT_MEDIA_ERROR_INVALID_ARGUMENT;
@@ -441,37 +423,22 @@ static int prvParseFragmentAck(char *pcSrc, size_t uLen, FragmentAck_t *pxFragAc
             uLineLen = uLen;
         }
         if (uLineLen > 0 && pcSrc[0] == '{') {
-            char *pcJson = (char *)kvsMalloc(uLineLen + 1);
-            if (pcJson == NULL) {
-                res = PUT_MEDIA_ERROR_OUT_OF_MEMORY;
-            } else {
-                memcpy(pcJson, pcSrc, uLineLen);
-                pcJson[uLineLen] = '\0';
-                res = parseFragmentMsg(pcJson, pxFragAck);
-                kvsFree(pcJson);
-                if (res == PUT_MEDIA_ERRNO_NONE) {
-                    *puFragAckLen = uLineLen;
-                }
+            res = parseFragmentMsg(pcSrc, uLineLen, pxFragAck);
+            if (res == PUT_MEDIA_ERRNO_NONE) {
+                *puFragAckLen = uLineLen;
             }
         } else {
             res = PUT_MEDIA_ERROR_FAIL_TO_PARSE_FRAGMENT_ACK_MSG;
             ESP_LOGI(TAG, "Unknown fragment ack:%.*s", (int)uLen, pcSrc);
         }
     } else {
-        char tempBuffer[uMsgLen + 1];
-        memcpy(tempBuffer, pcSrc + uBytesRead, uMsgLen);
-        tempBuffer[uMsgLen] = '\0';
-
-        if ((xStFragMsg = STRING_construct_n(tempBuffer, uMsgLen)) == NULL ||
-                parseFragmentMsg(STRING_c_str(xStFragMsg), pxFragAck) != PUT_MEDIA_ERRNO_NONE) {
+        if (parseFragmentMsg(pcSrc + uBytesRead, uMsgLen, pxFragAck) != PUT_MEDIA_ERRNO_NONE) {
             res = PUT_MEDIA_ERROR_FAIL_TO_PARSE_FRAGMENT_ACK_MSG;
             ESP_LOGI(TAG, "Failed to parse fragment ack");
         } else {
             *puFragAckLen = uBytesRead + uMsgLen + 2;
         }
     }
-
-    STRING_delete(xStFragMsg);
 
     return res;
 }

@@ -14,9 +14,13 @@
  */
 
 #include <inttypes.h>
+#include <limits.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <net/netio.h>
 
 /* Third party headers */
 #include "azure_c_shared_utility/httpheaders.h"
@@ -142,7 +146,6 @@ static int prvSetHeadersFromHandle(esp_http_client_handle_t h, HTTP_HEADERS_HAND
     size_t i;
     char *pcHeader = NULL;
     char key[128];
-    char value[1024];
 
     if (HTTPHeaders_GetHeaderCount(xHttpReqHeaders, &uHeadersCnt) != HTTP_HEADERS_OK) {
         return PUT_MEDIA_ERROR_UNABLE_TO_GET_HTTP_HEADER_COUNT;
@@ -151,16 +154,31 @@ static int prvSetHeadersFromHandle(esp_http_client_handle_t h, HTTP_HEADERS_HAND
         if (HTTPHeaders_GetHeader(xHttpReqHeaders, i, &pcHeader) != HTTP_HEADERS_OK) {
             return PUT_MEDIA_ERROR_UNABLE_TO_GET_HTTP_HEADER;
         }
-        prvParseHeaderLine(pcHeader, key, sizeof(key), value, sizeof(value));
+        /* Size the value buffer to the whole "name: value" line — the value can
+         * never be longer than that. Heap-allocated so a long header (e.g. the
+         * x-amz-security-token STS token, which exceeds 1 KB) is never truncated,
+         * and we don't blow the small put_media_task stack. */
+        size_t value_bufsz = strlen(pcHeader) + 1;
+        char *value = malloc(value_bufsz);
+        if (value == NULL) {
+            free(pcHeader);
+            return PUT_MEDIA_ERROR_UNABLE_TO_GET_HTTP_HEADER;
+        }
+        prvParseHeaderLine(pcHeader, key, sizeof(key), value, value_bufsz);
         free(pcHeader);
         pcHeader = NULL;
         if (key[0] != '\0') {
-            ESP_LOGI(TAG, "%s: %s", key, value);
+            /* Never log the SigV4 signature or the STS session token. */
+            bool bSecret = (strcasecmp(key, HDR_AUTHORIZATION) == 0 ||
+                            strcasecmp(key, HDR_X_AMZ_SECURITY_TOKEN) == 0);
+            ESP_LOGD(TAG, "%s: %s", key, bSecret ? "<redacted>" : value);
             esp_err_t err = esp_http_client_set_header(h, key, value);
             if (err != ESP_OK) {
+                free(value);
                 return PUT_MEDIA_ERROR_UNABLE_TO_GET_HTTP_HEADER;
             }
         }
+        free(value);
     }
     return PUT_MEDIA_ERRNO_NONE;
 }
@@ -250,7 +268,7 @@ int Http_performRequest(const char *pcHost, const char *pcPort, const char *pcUr
     }
 
     if (http_method == HTTP_METHOD_POST && strlen(pcBody) > 0) {
-        ESP_LOGI(TAG, "body: %s", pcBody);
+        ESP_LOGD(TAG, "body: %s", pcBody);
         esp_http_client_set_post_field(h, pcBody, strlen(pcBody));
     }
 
@@ -368,34 +386,68 @@ put_media_err_t Http_performRequestWithX509(const char *pcHost, const char *pcPo
     return res;
 }
 
+/*
+ * Write uBytesToSend bytes to an already-open connection.
+ *
+ * Note on the n <= 0 test: esp_http_client_write() returns whatever
+ * esp_transport_write() returned, and ssl_write() returns its *poll* result,
+ * which is 0 (not negative) when the socket does not become writable within
+ * timeout_ms. Treating only n < 0 as an error would spin forever on a stalled
+ * link, so anything that is not forward progress is a failure here.
+ */
+static put_media_err_t prvWriteFully(esp_http_client_handle_t http_client, const char *pBuffer, size_t uBytesToSend)
+{
+    size_t bytes_sent = 0;
+
+    while (bytes_sent < uBytesToSend) {
+        int n = esp_http_client_write(http_client, pBuffer + bytes_sent, (int)(uBytesToSend - bytes_sent));
+        if (n <= 0) {
+            ESP_LOGE(TAG, "esp_http_client_write returned %d after %zu/%zu bytes", n, bytes_sent, uBytesToSend);
+            return PUT_MEDIA_ERROR_NETIO_UNABLE_TO_SEND_CONTENT;
+        }
+        bytes_sent += (size_t)n;
+    }
+
+    return PUT_MEDIA_ERRNO_NONE;
+}
+
 put_media_err_t Http_write_chunk(esp_http_client_handle_t http_client, const char *pBuffer, size_t uBytesToSend)
 {
     put_media_err_t err = PUT_MEDIA_ERRNO_NONE;
-    if (http_client == NULL || pBuffer == NULL || uBytesToSend == 0) {
+
+    /* esp_http_client_chunk_write_begin() takes an int length. */
+    if (http_client == NULL || pBuffer == NULL || uBytesToSend == 0 || uBytesToSend > INT_MAX) {
         err = PUT_MEDIA_ERROR_INVALID_ARGUMENT;
-    } else if (esp_http_client_chunk_write_begin(http_client, uBytesToSend) != 0) {
+    } else if (esp_http_client_chunk_write_begin(http_client, (int)uBytesToSend) != 0) {
         err = PUT_MEDIA_ERROR_NETIO_UNABLE_TO_SEND_CONTENT;
-    } else {
-        int bytes_sent = 0;
-        while (bytes_sent < uBytesToSend) {
-            int n = esp_http_client_write(http_client, pBuffer + bytes_sent, uBytesToSend);
-            if (n < 0) {
-                ESP_LOGE(TAG, "esp_http_client_write error %d", n);
-                break;
-            }
-
-            bytes_sent += n;
-        }
-
-        if (bytes_sent < uBytesToSend) {
-            err = PUT_MEDIA_ERROR_NETIO_UNABLE_TO_SEND_CONTENT;
-        } else {
-            err = esp_http_client_chunk_write_end(http_client, false) == 0 ?
-                PUT_MEDIA_ERRNO_NONE : PUT_MEDIA_ERROR_NETIO_UNABLE_TO_SEND_CONTENT;
-        }
+    } else if ((err = prvWriteFully(http_client, pBuffer, uBytesToSend)) != PUT_MEDIA_ERRNO_NONE) {
+        /*
+         * The chunk header is already on the wire but the body is short: the
+         * request body is now unparseable and the connection cannot be reused.
+         * The caller is responsible for tearing the session down.
+         */
+        ESP_LOGE(TAG, "Chunk body truncated, HTTP stream is no longer usable");
+    } else if (esp_http_client_chunk_write_end(http_client, false) != 0) {
+        err = PUT_MEDIA_ERROR_NETIO_UNABLE_TO_SEND_CONTENT;
     }
 
     return err;
+}
+
+put_media_err_t Http_finishChunkedRequest(esp_http_client_handle_t http_client)
+{
+    /*
+     * Written directly rather than via esp_http_client_chunk_write_end(client, true):
+     * that API always emits a "\r\n" chunk trailer before the terminator, which
+     * would inject a stray CRLF after an already-completed chunk.
+     */
+    static const char terminator[] = "0\r\n\r\n";
+
+    if (http_client == NULL) {
+        return PUT_MEDIA_ERROR_INVALID_ARGUMENT;
+    }
+
+    return prvWriteFully(http_client, terminator, sizeof(terminator) - 1);
 }
 
 put_media_err_t Http_openChunkedRequest(const char *pcHost, const char *pcPort, const char *pcUri,
@@ -448,8 +500,12 @@ put_media_err_t Http_openChunkedRequest(const char *pcHost, const char *pcPort, 
         return res;
     }
 
-    err = esp_http_client_fetch_headers(h);
-    if (err != ESP_OK) {
+    /*
+     * esp_http_client_fetch_headers() returns the content length (0 when the
+     * response carries no Content-Length), not an esp_err_t. Only a negative
+     * value is an error.
+     */
+    if (esp_http_client_fetch_headers(h) < 0) {
         res = PUT_MEDIA_ERROR_RECV_ZERO_SIZED_HTTP_DATA;
         esp_http_client_cleanup(h);
         return res;

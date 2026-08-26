@@ -23,6 +23,9 @@
 /* Longer timeouts for PutMedia stream to avoid transport_base poll timeout on slow/congested links */
 #define DEFAULT_PUT_MEDIA_HTTP_TIMEOUT_MS (2000)
 #define DEFAULT_PUT_MEDIA_STACK_SIZE      (6 * 1024)
+/* How long put_media_deinit() waits for the task to leave its loop before giving up. */
+#define PUT_MEDIA_TASK_EXIT_TIMEOUT_MS    (5000)
+#define PUT_MEDIA_TASK_EXIT_POLL_MS       (10)
 
 #define TAG "PUT_MEDIA"
 
@@ -66,6 +69,8 @@ static struct {
     uint8_t *put_media_task_stack;
     uint8_t *put_media_task_buffer;
     QueueHandle_t mkv_buf_queue;
+    /* Set by the task just before it deletes itself, so deinit knows its stack is idle. */
+    volatile bool task_exited;
 
     enum {
         TASK_DEINITIATED = 0,
@@ -77,7 +82,8 @@ static struct {
 
 enum {
     START_TASK_SIGNAL = BIT1,
-    STOP_TASK_SIGNAL  = BIT2
+    STOP_TASK_SIGNAL  = BIT2,
+    EXIT_TASK_SIGNAL  = BIT3
 };
 
 static put_media_err_t put_media_update(mkv_buf_info_t mkv_buf_info);
@@ -158,7 +164,12 @@ static int updateAndVerifyRestfulReqParameters()
         put_media_priv_data.xGetDataEpPara.pcStreamName = put_media_priv_data.pStreamName;
 
         put_media_priv_data.xPutMediaPara.pcStreamName = put_media_priv_data.pStreamName;
-        put_media_priv_data.xPutMediaPara.xTimecodeType = TIMECODE_TYPE_ABSOLUTE;
+        /* The MKV mux emits cluster timecodes relative to stream start (not
+         * absolute epoch), while x-amzn-producer-start-timestamp carries the
+         * real epoch. Tell KVS the timecodes are RELATIVE so it computes the
+         * producer timestamp as start + offset; ABSOLUTE made every fragment
+         * land at ~1970 and disappear from producer-timestamp queries. */
+        put_media_priv_data.xPutMediaPara.xTimecodeType = TIMECODE_TYPE_RELATIVE;
         put_media_priv_data.xPutMediaPara.uRecvTimeoutMs = DEFAULT_PUT_MEDIA_HTTP_TIMEOUT_MS;
         put_media_priv_data.xPutMediaPara.uSendTimeoutMs = DEFAULT_PUT_MEDIA_HTTP_TIMEOUT_MS;
     }
@@ -275,7 +286,7 @@ put_media_err_t put_media_start()
 
 bool put_media_is_started()
 {
-    return put_media_priv_data.xPutMediaHandle != NULL;
+    return put_media_priv_data.state == TASK_STARTED;
 }
 
 put_media_err_t put_media_stop()
@@ -372,7 +383,7 @@ static put_media_err_t put_media_update(mkv_buf_info_t mkv_buf_info)
         }
 
         mkv_header = mkv_buf_info;
-        mkv_header.buffer = malloc(mkv_buf_info.uDataLen);
+        mkv_header.buffer = heap_caps_malloc(mkv_buf_info.uDataLen, MALLOC_CAP_SPIRAM);
         if (!mkv_header.buffer) {
             res = PUT_MEDIA_ERROR_OUT_OF_MEMORY;
             break;
@@ -455,6 +466,19 @@ static void put_media_service_stop()
     }
 }
 
+/*
+ * Drop the current PutMedia session and open a fresh one. Used both when a
+ * fragment ack reports an error and when a chunk write fails - the latter
+ * leaves the HTTP request body mid-chunk, so the connection is unusable and
+ * continuing to write into it would corrupt the stream.
+ */
+static put_media_err_t put_media_session_restart()
+{
+    ESP_LOGI(TAG, "Restarting Put Media session");
+    put_media_service_stop();
+    return put_media_service_start();
+}
+
 put_media_err_t put_media_maintain()
 {
     put_media_err_t res = PUT_MEDIA_ERRNO_NONE;
@@ -500,9 +524,7 @@ put_media_err_t put_media_maintain()
                 }
             }
 
-            ESP_LOGI(TAG, "Stopping Put Media");
-            put_media_service_stop();
-            res = put_media_service_start();
+            res = put_media_session_restart();
         }
     }
 
@@ -516,12 +538,18 @@ static void put_media_task(void *pvParameters)
     size_t data_sent = 0;
     int64_t prev_time = 0;
 
-    while (true) {
+    bool exit_requested = false;
+
+    while (!exit_requested) {
         uint32_t notification_value = 0;
         while (xTaskNotifyWait(0, UINT32_MAX, &notification_value, portMAX_DELAY) == pdTRUE
-                && !(notification_value & START_TASK_SIGNAL)) { }
+                && !(notification_value & (START_TASK_SIGNAL | EXIT_TASK_SIGNAL))) { }
 
-        esp_err_t res = put_media_service_start();
+        if (notification_value & EXIT_TASK_SIGNAL) {
+            break;
+        }
+
+        put_media_err_t res = put_media_service_start();
 
         if (res != PUT_MEDIA_ERRNO_NONE) {
             ESP_LOGE(TAG, "Error while put media start %d", res);
@@ -542,6 +570,10 @@ static void put_media_task(void *pvParameters)
         while (true) {
             mkv_buf_info_t mkv_buf_info;
             xTaskNotifyWait(0, UINT32_MAX, &notification_value, 1);
+            if (notification_value & EXIT_TASK_SIGNAL) {
+                exit_requested = true;
+                break;
+            }
             if (notification_value & STOP_TASK_SIGNAL) {
                 break;
             }
@@ -552,6 +584,19 @@ static void put_media_task(void *pvParameters)
                     ESP_LOGE(TAG, "put media update failed: %d", res);
                     put_media_event_data_t ev = { .event = PUT_MEDIA_ON_ERROR, .data = { .error_code = res } };
                     put_media_notify_event(&ev);
+
+                    /*
+                     * The write may have failed partway through a chunk, which
+                     * leaves the request body unparseable. Reconnect before the
+                     * next frame instead of writing into a broken stream.
+                     */
+                    free(mkv_buf_info.buffer);
+                    if ((res = put_media_session_restart()) != PUT_MEDIA_ERRNO_NONE) {
+                        ESP_LOGE(TAG, "put media session restart failed: %d", res);
+                        put_media_event_data_t restart_ev = { .event = PUT_MEDIA_ON_ERROR, .data = { .error_code = res } };
+                        put_media_notify_event(&restart_ev);
+                    }
+                    continue;
                 }
                 data_sent += mkv_buf_info.uDataLen;
                 if ((res = put_media_maintain()) != PUT_MEDIA_ERRNO_NONE) {
@@ -563,7 +608,7 @@ static void put_media_task(void *pvParameters)
 
                 int64_t ctime = esp_timer_get_time();
                 if (ctime - prev_time > 1000 * 1000 * 1) {
-                    ESP_LOGI(TAG, "data sent: %d", data_sent);
+                    ESP_LOGI(TAG, "data sent: %zu", data_sent);
                     prev_time = ctime;
                 }
             }
@@ -580,15 +625,71 @@ static void put_media_task(void *pvParameters)
 
         ESP_LOGI(TAG, "Put media stopped");
     }
+
+    /* Signal deinit that the stack is no longer in use, then retire. */
+    put_media_priv_data.state = TASK_DEINITIATED;
+    put_media_priv_data.task_exited = true;
+    vTaskDelete(NULL);
+}
+
+/*
+ * Ask the task to leave its loop and wait for it to actually get there.
+ * Returns false if it did not, in which case its stack must not be freed.
+ */
+static bool put_media_task_shutdown()
+{
+    int waited_ms = 0;
+
+    if (put_media_priv_data.put_media_task_handle == NULL) {
+        return true;
+    }
+
+    put_media_priv_data.task_exited = false;
+    xTaskNotify(put_media_priv_data.put_media_task_handle, EXIT_TASK_SIGNAL, eSetValueWithOverwrite);
+
+    while (!put_media_priv_data.task_exited && waited_ms < PUT_MEDIA_TASK_EXIT_TIMEOUT_MS) {
+        vTaskDelay(pdMS_TO_TICKS(PUT_MEDIA_TASK_EXIT_POLL_MS));
+        waited_ms += PUT_MEDIA_TASK_EXIT_POLL_MS;
+    }
+
+    put_media_priv_data.put_media_task_handle = NULL;
+
+    if (!put_media_priv_data.task_exited) {
+        return false;
+    }
+
+    /* Give the idle task a chance to finish with the deleted task first. */
+    vTaskDelay(pdMS_TO_TICKS(20));
+    return true;
+}
+
+static void put_media_drain_queue()
+{
+    mkv_buf_info_t mkv_buf_info;
+
+    if (put_media_priv_data.mkv_buf_queue == NULL) {
+        return;
+    }
+
+    while (xQueueReceive(put_media_priv_data.mkv_buf_queue, &mkv_buf_info, 0) == pdTRUE) {
+        free(mkv_buf_info.buffer);
+    }
 }
 
 put_media_err_t put_media_deinit()
 {
-    esp_err_t err = put_media_stop();
+    put_media_err_t err = put_media_stop();
+    bool task_stack_reclaimable;
 
     if (err != PUT_MEDIA_ERRNO_NONE) {
         ESP_LOGE(TAG, "Could not stop put media");
         return err;
+    }
+
+    /* Retire the task before touching anything it might still be using. */
+    task_stack_reclaimable = put_media_task_shutdown();
+    if (!task_stack_reclaimable) {
+        ESP_LOGE(TAG, "put_media task did not exit in time; leaking its stack rather than freeing it in use");
     }
 
     if (put_media_priv_data.pHost != NULL) {
@@ -611,18 +712,14 @@ put_media_err_t put_media_deinit()
         free(put_media_priv_data.pDataEndpoint);
         put_media_priv_data.pDataEndpoint = NULL;
     }
-    if (put_media_priv_data.pAwsAccessKeyId != NULL) {
-        free(put_media_priv_data.pAwsAccessKeyId);
-        put_media_priv_data.pAwsAccessKeyId = NULL;
-    }
-    if (put_media_priv_data.pAwsSecretAccessKey != NULL) {
-        free(put_media_priv_data.pAwsSecretAccessKey);
-        put_media_priv_data.pAwsSecretAccessKey = NULL;
-    }
-    if (put_media_priv_data.pAwsSessionToken != NULL) {
-        free(put_media_priv_data.pAwsSessionToken);
-        put_media_priv_data.pAwsSessionToken = NULL;
-    }
+    /*
+     * The AWS credential strings are NOT owned here: kvs_fetch_credentials_cb
+     * writes its own pointers into these fields (see put_media_service_start),
+     * and the callback keeps ownership. Only drop the references.
+     */
+    put_media_priv_data.pAwsAccessKeyId = NULL;
+    put_media_priv_data.pAwsSecretAccessKey = NULL;
+    put_media_priv_data.pAwsSessionToken = NULL;
     if (put_media_priv_data.pIotCredentialHost != NULL) {
         free(put_media_priv_data.pIotCredentialHost);
         put_media_priv_data.pIotCredentialHost = NULL;
@@ -648,22 +745,21 @@ put_media_err_t put_media_deinit()
         put_media_priv_data.pIotX509PrivateKey = NULL;
     }
 
-    if (put_media_priv_data.put_media_task_handle) {
-        vTaskDelete(put_media_priv_data.put_media_task_handle);
-        put_media_priv_data.put_media_task_handle = NULL;
-    }
+    if (task_stack_reclaimable) {
+        if (put_media_priv_data.put_media_task_buffer) {
+            free(put_media_priv_data.put_media_task_buffer);
+            put_media_priv_data.put_media_task_buffer = NULL;
+        }
 
-    if (put_media_priv_data.put_media_task_buffer) {
-        free(put_media_priv_data.put_media_task_buffer);
-        put_media_priv_data.put_media_task_buffer = NULL;
-    }
-
-    if (put_media_priv_data.put_media_task_stack) {
-        free(put_media_priv_data.put_media_task_stack);
-        put_media_priv_data.put_media_task_stack = NULL;
+        if (put_media_priv_data.put_media_task_stack) {
+            free(put_media_priv_data.put_media_task_stack);
+            put_media_priv_data.put_media_task_stack = NULL;
+        }
     }
 
     if (put_media_priv_data.mkv_buf_queue) {
+        /* Frames still queued own their buffers; release them before the queue goes. */
+        put_media_drain_queue();
         vQueueDelete(put_media_priv_data.mkv_buf_queue);
         put_media_priv_data.mkv_buf_queue = NULL;
     }

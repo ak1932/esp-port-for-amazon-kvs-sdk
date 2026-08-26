@@ -15,6 +15,7 @@
 
 #include <ctype.h>
 #include <inttypes.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -59,6 +60,13 @@
 
 #define PORT_HTTPS "443"
 
+#define URI_SCHEME_HTTPS "https://"
+#define URI_SCHEME_HTTPS_LEN (sizeof(URI_SCHEME_HTTPS) - 1)
+
+/* Bounds for draining the PutMedia response after the final chunk is sent. */
+#define PUT_MEDIA_DRAIN_TIMEOUT_MS (500)
+#define PUT_MEDIA_DRAIN_MAX_READS  (8)
+
 /*-----------------------------------------------------------*/
 
 #define KVS_URI_CREATE_STREAM "/createStream"
@@ -91,6 +99,12 @@ typedef struct PutMedia {
     DLIST_ENTRY xPendingFragmentAcks;
     /* After 100 Continue we must call fetch_headers() once to consume 200 before esp_http_client_read() can return acks */
     int bSecondResponseHeadersFetched;
+    /*
+     * Set when a chunk write failed after its header was already on the wire.
+     * The request body is then malformed: no further chunks may be written and
+     * the stream must not be terminated gracefully - only closed.
+     */
+    bool bStreamCorrupted;
     unsigned int uRecvTimeoutMs;
 } PutMedia_t;
 
@@ -239,13 +253,19 @@ static int prvParseDataEndpoint(const char *pcJsonSrc, size_t uJsonSrcLen, char 
         res = PUT_MEDIA_ERROR_FAIL_TO_PARSE_DATA_ENDPOINT;
         ESP_LOGE(TAG, "Failed to parse data endpoint");
     } else {
-        /* Please note that the memory of pcDataEndpoint is from malloc and we tranfer the ownership to caller here. */
+        /* The service returns "https://<host>"; strip the scheme and hand the host to the caller. */
         uEndpointLen = strlen(pcDataEndpoint);
-        if (uEndpointLen > 8) {
-            uEndpointLen -= 8;
+        if (uEndpointLen <= URI_SCHEME_HTTPS_LEN || strncmp(pcDataEndpoint, URI_SCHEME_HTTPS, URI_SCHEME_HTTPS_LEN) != 0) {
+            res = PUT_MEDIA_ERROR_FAIL_TO_PARSE_DATA_ENDPOINT;
+            ESP_LOGE(TAG, "Unexpected data endpoint format:%s", pcDataEndpoint);
+        } else {
+            uEndpointLen -= URI_SCHEME_HTTPS_LEN;
             *ppcEndpoint = (char *)kvsMalloc(uEndpointLen + 1);
-            if (*ppcEndpoint != NULL) {
-                memcpy(*ppcEndpoint, pcDataEndpoint + 8, uEndpointLen);
+            if (*ppcEndpoint == NULL) {
+                res = PUT_MEDIA_ERROR_OUT_OF_MEMORY;
+                ESP_LOGE(TAG, "OOM: data endpoint");
+            } else {
+                memcpy(*ppcEndpoint, pcDataEndpoint + URI_SCHEME_HTTPS_LEN, uEndpointLen);
                 (*ppcEndpoint)[uEndpointLen] = '\0';
             }
         }
@@ -875,6 +895,7 @@ int Kvs_putMediaStart(KvsServiceParameter_t *pServPara, KvsPutMediaParameter_t *
 
         if (uHttpStatusCode != 100 && uHttpStatusCode != 200) {
             ESP_LOGE(TAG, "Put Media failed, HTTP status code: %u", uHttpStatusCode);
+            res = PUT_MEDIA_GENERATE_RESTFUL_ERROR(uHttpStatusCode);
             esp_http_client_cleanup(xHttpClient);
             xHttpClient = NULL;
         } else {
@@ -902,6 +923,26 @@ int Kvs_putMediaStart(KvsServiceParameter_t *pServPara, KvsPutMediaParameter_t *
     return res;
 }
 
+/*
+ * Write one chunk, refusing to touch a stream that a previous failure already
+ * left mid-chunk and latching that state when a new failure happens. Once this
+ * returns an error the caller must abandon the session: the request body cannot
+ * be repaired, and writing the next chunk header into it would corrupt whatever
+ * the service has parsed so far.
+ */
+static int prvWriteChunkChecked(PutMedia_t *pPutMedia, const uint8_t *pBuf, size_t uLen)
+{
+    int res = PUT_MEDIA_ERRNO_NONE;
+
+    if (pPutMedia->bStreamCorrupted) {
+        res = PUT_MEDIA_ERROR_INVALID_STATE;
+    } else if ((res = Http_write_chunk(pPutMedia->xHttpClient, (const char *)pBuf, uLen)) != PUT_MEDIA_ERRNO_NONE) {
+        pPutMedia->bStreamCorrupted = true;
+    }
+
+    return res;
+}
+
 int Kvs_putMediaUpdate(PutMediaHandle xPutMediaHandle, uint8_t *pMkvHeader, size_t uMkvHeaderLen, uint8_t *pData, size_t uDataLen)
 {
     int res = PUT_MEDIA_ERRNO_NONE;
@@ -915,10 +956,10 @@ int Kvs_putMediaUpdate(PutMediaHandle xPutMediaHandle, uint8_t *pMkvHeader, size
         res = PUT_MEDIA_ERROR_INVALID_ARGUMENT;
         ESP_LOGE(TAG, "Invalid argument");
     } else {
-        if ((res = Http_write_chunk(pPutMedia->xHttpClient, (const char *)pMkvHeader, uMkvHeaderLen)) != PUT_MEDIA_ERRNO_NONE) {
+        if ((res = prvWriteChunkChecked(pPutMedia, pMkvHeader, uMkvHeaderLen)) != PUT_MEDIA_ERRNO_NONE) {
             ESP_LOGE(TAG, "Failed to send MKV header chunk");
-        } else if (pData != NULL && uDataLen > 0 &&
-                   (res = Http_write_chunk(pPutMedia->xHttpClient, (const char *)pData, uDataLen)) != PUT_MEDIA_ERRNO_NONE) {
+        } else if (uDataLen > 0 &&
+                   (res = prvWriteChunkChecked(pPutMedia, pData, uDataLen)) != PUT_MEDIA_ERRNO_NONE) {
             ESP_LOGE(TAG, "Failed to send data frame");
         }
     }
@@ -935,7 +976,7 @@ int Kvs_putMediaUpdateRaw(PutMediaHandle xPutMediaHandle, uint8_t *pBuf, size_t 
         res = PUT_MEDIA_ERROR_INVALID_ARGUMENT;
         ESP_LOGE(TAG, "Invalid argument");
     } else {
-        if ((res = Http_write_chunk(pPutMedia->xHttpClient, (const char *)pBuf, uLen)) != PUT_MEDIA_ERRNO_NONE) {
+        if ((res = prvWriteChunkChecked(pPutMedia, pBuf, uLen)) != PUT_MEDIA_ERRNO_NONE) {
             ESP_LOGE(TAG, "Failed to send data frame");
         }
     }
@@ -961,14 +1002,43 @@ void print_escaped(const char *str, size_t len) {
     }
 }
 
+/*
+ * Parse every fragment ack packed into pBuf and queue it for the caller.
+ * Returns a PUTMEDIA error if one of the acks reports a session error.
+ */
+static int prvProcessAckBuffer(PutMedia_t *pPutMedia, const uint8_t *pBuf, int uLen)
+{
+    int res = PUT_MEDIA_ERRNO_NONE;
+    int uBytesConsumed = 0;
+    FragmentAck_t xFragmentAck = {0};
+    size_t uFragAckLen = 0;
+
+    while (uBytesConsumed < uLen) {
+        memset(&xFragmentAck, 0, sizeof(FragmentAck_t));
+        if (prvParseFragmentAck((char *)pBuf + uBytesConsumed, uLen - uBytesConsumed, &xFragmentAck, &uFragAckLen) != PUT_MEDIA_ERRNO_NONE ||
+                uFragAckLen == 0) {
+            break;
+        }
+
+        prvLogFragmentAck(&xFragmentAck);
+        prvPushFragmentAck(pPutMedia, &xFragmentAck);
+        if (xFragmentAck.eventType == eError) {
+            res = PUT_MEDIA_GENERATE_PUTMEDIA_ERROR(xFragmentAck.uErrorId);
+            break;
+        }
+
+        uBytesConsumed += uFragAckLen;
+    }
+
+    return res;
+}
+
 int Kvs_putMediaDoWork(PutMediaHandle xPutMediaHandle)
 {
     int res = PUT_MEDIA_ERRNO_NONE;
     PutMedia_t *pPutMedia = xPutMediaHandle;
     int uBytesTotalReceived = 0;
     int uBytesReceived = 0;
-    FragmentAck_t xFragmentAck = {0};
-    size_t uFragAckLen = 0;
     uint8_t buffer[2560];
 
     if (pPutMedia == NULL || pPutMedia->xHttpClient == NULL) {
@@ -1012,25 +1082,7 @@ int Kvs_putMediaDoWork(PutMediaHandle xPutMediaHandle)
 
         if (res == PUT_MEDIA_ERRNO_NONE && uBytesTotalReceived > 0) {
             ESP_LOGD(TAG, "uBytesReceived: %d", uBytesTotalReceived);
-            // print_escaped((const char *) buffer, uBytesTotalReceived);
-            // printf("\n");
-            uBytesReceived = 0;
-            while (uBytesReceived < uBytesTotalReceived) {
-                memset(&xFragmentAck, 0, sizeof(FragmentAck_t));
-                if (prvParseFragmentAck((char *)buffer + uBytesReceived, uBytesTotalReceived - uBytesReceived, &xFragmentAck, &uFragAckLen) != PUT_MEDIA_ERRNO_NONE ||
-                        uFragAckLen == 0) {
-                    break;
-                } else {
-                    prvLogFragmentAck(&xFragmentAck);
-                    prvPushFragmentAck(pPutMedia, &xFragmentAck);
-                    if (xFragmentAck.eventType == eError) {
-                        res = PUT_MEDIA_GENERATE_PUTMEDIA_ERROR(xFragmentAck.uErrorId);
-                        break;
-                    }
-                }
-                uBytesReceived += uFragAckLen;
-            }
-
+            res = prvProcessAckBuffer(pPutMedia, buffer, uBytesTotalReceived);
             prvLogPendingFragmentAcks(pPutMedia);
         }
     }
@@ -1038,18 +1090,58 @@ int Kvs_putMediaDoWork(PutMediaHandle xPutMediaHandle)
     return res;
 }
 
+/*
+ * Close the chunked request body and read whatever the service has left to say.
+ * Without the terminator AWS sees a truncated PutMedia request and may drop the
+ * final fragment, and any terminal error ack would be lost.
+ */
+static void prvFinishAndDrain(PutMedia_t *pPutMedia)
+{
+    uint8_t buffer[512];
+    int i;
+
+    if (Http_finishChunkedRequest(pPutMedia->xHttpClient) != PUT_MEDIA_ERRNO_NONE) {
+        ESP_LOGW(TAG, "Failed to send final chunk terminator");
+        return;
+    }
+
+    esp_http_client_set_timeout_ms(pPutMedia->xHttpClient, PUT_MEDIA_DRAIN_TIMEOUT_MS);
+
+    /* The 200 headers may still be pending if no ack arrived during the session. */
+    if (!pPutMedia->bSecondResponseHeadersFetched &&
+            esp_http_client_fetch_headers(pPutMedia->xHttpClient) >= 0) {
+        pPutMedia->bSecondResponseHeadersFetched = 1;
+    }
+
+    for (i = 0; i < PUT_MEDIA_DRAIN_MAX_READS; i++) {
+        int uBytesReceived = esp_http_client_read(pPutMedia->xHttpClient, (char *)buffer, sizeof(buffer));
+        if (uBytesReceived <= 0) {
+            break;
+        }
+        prvProcessAckBuffer(pPutMedia, buffer, uBytesReceived);
+    }
+
+    prvLogPendingFragmentAcks(pPutMedia);
+}
+
 void Kvs_putMediaFinish(PutMediaHandle xPutMediaHandle)
 {
     PutMedia_t *pPutMedia = xPutMediaHandle;
 
     if (pPutMedia != NULL) {
-        prvFlushFragmentAck(pPutMedia);
-        Lock_Deinit(pPutMedia->xLock);
         if (pPutMedia->xHttpClient != NULL) {
+            /* A stream left mid-chunk by a failed write cannot be closed cleanly. */
+            if (pPutMedia->bStreamCorrupted) {
+                ESP_LOGW(TAG, "Dropping PutMedia connection without terminator, stream was corrupted");
+            } else {
+                prvFinishAndDrain(pPutMedia);
+            }
             esp_http_client_close(pPutMedia->xHttpClient);
             esp_http_client_cleanup(pPutMedia->xHttpClient);
             pPutMedia->xHttpClient = NULL;
         }
+        prvFlushFragmentAck(pPutMedia);
+        Lock_Deinit(pPutMedia->xLock);
         kvsFree(pPutMedia);
     }
 }

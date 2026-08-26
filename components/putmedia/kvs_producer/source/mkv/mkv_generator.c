@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 
 /* Public headers */
 #include "kvs/mkv_errors.h"
@@ -471,7 +472,9 @@ static int prvCreateAudioTrackEntry(AudioTrackInfo_t *pAudioTrackInfo, uint8_t *
 
             memcpy(pIdx, gSegmentTrackEntryAudioHeader, gSegmentTrackEntryAudioHeaderSize);
             audioFrequency = (double)pAudioTrackInfo->uFrequency;
-            PUT_UNALIGNED_8_byte_BE(pIdx + MKV_SEGMENT_TRACK_ENTRY_AUDIO_FREQUENCY_OFFSET, *((uint64_t *)(&audioFrequency)));
+            uint64_t freq_bits;
+            memcpy(&freq_bits, &audioFrequency, sizeof(freq_bits));
+            PUT_UNALIGNED_8_byte_BE(pIdx + MKV_SEGMENT_TRACK_ENTRY_AUDIO_FREQUENCY_OFFSET, freq_bits);
             *(pIdx + MKV_SEGMENT_TRACK_ENTRY_AUDIO_CHANNEL_NUMBER_OFFSET) = pAudioTrackInfo->uChannelNumber;
             if (bHasBitsPerSampleField) {
                 /* Adjust the length field of Audio header. */
@@ -973,7 +976,7 @@ int Mkv_generateTags(const MkvTag_t tagsList[], const size_t tagsListLen, MkvTag
     }
 
     // Allocate buffer
-    uint8_t *buffer = (uint8_t *)malloc(totalSize);
+    uint8_t *buffer = (uint8_t *)heap_caps_malloc(totalSize, MALLOC_CAP_SPIRAM);
     if (buffer == NULL) {
         ESP_LOGE(TAG, "Failed to allocate memory for tags");
         return MKV_ERROR_OUT_OF_MEMORY;

@@ -28,6 +28,7 @@
 /* KVS headers */
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/idf_additions.h"
 #include "freertos/projdefs.h"
 #include "kvs/mkv_errors.h"
@@ -943,7 +944,7 @@ mkv_err_t mkv_app_emit_ebml_header(mkv_app_handle handle, mkv_buf_info_t *mkv_bu
         return MKV_ERROR_INVALID_STATE;
     }
 
-    mkv_buf->buffer = malloc(mkv_buf->uDataLen);
+    mkv_buf->buffer = heap_caps_malloc(mkv_buf->uDataLen, MALLOC_CAP_SPIRAM);
     if (!(mkv_buf->buffer)) {
         return MKV_ERROR_OUT_OF_MEMORY;
     }

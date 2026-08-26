@@ -31,6 +31,7 @@
 #include "os/allocator.h"
 
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 
 #define TAG "MKV_STREAM"
 
@@ -463,7 +464,7 @@ int Kvs_dataFrameAddTags(DataFrameHandle xDataFrameHandle, MkvTag_t* tagsList, s
 
         // Allocate and create new combined header
         size_t newHeaderLen = tagsBuffer.size + originalHeaderLen;
-        uint8_t *newHeader = (uint8_t *)malloc(newHeaderLen);
+        uint8_t *newHeader = (uint8_t *)heap_caps_malloc(newHeaderLen, MALLOC_CAP_SPIRAM);
         if (newHeader == NULL) {
             free(tagsBuffer.buffer);
             ESP_LOGE(TAG, "Failed to allocate memory for new header");

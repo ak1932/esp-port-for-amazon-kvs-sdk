@@ -124,10 +124,26 @@ put_media_err_t Http_openChunkedRequest(const char *pcHost, const char *pcPort, 
 /**
  * @brief Send http chunk over esp_http_client
  *
+ * On failure the chunk header may already have been written, in which case the
+ * request body is truncated mid-chunk and the connection MUST NOT be reused:
+ * the caller has to tear the session down and reconnect.
+ *
  * @param[in] http_client esp_http_client handle
  * @param[in] pBuffer Chunk buffer to write
  * @param[in] uBytesToSend Bytes to write
  * @return 0 on success, non-zero put_media error otherwise
  */
 put_media_err_t Http_write_chunk(esp_http_client_handle_t http_client, const char *pBuffer, size_t uBytesToSend);
+
+/**
+ * @brief Send the final chunk terminator ("0\r\n\r\n") to close a chunked request body.
+ *
+ * Call once, after the last Http_write_chunk(), to end the request cleanly.
+ * Must not be called if a previous Http_write_chunk() failed, since the body is
+ * then already malformed.
+ *
+ * @param[in] http_client esp_http_client handle
+ * @return 0 on success, non-zero put_media error otherwise
+ */
+put_media_err_t Http_finishChunkedRequest(esp_http_client_handle_t http_client);
 #endif /* HTTP_HELPER_H */

@@ -15,11 +15,15 @@
 
 #include <stddef.h>
 #include <stdio.h>
+#include <string.h>
 
 /* Third party headers */
 #include "azure_c_shared_utility/strings.h"
+#include "mbedtls/build_info.h"
 #include "mbedtls/md.h"
-#include "mbedtls/sha256.h"
+#if defined(MBEDTLS_VERSION_MAJOR) && (MBEDTLS_VERSION_MAJOR >= 4)
+#include "psa/crypto.h"
+#endif
 
 /* Public headers */
 #include "kvs/put_media_errors.h"
@@ -117,15 +121,18 @@ static int prvHexEncodedSha256(const unsigned char *pMsg, size_t uMsgLen, char p
     char *p = NULL;
     unsigned char pHashBuf[SHA256_DIGEST_LENGTH] = {0};
 
+    const mbedtls_md_info_t *pxSha256Info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+
     if (pMsg == NULL) {
         res = PUT_MEDIA_ERROR_INVALID_ARGUMENT;
+    } else if (pxSha256Info == NULL) {
+        res = PUT_MEDIA_ERROR_UNKNOWN_MBEDTLS_MESSAGE_DIGEST;
     }
-#if MBEDTLS_VERSION_NUMBER < 0x03000000
-    else if ((retVal = mbedtls_sha256_ret(pMsg, uMsgLen, pHashBuf, 0)) != 0)
-#else
-    else if ((retVal = mbedtls_sha256(pMsg, uMsgLen, pHashBuf, 0)) != 0)
-#endif
-    {
+    /* Use the generic message-digest API rather than the low-level
+     * mbedtls_sha256() from mbedtls/sha256.h: mbedtls 4.x (ESP-IDF v6.x) moved
+     * that header under mbedtls/private/, so the direct call no longer builds
+     * there. mbedtls_md() is public across 2.x/3.x/4.x and hashes in one shot. */
+    else if ((retVal = mbedtls_md(pxSha256Info, pMsg, uMsgLen, pHashBuf)) != 0) {
         res = PUT_MEDIA_GENERATE_MBEDTLS_ERROR(retVal);
     } else {
         p = pcHexEncodedHash;
@@ -231,6 +238,61 @@ int AwsSigV4_AddCanonicalBody(AwsSigV4Handle xSigV4Handle, const char *pBody, si
     return res;
 }
 
+/**
+ * @brief One-shot HMAC-SHA256, portable across mbedtls 3.x and 4.x.
+ *
+ * mbedtls 4.x (TF-PSA-Crypto, ESP-IDF v6.x) put the whole HMAC-on-md API behind
+ * MBEDTLS_DECLARE_PRIVATE_IDENTIFIERS; PSA Crypto is the supported path there.
+ * Older mbedtls keeps the classic one-shot. Output is staged through a local
+ * buffer so that pMsg and pOutput may alias, which every call site below does.
+ */
+#if defined(MBEDTLS_VERSION_MAJOR) && (MBEDTLS_VERSION_MAJOR >= 4)
+static int prvHmacSha256(const mbedtls_md_info_t *pxMdInfo, const unsigned char *pKey, size_t uKeyLen, const unsigned char *pMsg, size_t uMsgLen, unsigned char *pOutput)
+{
+    psa_key_attributes_t xAttributes = PSA_KEY_ATTRIBUTES_INIT;
+    psa_key_id_t xKeyId = PSA_KEY_ID_NULL;
+    psa_status_t xStatus = PSA_SUCCESS;
+    unsigned char pMac[SHA256_DIGEST_LENGTH] = {0};
+    size_t uMacLen = 0;
+
+    (void) pxMdInfo;
+
+    /* Idempotent, and cheap once initialised. */
+    if ((xStatus = psa_crypto_init()) != PSA_SUCCESS) {
+        return (int)xStatus;
+    }
+
+    psa_set_key_usage_flags(&xAttributes, PSA_KEY_USAGE_SIGN_MESSAGE);
+    psa_set_key_algorithm(&xAttributes, PSA_ALG_HMAC(PSA_ALG_SHA_256));
+    psa_set_key_type(&xAttributes, PSA_KEY_TYPE_HMAC);
+
+    if ((xStatus = psa_import_key(&xAttributes, pKey, uKeyLen, &xKeyId)) != PSA_SUCCESS) {
+        return (int)xStatus;
+    }
+
+    xStatus = psa_mac_compute(xKeyId, PSA_ALG_HMAC(PSA_ALG_SHA_256), pMsg, uMsgLen, pMac, sizeof(pMac), &uMacLen);
+    psa_destroy_key(xKeyId);
+
+    if (xStatus == PSA_SUCCESS) {
+        memcpy(pOutput, pMac, uMacLen);
+    }
+
+    return (int)xStatus;
+}
+#else
+static int prvHmacSha256(const mbedtls_md_info_t *pxMdInfo, const unsigned char *pKey, size_t uKeyLen, const unsigned char *pMsg, size_t uMsgLen, unsigned char *pOutput)
+{
+    unsigned char pMac[SHA256_DIGEST_LENGTH] = {0};
+    int retVal = mbedtls_md_hmac(pxMdInfo, pKey, uKeyLen, pMsg, uMsgLen, pMac);
+
+    if (retVal == 0) {
+        memcpy(pOutput, pMac, sizeof(pMac));
+    }
+
+    return retVal;
+}
+#endif
+
 int AwsSigV4_Sign(AwsSigV4Handle xSigV4Handle, char *pcAccessKey, char *pcSecretKey, char *pcRegion, char *pcService, const char *pcXAmzDate)
 {
     int res = PUT_MEDIA_ERRNO_NONE;
@@ -274,11 +336,11 @@ int AwsSigV4_Sign(AwsSigV4Handle xSigV4Handle, char *pcAccessKey, char *pcSecret
     }
     /* Calculate the HMAC of date, region, service, signature end, and signed string*/
     else if (
-        (retVal = mbedtls_md_hmac(pxMdInfo, (const unsigned char *)pHmac, strlen(pHmac), (const unsigned char *)pcXAmzDate, SIGNATURE_DATE_STRING_LEN, (unsigned char *)pHmac)) != 0 ||
-        (retVal = mbedtls_md_hmac(pxMdInfo, (const unsigned char *)pHmac, uHmacSize, (const unsigned char *)pcRegion, strlen(pcRegion), (unsigned char *)pHmac)) != 0 ||
-        (retVal = mbedtls_md_hmac(pxMdInfo, (const unsigned char *)pHmac, uHmacSize, (const unsigned char *)pcService, strlen(pcService), (unsigned char *)pHmac)) != 0 ||
-        (retVal = mbedtls_md_hmac(pxMdInfo, (const unsigned char *)pHmac, uHmacSize, (const unsigned char *)AWS_SIG_V4_SIGNATURE_END, sizeof(AWS_SIG_V4_SIGNATURE_END) - 1, (unsigned char *)pHmac)) != 0 ||
-        (retVal = mbedtls_md_hmac(pxMdInfo, (const unsigned char *)pHmac, uHmacSize, (const unsigned char *)STRING_c_str(xStSignedStr), STRING_length(xStSignedStr), (unsigned char *)pHmac)) != 0) {
+        (retVal = prvHmacSha256(pxMdInfo, (const unsigned char *)pHmac, strlen(pHmac), (const unsigned char *)pcXAmzDate, SIGNATURE_DATE_STRING_LEN, (unsigned char *)pHmac)) != 0 ||
+        (retVal = prvHmacSha256(pxMdInfo, (const unsigned char *)pHmac, uHmacSize, (const unsigned char *)pcRegion, strlen(pcRegion), (unsigned char *)pHmac)) != 0 ||
+        (retVal = prvHmacSha256(pxMdInfo, (const unsigned char *)pHmac, uHmacSize, (const unsigned char *)pcService, strlen(pcService), (unsigned char *)pHmac)) != 0 ||
+        (retVal = prvHmacSha256(pxMdInfo, (const unsigned char *)pHmac, uHmacSize, (const unsigned char *)AWS_SIG_V4_SIGNATURE_END, sizeof(AWS_SIG_V4_SIGNATURE_END) - 1, (unsigned char *)pHmac)) != 0 ||
+        (retVal = prvHmacSha256(pxMdInfo, (const unsigned char *)pHmac, uHmacSize, (const unsigned char *)STRING_c_str(xStSignedStr), STRING_length(xStSignedStr), (unsigned char *)pHmac)) != 0) {
         res = PUT_MEDIA_GENERATE_MBEDTLS_ERROR(retVal);
     } else {
         for (i = 0; i < uHmacSize; i++) {

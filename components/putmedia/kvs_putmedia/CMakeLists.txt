@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.10)
 
 set(srcs
     "source/misc/json_helper.c"
+    "source/net/http_headers.c"
     "source/net/http_helper.c"
     "source/restful/kvs/restapi_kvs.c"
     "source/restful/aws_signer_v4.c"

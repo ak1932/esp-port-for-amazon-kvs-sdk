@@ -22,8 +22,9 @@
 #define HTTP_METHOD_GET_STR "GET"
 #define HTTP_METHOD_POST_STR "POST"
 
-#include "azure_c_shared_utility/httpheaders.h"
 #include "esp_http_client.h"
+
+#include "net/http_headers.h"
 
 #define URI_QUERY_EMPTY                 ""
 
@@ -72,7 +73,7 @@
  * @return 0 on success, non-zero put_media error otherwise
  */
 int Http_performRequest(const char *pcHost, const char *pcPort, const char *pcUri,
-                        esp_http_client_method_t http_method, HTTP_HEADERS_HANDLE xHttpReqHeaders,
+                        esp_http_client_method_t http_method, HttpHeaders_t *xHttpReqHeaders,
                         const char *pcBody, unsigned int uRecvTimeoutMs, unsigned int uSendTimeoutMs,
                         unsigned int *puHttpStatus, char **ppRspBody, size_t *puRspBodyLen);
 
@@ -96,7 +97,7 @@ int Http_performRequest(const char *pcHost, const char *pcPort, const char *pcUr
  * @return 0 on success, non-zero put_media error otherwise
  */
 put_media_err_t Http_performRequestWithX509(const char *pcHost, const char *pcPort, const char *pcUri,
-                                            esp_http_client_method_t http_method, HTTP_HEADERS_HANDLE xHttpReqHeaders,
+                                            esp_http_client_method_t http_method, HttpHeaders_t *xHttpReqHeaders,
                                             const char *pcBody, unsigned int uRecvTimeoutMs, unsigned int uSendTimeoutMs,
                                             const char *pcRootCA, const char *pcCertPem, const char *pcKeyPem,
                                             unsigned int *puHttpStatus, char **ppRspBody, size_t *puRspBodyLen);
@@ -117,7 +118,7 @@ put_media_err_t Http_performRequestWithX509(const char *pcHost, const char *pcPo
  * @return 0 on success, non-zero put_media error otherwise
  */
 put_media_err_t Http_openChunkedRequest(const char *pcHost, const char *pcPort, const char *pcUri,
-                                        HTTP_HEADERS_HANDLE xHttpReqHeaders,
+                                        HttpHeaders_t *xHttpReqHeaders,
                                         unsigned int uRecvTimeoutMs, unsigned int uSendTimeoutMs,
                                         unsigned int *puHttpStatus, esp_http_client_handle_t *ppClient);
 

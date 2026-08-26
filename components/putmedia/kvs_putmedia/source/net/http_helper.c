@@ -21,11 +21,7 @@
 #include <string.h>
 #include <strings.h>
 
-/* Third party headers */
-#include "azure_c_shared_utility/httpheaders.h"
-
 /* Public headers */
-#include "azure_c_shared_utility/strings.h"
 #include "esp_crt_bundle.h"
 #include "esp_err.h"
 #include "kvs/put_media_errors.h"
@@ -133,78 +129,24 @@ static esp_err_t prvHttpEventHandler(esp_http_client_event_t *pEvt)
     return ESP_OK;
 }
 
-/* Parse "name: value" into key and value; value may have leading space after colon. */
-static void prvParseHeaderLine(const char *pcLine, char *pcKey, size_t uKeySize, char *pcVal, size_t uValSize)
+static int prvSetHeadersFromHandle(esp_http_client_handle_t h, HttpHeaders_t *xHttpReqHeaders)
 {
-    const char *pColon = strchr(pcLine, ':');
-    if (pColon == NULL) {
-        if (pcKey && uKeySize) {
-            pcKey[0] = '\0';
-        }
-        if (pcVal && uValSize) {
-            pcVal[0] = '\0';
-        }
-        return;
-    }
-    size_t keyLen = (size_t)(pColon - pcLine);
-    if (keyLen >= uKeySize) {
-        ESP_LOGE(TAG, "Value buf size: %d, value required size: %d to parse HTTP Headers", uKeySize, keyLen);
-        keyLen = uKeySize - 1;
-    }
-    memcpy(pcKey, pcLine, keyLen);
-    pcKey[keyLen] = '\0';
-    const char *pVal = pColon + 1;
-    while (*pVal == ' ' || *pVal == '\t') {
-        pVal++;
-    }
-    size_t valLen = strlen(pVal);
-    if (valLen >= uValSize) {
-        ESP_LOGE(TAG, "Value buf size: %d, value required size: %d to parse HTTP Headers", uValSize, valLen);
-        valLen = uValSize - 1;
-    }
-    memcpy(pcVal, pVal, valLen);
-    pcVal[valLen] = '\0';
-}
-
-static int prvSetHeadersFromHandle(esp_http_client_handle_t h, HTTP_HEADERS_HANDLE xHttpReqHeaders)
-{
-    size_t uHeadersCnt = 0;
+    size_t uHeadersCnt = HttpHeaders_count(xHttpReqHeaders);
+    const char *pcName = NULL;
+    const char *pcValue = NULL;
     size_t i;
-    char *pcHeader = NULL;
-    char key[128];
 
-    if (HTTPHeaders_GetHeaderCount(xHttpReqHeaders, &uHeadersCnt) != HTTP_HEADERS_OK) {
-        return PUT_MEDIA_ERROR_UNABLE_TO_GET_HTTP_HEADER_COUNT;
-    }
     for (i = 0; i < uHeadersCnt; i++) {
-        if (HTTPHeaders_GetHeader(xHttpReqHeaders, i, &pcHeader) != HTTP_HEADERS_OK) {
+        if (HttpHeaders_get(xHttpReqHeaders, i, &pcName, &pcValue) != PUT_MEDIA_ERRNO_NONE) {
             return PUT_MEDIA_ERROR_UNABLE_TO_GET_HTTP_HEADER;
         }
-        /* Size the value buffer to the whole "name: value" line — the value can
-         * never be longer than that. Heap-allocated so a long header (e.g. the
-         * x-amz-security-token STS token, which exceeds 1 KB) is never truncated,
-         * and we don't blow the small put_media_task stack. */
-        size_t value_bufsz = strlen(pcHeader) + 1;
-        char *value = malloc(value_bufsz);
-        if (value == NULL) {
-            free(pcHeader);
+        /* Never log the SigV4 signature or the STS session token. */
+        bool bSecret = (strcasecmp(pcName, HDR_AUTHORIZATION) == 0 ||
+                        strcasecmp(pcName, HDR_X_AMZ_SECURITY_TOKEN) == 0);
+        ESP_LOGD(TAG, "%s: %s", pcName, bSecret ? "<redacted>" : pcValue);
+        if (esp_http_client_set_header(h, pcName, pcValue) != ESP_OK) {
             return PUT_MEDIA_ERROR_UNABLE_TO_GET_HTTP_HEADER;
         }
-        prvParseHeaderLine(pcHeader, key, sizeof(key), value, value_bufsz);
-        free(pcHeader);
-        pcHeader = NULL;
-        if (key[0] != '\0') {
-            /* Never log the SigV4 signature or the STS session token. */
-            bool bSecret = (strcasecmp(key, HDR_AUTHORIZATION) == 0 ||
-                            strcasecmp(key, HDR_X_AMZ_SECURITY_TOKEN) == 0);
-            ESP_LOGD(TAG, "%s: %s", key, bSecret ? "<redacted>" : value);
-            esp_err_t err = esp_http_client_set_header(h, key, value);
-            if (err != ESP_OK) {
-                free(value);
-                return PUT_MEDIA_ERROR_UNABLE_TO_GET_HTTP_HEADER;
-            }
-        }
-        free(value);
     }
     return PUT_MEDIA_ERRNO_NONE;
 }
@@ -224,7 +166,7 @@ static int prvMapEspErrToPutMedia(esp_err_t err)
 }
 
 int Http_performRequest(const char *pcHost, const char *pcPort, const char *pcUri,
-                        esp_http_client_method_t http_method, HTTP_HEADERS_HANDLE xHttpReqHeaders,
+                        esp_http_client_method_t http_method, HttpHeaders_t *xHttpReqHeaders,
                         const char *pcBody, unsigned int uRecvTimeoutMs, unsigned int uSendTimeoutMs,
                         unsigned int *puHttpStatus, char **ppRspBody, size_t *puRspBodyLen)
 {
@@ -304,7 +246,7 @@ int Http_performRequest(const char *pcHost, const char *pcPort, const char *pcUr
 }
 
 put_media_err_t Http_performRequestWithX509(const char *pcHost, const char *pcPort, const char *pcUri,
-                                            esp_http_client_method_t http_method, HTTP_HEADERS_HANDLE xHttpReqHeaders,
+                                            esp_http_client_method_t http_method, HttpHeaders_t *xHttpReqHeaders,
                                             const char *pcBody, unsigned int uRecvTimeoutMs, unsigned int uSendTimeoutMs,
                                             const char *pcRootCA, const char *pcCertPem, const char *pcKeyPem,
                                             unsigned int *puHttpStatus, char **ppRspBody, size_t *puRspBodyLen)
@@ -543,7 +485,7 @@ put_media_err_t Http_finishChunkedRequest(esp_http_client_handle_t http_client)
 }
 
 put_media_err_t Http_openChunkedRequest(const char *pcHost, const char *pcPort, const char *pcUri,
-                                        HTTP_HEADERS_HANDLE xHttpReqHeaders,
+                                        HttpHeaders_t *xHttpReqHeaders,
                                         unsigned int uRecvTimeoutMs, unsigned int uSendTimeoutMs,
                                         unsigned int *puHttpStatus, esp_http_client_handle_t *ppClient)
 {

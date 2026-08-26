@@ -17,7 +17,6 @@
 #include <string.h>
 
 /* Thirdparty headers */
-#include "azure_c_shared_utility/httpheaders.h"
 #include "azure_c_shared_utility/strings.h"
 
 /* Public headers */
@@ -69,7 +68,7 @@ IotCredentialToken_t *Iot_getCredential(IotCredentialRequest_t *pReq)
     STRING_HANDLE xStUri = NULL;
 
     unsigned int uHttpStatusCode = 0;
-    HTTP_HEADERS_HANDLE xHttpReqHeaders = NULL;
+    HttpHeaders_t *xHttpReqHeaders = NULL;
     char *pRspBody = NULL;
     size_t uRspBodyLen = 0;
 
@@ -81,9 +80,9 @@ IotCredentialToken_t *Iot_getCredential(IotCredentialRequest_t *pReq)
         res = PUT_MEDIA_ERROR_OUT_OF_MEMORY;
         ESP_LOGE(TAG, "OOM: Failed to allocate IoT URI");
     } else if (
-        (xHttpReqHeaders = HTTPHeaders_Alloc()) == NULL || HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_HOST, pReq->pCredentialHost) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, "accept", "*/*") != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_X_AMZN_IOT_THINGNAME, pReq->pThingName) != HTTP_HEADERS_OK) {
+        (xHttpReqHeaders = HttpHeaders_create()) == NULL || HttpHeaders_add(xHttpReqHeaders, HDR_HOST, pReq->pCredentialHost) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, "accept", "*/*") != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZN_IOT_THINGNAME, pReq->pThingName) != PUT_MEDIA_ERRNO_NONE) {
         res = PUT_MEDIA_ERROR_FAIL_TO_GENERATE_HTTP_HEADERS;
         ESP_LOGE(TAG, "Failed to generate HTTP headers");
     } else if ((res = Http_performRequestWithX509(pReq->pCredentialHost, "443", STRING_c_str(xStUri), HTTP_METHOD_GET,
@@ -119,7 +118,7 @@ IotCredentialToken_t *Iot_getCredential(IotCredentialRequest_t *pReq)
         kvsFree(pRspBody);
     }
 
-    HTTPHeaders_Free(xHttpReqHeaders);
+    HttpHeaders_free(xHttpReqHeaders);
     STRING_delete(xStUri);
 
     return pToken;

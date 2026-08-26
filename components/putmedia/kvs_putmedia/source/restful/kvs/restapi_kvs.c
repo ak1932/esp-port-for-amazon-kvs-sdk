@@ -22,9 +22,7 @@
 #include <string.h>
 
 /* Thirdparty headers */
-#include "azure_c_shared_utility/buffer_.h"
 #include "azure_c_shared_utility/doublylinkedlist.h"
-#include "azure_c_shared_utility/httpheaders.h"
 #include "azure_c_shared_utility/lock.h"
 #include "azure_c_shared_utility/strings.h"
 
@@ -166,7 +164,7 @@ static int prvValidatePutMediaParameter(KvsPutMediaParameter_t *pPutMediaPara)
     }
 }
 
-static AwsSigV4Handle prvSign(KvsServiceParameter_t *pServPara, char *pcUri, char *pcQuery, HTTP_HEADERS_HANDLE xHeadersToSign, const char *pcHttpBody)
+static AwsSigV4Handle prvSign(KvsServiceParameter_t *pServPara, char *pcUri, char *pcQuery, HttpHeaders_t *xHeadersToSign, const char *pcHttpBody)
 {
     int res = PUT_MEDIA_ERRNO_NONE;
 
@@ -176,42 +174,42 @@ static AwsSigV4Handle prvSign(KvsServiceParameter_t *pServPara, char *pcUri, cha
 
     if ((xAwsSigV4Handle = AwsSigV4_Create(HTTP_METHOD_POST_STR, pcUri, pcQuery)) == NULL) {
         res = PUT_MEDIA_ERROR_FAIL_TO_CREATE_SIGV4_HANDLE;
-    } else if ((pcVal = HTTPHeaders_FindHeaderValue(xHeadersToSign, HDR_CONNECTION)) != NULL && AwsSigV4_AddCanonicalHeader(xAwsSigV4Handle, HDR_CONNECTION, pcVal) != PUT_MEDIA_ERRNO_NONE) {
+    } else if ((pcVal = HttpHeaders_find(xHeadersToSign, HDR_CONNECTION)) != NULL && AwsSigV4_AddCanonicalHeader(xAwsSigV4Handle, HDR_CONNECTION, pcVal) != PUT_MEDIA_ERRNO_NONE) {
         res = PUT_MEDIA_ERROR_FAIL_TO_ADD_CANONICAL_HEADER;
-    // } else if ((pcVal = HTTPHeaders_FindHeaderValue(xHeadersToSign, HDR_CONTENT_LENGTH)) != NULL && AwsSigV4_AddCanonicalHeader(xAwsSigV4Handle, HDR_CONTENT_LENGTH, pcVal) != PUT_MEDIA_ERRNO_NONE) {
+    // } else if ((pcVal = HttpHeaders_find(xHeadersToSign, HDR_CONTENT_LENGTH)) != NULL && AwsSigV4_AddCanonicalHeader(xAwsSigV4Handle, HDR_CONTENT_LENGTH, pcVal) != PUT_MEDIA_ERRNO_NONE) {
     //     res = PUT_MEDIA_ERROR_FAIL_TO_ADD_CANONICAL_HEADER;
-    // } else if ((pcVal = HTTPHeaders_FindHeaderValue(xHeadersToSign, HDR_CONTENT_TYPE)) != NULL && AwsSigV4_AddCanonicalHeader(xAwsSigV4Handle, HDR_CONTENT_TYPE, pcVal) != PUT_MEDIA_ERRNO_NONE) {
+    // } else if ((pcVal = HttpHeaders_find(xHeadersToSign, HDR_CONTENT_TYPE)) != NULL && AwsSigV4_AddCanonicalHeader(xAwsSigV4Handle, HDR_CONTENT_TYPE, pcVal) != PUT_MEDIA_ERRNO_NONE) {
     //     res = PUT_MEDIA_ERROR_FAIL_TO_ADD_CANONICAL_HEADER;
-    } else if ((pcVal = HTTPHeaders_FindHeaderValue(xHeadersToSign, HDR_HOST)) != NULL && AwsSigV4_AddCanonicalHeader(xAwsSigV4Handle, HDR_HOST, pcVal) != PUT_MEDIA_ERRNO_NONE) {
+    } else if ((pcVal = HttpHeaders_find(xHeadersToSign, HDR_HOST)) != NULL && AwsSigV4_AddCanonicalHeader(xAwsSigV4Handle, HDR_HOST, pcVal) != PUT_MEDIA_ERRNO_NONE) {
         res = PUT_MEDIA_ERROR_FAIL_TO_ADD_CANONICAL_HEADER;
     } else if (
-        (pcVal = HTTPHeaders_FindHeaderValue(xHeadersToSign, HDR_TRANSFER_ENCODING)) != NULL &&
+        (pcVal = HttpHeaders_find(xHeadersToSign, HDR_TRANSFER_ENCODING)) != NULL &&
         AwsSigV4_AddCanonicalHeader(xAwsSigV4Handle, HDR_TRANSFER_ENCODING, pcVal) != PUT_MEDIA_ERRNO_NONE) {
         res = PUT_MEDIA_ERROR_FAIL_TO_ADD_CANONICAL_HEADER;
-    } else if ((pcVal = HTTPHeaders_FindHeaderValue(xHeadersToSign, HDR_USER_AGENT)) != NULL && AwsSigV4_AddCanonicalHeader(xAwsSigV4Handle, HDR_USER_AGENT, pcVal) != PUT_MEDIA_ERRNO_NONE) {
+    } else if ((pcVal = HttpHeaders_find(xHeadersToSign, HDR_USER_AGENT)) != NULL && AwsSigV4_AddCanonicalHeader(xAwsSigV4Handle, HDR_USER_AGENT, pcVal) != PUT_MEDIA_ERRNO_NONE) {
         res = PUT_MEDIA_ERROR_FAIL_TO_ADD_CANONICAL_HEADER;
     } else if (
-        (pcXAmzDate = HTTPHeaders_FindHeaderValue(xHeadersToSign, HDR_X_AMZ_DATE)) != NULL &&
+        (pcXAmzDate = HttpHeaders_find(xHeadersToSign, HDR_X_AMZ_DATE)) != NULL &&
         AwsSigV4_AddCanonicalHeader(xAwsSigV4Handle, HDR_X_AMZ_DATE, pcXAmzDate) != PUT_MEDIA_ERRNO_NONE) {
         res = PUT_MEDIA_ERROR_FAIL_TO_ADD_CANONICAL_HEADER;
     } else if (
-        (pcVal = HTTPHeaders_FindHeaderValue(xHeadersToSign, HDR_X_AMZ_SECURITY_TOKEN)) != NULL &&
+        (pcVal = HttpHeaders_find(xHeadersToSign, HDR_X_AMZ_SECURITY_TOKEN)) != NULL &&
         AwsSigV4_AddCanonicalHeader(xAwsSigV4Handle, HDR_X_AMZ_SECURITY_TOKEN, pcVal) != PUT_MEDIA_ERRNO_NONE) {
         res = PUT_MEDIA_ERROR_FAIL_TO_ADD_CANONICAL_HEADER;
     } else if (
-        (pcVal = HTTPHeaders_FindHeaderValue(xHeadersToSign, HDR_X_AMZN_FRAG_ACK_REQUIRED)) != NULL &&
+        (pcVal = HttpHeaders_find(xHeadersToSign, HDR_X_AMZN_FRAG_ACK_REQUIRED)) != NULL &&
         AwsSigV4_AddCanonicalHeader(xAwsSigV4Handle, HDR_X_AMZN_FRAG_ACK_REQUIRED, pcVal) != PUT_MEDIA_ERRNO_NONE) {
         res = PUT_MEDIA_ERROR_FAIL_TO_ADD_CANONICAL_HEADER;
     } else if (
-        (pcVal = HTTPHeaders_FindHeaderValue(xHeadersToSign, HDR_X_AMZN_FRAG_T_TYPE)) != NULL &&
+        (pcVal = HttpHeaders_find(xHeadersToSign, HDR_X_AMZN_FRAG_T_TYPE)) != NULL &&
         AwsSigV4_AddCanonicalHeader(xAwsSigV4Handle, HDR_X_AMZN_FRAG_T_TYPE, pcVal) != PUT_MEDIA_ERRNO_NONE) {
         res = PUT_MEDIA_ERROR_FAIL_TO_ADD_CANONICAL_HEADER;
     } else if (
-        (pcVal = HTTPHeaders_FindHeaderValue(xHeadersToSign, HDR_X_AMZN_PRODUCER_START_T)) != NULL &&
+        (pcVal = HttpHeaders_find(xHeadersToSign, HDR_X_AMZN_PRODUCER_START_T)) != NULL &&
         AwsSigV4_AddCanonicalHeader(xAwsSigV4Handle, HDR_X_AMZN_PRODUCER_START_T, pcVal) != PUT_MEDIA_ERRNO_NONE) {
         res = PUT_MEDIA_ERROR_FAIL_TO_ADD_CANONICAL_HEADER;
     } else if (
-        (pcVal = HTTPHeaders_FindHeaderValue(xHeadersToSign, HDR_X_AMZN_STREAM_NAME)) != NULL &&
+        (pcVal = HttpHeaders_find(xHeadersToSign, HDR_X_AMZN_STREAM_NAME)) != NULL &&
         AwsSigV4_AddCanonicalHeader(xAwsSigV4Handle, HDR_X_AMZN_STREAM_NAME, pcVal) != PUT_MEDIA_ERRNO_NONE) {
         res = PUT_MEDIA_ERROR_FAIL_TO_ADD_CANONICAL_HEADER;
     } else if (AwsSigV4_AddCanonicalBody(xAwsSigV4Handle, pcHttpBody, strlen(pcHttpBody)) != PUT_MEDIA_ERRNO_NONE) {
@@ -583,7 +581,7 @@ int Kvs_describeStream(KvsServiceParameter_t *pServPara, KvsDescribeStreamParame
     AwsSigV4Handle xAwsSigV4Handle = NULL;
 
     unsigned int uHttpStatusCode = 0;
-    HTTP_HEADERS_HANDLE xHttpReqHeaders = NULL;
+    HttpHeaders_t *xHttpReqHeaders = NULL;
     char *pRspBody = NULL;
     size_t uRspBodyLen = 0;
 
@@ -607,19 +605,19 @@ int Kvs_describeStream(KvsServiceParameter_t *pServPara, KvsDescribeStreamParame
             res = PUT_MEDIA_ERROR_UNABLE_TO_ALLOCATE_HTTP_BODY;
             ESP_LOGE(TAG, "Failed to allocate HTTP body");
         } else if (
-            (xHttpReqHeaders = HTTPHeaders_Alloc()) == NULL ||
-            HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_HOST, pServPara->pcHost) != HTTP_HEADERS_OK ||
-            HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_ACCEPT, VAL_ACCEPT_ANY) != HTTP_HEADERS_OK ||
-            HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_CONTENT_LENGTH, STRING_c_str(xStContentLength)) != HTTP_HEADERS_OK ||
-            HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_CONTENT_TYPE, VAL_CONTENT_TYPE_APPLICATION_jSON) != HTTP_HEADERS_OK ||
-            HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_USER_AGENT, VAL_USER_AGENT) != HTTP_HEADERS_OK ||
-            HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_X_AMZ_DATE, pcXAmzDate) != HTTP_HEADERS_OK ||
-            (pServPara->pcToken != NULL && (HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_X_AMZ_SECURITY_TOKEN, pServPara->pcToken) != HTTP_HEADERS_OK))) {
+            (xHttpReqHeaders = HttpHeaders_create()) == NULL ||
+            HttpHeaders_add(xHttpReqHeaders, HDR_HOST, pServPara->pcHost) != PUT_MEDIA_ERRNO_NONE ||
+            HttpHeaders_add(xHttpReqHeaders, HDR_ACCEPT, VAL_ACCEPT_ANY) != PUT_MEDIA_ERRNO_NONE ||
+            HttpHeaders_add(xHttpReqHeaders, HDR_CONTENT_LENGTH, STRING_c_str(xStContentLength)) != PUT_MEDIA_ERRNO_NONE ||
+            HttpHeaders_add(xHttpReqHeaders, HDR_CONTENT_TYPE, VAL_CONTENT_TYPE_APPLICATION_jSON) != PUT_MEDIA_ERRNO_NONE ||
+            HttpHeaders_add(xHttpReqHeaders, HDR_USER_AGENT, VAL_USER_AGENT) != PUT_MEDIA_ERRNO_NONE ||
+            HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZ_DATE, pcXAmzDate) != PUT_MEDIA_ERRNO_NONE ||
+            (pServPara->pcToken != NULL && (HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZ_SECURITY_TOKEN, pServPara->pcToken) != PUT_MEDIA_ERRNO_NONE))) {
             res = PUT_MEDIA_ERROR_UNABLE_TO_GENERATE_HTTP_HEADER;
             ESP_LOGE(TAG, "Failed to generate HTTP headers");
         } else if (
             (xAwsSigV4Handle = prvSign(pServPara, KVS_URI_DESCRIBE_STREAM, URI_QUERY_EMPTY, xHttpReqHeaders, STRING_c_str(xStHttpBody))) == NULL ||
-            HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_AUTHORIZATION, AwsSigV4_GetAuthorization(xAwsSigV4Handle)) != HTTP_HEADERS_OK) {
+            HttpHeaders_add(xHttpReqHeaders, HDR_AUTHORIZATION, AwsSigV4_GetAuthorization(xAwsSigV4Handle)) != PUT_MEDIA_ERRNO_NONE) {
             res = PUT_MEDIA_ERROR_FAIL_TO_SIGN_HTTP_REQ;
             ESP_LOGE(TAG, "Failed to sign");
         } else if ((res = Http_performRequest(pServPara->pcHost, PORT_HTTPS, KVS_URI_DESCRIBE_STREAM, HTTP_METHOD_POST,
@@ -639,7 +637,7 @@ int Kvs_describeStream(KvsServiceParameter_t *pServPara, KvsDescribeStreamParame
         }
 
         SAFE_FREE(pRspBody);
-        HTTPHeaders_Free(xHttpReqHeaders);
+        HttpHeaders_free(xHttpReqHeaders);
         AwsSigV4_Terminate(xAwsSigV4Handle);
         STRING_delete(xStContentLength);
         STRING_delete(xStHttpBody);
@@ -658,7 +656,7 @@ int Kvs_createStream(KvsServiceParameter_t *pServPara, KvsCreateStreamParameter_
     AwsSigV4Handle xAwsSigV4Handle = NULL;
 
     unsigned int uHttpStatusCode = 0;
-    HTTP_HEADERS_HANDLE xHttpReqHeaders = NULL;
+    HttpHeaders_t *xHttpReqHeaders = NULL;
     char *pRspBody = NULL;
     size_t uRspBodyLen = 0;
 
@@ -679,19 +677,19 @@ int Kvs_createStream(KvsServiceParameter_t *pServPara, KvsCreateStreamParameter_
         res = PUT_MEDIA_ERROR_UNABLE_TO_ALLOCATE_HTTP_BODY;
         ESP_LOGE(TAG, "Failed to allocate HTTP body");
     } else if (
-        (xHttpReqHeaders = HTTPHeaders_Alloc()) == NULL ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_HOST, pServPara->pcHost) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_ACCEPT, VAL_ACCEPT_ANY) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_CONTENT_LENGTH, STRING_c_str(xStContentLength)) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_CONTENT_TYPE, VAL_CONTENT_TYPE_APPLICATION_jSON) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_USER_AGENT, VAL_USER_AGENT) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_X_AMZ_DATE, pcXAmzDate) != HTTP_HEADERS_OK ||
-        (pServPara->pcToken != NULL && (HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_X_AMZ_SECURITY_TOKEN, pServPara->pcToken) != HTTP_HEADERS_OK))) {
+        (xHttpReqHeaders = HttpHeaders_create()) == NULL ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_HOST, pServPara->pcHost) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_ACCEPT, VAL_ACCEPT_ANY) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_CONTENT_LENGTH, STRING_c_str(xStContentLength)) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_CONTENT_TYPE, VAL_CONTENT_TYPE_APPLICATION_jSON) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_USER_AGENT, VAL_USER_AGENT) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZ_DATE, pcXAmzDate) != PUT_MEDIA_ERRNO_NONE ||
+        (pServPara->pcToken != NULL && (HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZ_SECURITY_TOKEN, pServPara->pcToken) != PUT_MEDIA_ERRNO_NONE))) {
         res = PUT_MEDIA_ERROR_UNABLE_TO_GENERATE_HTTP_HEADER;
         ESP_LOGE(TAG, "Failed to generate HTTP headers");
     } else if (
         (xAwsSigV4Handle = prvSign(pServPara, KVS_URI_CREATE_STREAM, URI_QUERY_EMPTY, xHttpReqHeaders, STRING_c_str(xStHttpBody))) == NULL ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_AUTHORIZATION, AwsSigV4_GetAuthorization(xAwsSigV4Handle)) != HTTP_HEADERS_OK) {
+        HttpHeaders_add(xHttpReqHeaders, HDR_AUTHORIZATION, AwsSigV4_GetAuthorization(xAwsSigV4Handle)) != PUT_MEDIA_ERRNO_NONE) {
         ESP_LOGE(TAG, "Failed to sign");
         res = PUT_MEDIA_ERROR_FAIL_TO_SIGN_HTTP_REQ;
     } else if ((res = Http_performRequest(pServPara->pcHost, PORT_HTTPS, KVS_URI_CREATE_STREAM, HTTP_METHOD_POST,
@@ -711,7 +709,7 @@ int Kvs_createStream(KvsServiceParameter_t *pServPara, KvsCreateStreamParameter_
     }
 
     SAFE_FREE(pRspBody);
-    HTTPHeaders_Free(xHttpReqHeaders);
+    HttpHeaders_free(xHttpReqHeaders);
     AwsSigV4_Terminate(xAwsSigV4Handle);
     STRING_delete(xStContentLength);
     STRING_delete(xStHttpBody);
@@ -730,7 +728,7 @@ int Kvs_getDataEndpoint(KvsServiceParameter_t *pServPara, KvsGetDataEndpointPara
     AwsSigV4Handle xAwsSigV4Handle = NULL;
 
     unsigned int uHttpStatusCode = 0;
-    HTTP_HEADERS_HANDLE xHttpReqHeaders = NULL;
+    HttpHeaders_t *xHttpReqHeaders = NULL;
     char *pRspBody = NULL;
     size_t uRspBodyLen = 0;
 
@@ -751,19 +749,19 @@ int Kvs_getDataEndpoint(KvsServiceParameter_t *pServPara, KvsGetDataEndpointPara
         res = PUT_MEDIA_ERROR_UNABLE_TO_ALLOCATE_HTTP_BODY;
         ESP_LOGE(TAG, "Failed to allocate HTTP body");
     } else if (
-        (xHttpReqHeaders = HTTPHeaders_Alloc()) == NULL ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_HOST, pServPara->pcHost) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_ACCEPT, VAL_ACCEPT_ANY) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_CONTENT_LENGTH, STRING_c_str(xStContentLength)) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_CONTENT_TYPE, VAL_CONTENT_TYPE_APPLICATION_jSON) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_USER_AGENT, VAL_USER_AGENT) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_X_AMZ_DATE, pcXAmzDate) != HTTP_HEADERS_OK ||
-        (pServPara->pcToken != NULL && (HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_X_AMZ_SECURITY_TOKEN, pServPara->pcToken) != HTTP_HEADERS_OK))) {
+        (xHttpReqHeaders = HttpHeaders_create()) == NULL ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_HOST, pServPara->pcHost) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_ACCEPT, VAL_ACCEPT_ANY) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_CONTENT_LENGTH, STRING_c_str(xStContentLength)) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_CONTENT_TYPE, VAL_CONTENT_TYPE_APPLICATION_jSON) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_USER_AGENT, VAL_USER_AGENT) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZ_DATE, pcXAmzDate) != PUT_MEDIA_ERRNO_NONE ||
+        (pServPara->pcToken != NULL && (HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZ_SECURITY_TOKEN, pServPara->pcToken) != PUT_MEDIA_ERRNO_NONE))) {
         res = PUT_MEDIA_ERROR_UNABLE_TO_GENERATE_HTTP_HEADER;
         ESP_LOGE(TAG, "Failed to generate HTTP headers");
     } else if (
         (xAwsSigV4Handle = prvSign(pServPara, KVS_URI_GET_DATA_ENDPOINT, URI_QUERY_EMPTY, xHttpReqHeaders, STRING_c_str(xStHttpBody))) == NULL ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_AUTHORIZATION, AwsSigV4_GetAuthorization(xAwsSigV4Handle)) != HTTP_HEADERS_OK) {
+        HttpHeaders_add(xHttpReqHeaders, HDR_AUTHORIZATION, AwsSigV4_GetAuthorization(xAwsSigV4Handle)) != PUT_MEDIA_ERRNO_NONE) {
         res = PUT_MEDIA_ERROR_FAIL_TO_SIGN_HTTP_REQ;
         ESP_LOGE(TAG, "Failed to sign");
     } else if ((res = Http_performRequest(pServPara->pcHost, PORT_HTTPS, KVS_URI_GET_DATA_ENDPOINT, HTTP_METHOD_POST,
@@ -788,7 +786,7 @@ int Kvs_getDataEndpoint(KvsServiceParameter_t *pServPara, KvsGetDataEndpointPara
     }
 
     SAFE_FREE(pRspBody);
-    HTTPHeaders_Free(xHttpReqHeaders);
+    HttpHeaders_free(xHttpReqHeaders);
     AwsSigV4_Terminate(xAwsSigV4Handle);
     STRING_delete(xStContentLength);
     STRING_delete(xStHttpBody);
@@ -807,7 +805,7 @@ int Kvs_putMediaStart(KvsServiceParameter_t *pServPara, KvsPutMediaParameter_t *
     AwsSigV4Handle xAwsSigV4Handle = NULL;
 
     unsigned int uHttpStatusCode = 0;
-    HTTP_HEADERS_HANDLE xHttpReqHeaders = NULL;
+    HttpHeaders_t *xHttpReqHeaders = NULL;
 
     esp_http_client_handle_t xHttpClient = NULL;
     bool bKeepClient = false;
@@ -830,25 +828,25 @@ int Kvs_putMediaStart(KvsServiceParameter_t *pServPara, KvsPutMediaParameter_t *
         ESP_LOGE(TAG, "Failed to get epoch time");
         /* Propagate the res error */
     } else if (
-        (xHttpReqHeaders = HTTPHeaders_Alloc()) == NULL ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_HOST, pServPara->pcPutMediaEndpoint) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_ACCEPT, VAL_ACCEPT_ANY) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_CONNECTION, VAL_KEEP_ALIVE) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_CONTENT_TYPE, VAL_CONTENT_TYPE_APPLICATION_jSON) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_TRANSFER_ENCODING, VAL_TRANSFER_ENCODING_CHUNKED) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_USER_AGENT, VAL_USER_AGENT) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_X_AMZ_DATE, pcXAmzDate) != HTTP_HEADERS_OK ||
-        (pServPara->pcToken != NULL && (HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_X_AMZ_SECURITY_TOKEN, pServPara->pcToken) != HTTP_HEADERS_OK)) ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_X_AMZN_FRAG_ACK_REQUIRED, VAL_FRAGMENT_ACK_REQUIRED_TRUE) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_X_AMZN_FRAG_T_TYPE, prvGetTimecodeValue(pPutMediaPara->xTimecodeType)) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_X_AMZN_PRODUCER_START_T, STRING_c_str(xStProducerStartTimestamp)) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_X_AMZN_STREAM_NAME, pPutMediaPara->pcStreamName) != HTTP_HEADERS_OK ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, "expect", "100-continue") != HTTP_HEADERS_OK) {
+        (xHttpReqHeaders = HttpHeaders_create()) == NULL ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_HOST, pServPara->pcPutMediaEndpoint) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_ACCEPT, VAL_ACCEPT_ANY) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_CONNECTION, VAL_KEEP_ALIVE) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_CONTENT_TYPE, VAL_CONTENT_TYPE_APPLICATION_jSON) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_TRANSFER_ENCODING, VAL_TRANSFER_ENCODING_CHUNKED) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_USER_AGENT, VAL_USER_AGENT) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZ_DATE, pcXAmzDate) != PUT_MEDIA_ERRNO_NONE ||
+        (pServPara->pcToken != NULL && (HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZ_SECURITY_TOKEN, pServPara->pcToken) != PUT_MEDIA_ERRNO_NONE)) ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZN_FRAG_ACK_REQUIRED, VAL_FRAGMENT_ACK_REQUIRED_TRUE) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZN_FRAG_T_TYPE, prvGetTimecodeValue(pPutMediaPara->xTimecodeType)) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZN_PRODUCER_START_T, STRING_c_str(xStProducerStartTimestamp)) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZN_STREAM_NAME, pPutMediaPara->pcStreamName) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, "expect", "100-continue") != PUT_MEDIA_ERRNO_NONE) {
         res = PUT_MEDIA_ERROR_UNABLE_TO_GENERATE_HTTP_HEADER;
         ESP_LOGE(TAG, "Failed to generate HTTP headers");
     } else if (
         (xAwsSigV4Handle = prvSign(pServPara, KVS_URI_PUT_MEDIA, URI_QUERY_EMPTY, xHttpReqHeaders, HTTP_BODY_EMPTY)) == NULL ||
-        HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_AUTHORIZATION, AwsSigV4_GetAuthorization(xAwsSigV4Handle)) != HTTP_HEADERS_OK) {
+        HttpHeaders_add(xHttpReqHeaders, HDR_AUTHORIZATION, AwsSigV4_GetAuthorization(xAwsSigV4Handle)) != PUT_MEDIA_ERRNO_NONE) {
         res = PUT_MEDIA_ERROR_FAIL_TO_SIGN_HTTP_REQ;
         ESP_LOGE(TAG, "Failed to sign");
     } else if ((res = Http_openChunkedRequest(pServPara->pcPutMediaEndpoint, PORT_HTTPS, KVS_URI_PUT_MEDIA,
@@ -884,7 +882,7 @@ int Kvs_putMediaStart(KvsServiceParameter_t *pServPara, KvsPutMediaParameter_t *
     if (!bKeepClient && xHttpClient != NULL) {
         esp_http_client_cleanup(xHttpClient);
     }
-    HTTPHeaders_Free(xHttpReqHeaders);
+    HttpHeaders_free(xHttpReqHeaders);
     AwsSigV4_Terminate(xAwsSigV4Handle);
     STRING_delete(xStProducerStartTimestamp);
 

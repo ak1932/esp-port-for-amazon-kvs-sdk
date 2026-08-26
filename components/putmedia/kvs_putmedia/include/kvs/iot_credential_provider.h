@@ -16,8 +16,7 @@
 #ifndef _AWS_IOT_CREDENTIAL_PROVIDER_H_
 #define _AWS_IOT_CREDENTIAL_PROVIDER_H_
 
-typedef struct
-{
+typedef struct {
     char *pCredentialHost;
     char *pRoleAlias;
     char *pThingName;
@@ -26,8 +25,7 @@ typedef struct
     char *pPrivateKey;
 } IotCredentialRequest_t;
 
-typedef struct
-{
+typedef struct {
     char *pAccessKeyId;
     char *pSecretAccessKey;
     char *pSessionToken;

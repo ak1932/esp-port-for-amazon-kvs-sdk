@@ -2,13 +2,12 @@
 #include "llhttp.h"
 
 /* Public headers */
-#include "kvs/errors.h"
+#include "kvs/put_media_errors.h"
 
 /* Internal headers */
 #include "net/http_parser_adapter.h"
 
-typedef struct
-{
+typedef struct {
     llhttp_settings_t xSettings;
     const char *pBodyLoc;
     size_t uBodyLen;
@@ -33,14 +32,11 @@ static enum llhttp_errno prvParseHttpResponse(const char *pBuf, size_t uLen, uns
     llhttp_init(&xHttpParser, HTTP_RESPONSE, (llhttp_settings_t *)&xSettings);
 
     xHttpErrno = llhttp_execute(&xHttpParser, pBuf, (size_t)uLen);
-    if (xHttpErrno == HPE_OK)
-    {
-        if (puStatusCode != NULL)
-        {
+    if (xHttpErrno == HPE_OK) {
+        if (puStatusCode != NULL) {
             *puStatusCode = xHttpParser.status_code;
         }
-        if (ppBodyLoc != NULL && puBodyLen != NULL)
-        {
+        if (ppBodyLoc != NULL && puBodyLen != NULL) {
             *ppBodyLoc = xSettings.pBodyLoc;
             *puBodyLen = xSettings.uBodyLen;
         }
@@ -51,15 +47,12 @@ static enum llhttp_errno prvParseHttpResponse(const char *pBuf, size_t uLen, uns
 
 int HttpParser_parseHttpResponse(const char *pBuf, size_t uLen, unsigned int *puStatusCode, const char **ppBodyLoc, size_t *puBodyLen)
 {
-    int res = KVS_ERRNO_NONE;
+    int res = PUT_MEDIA_ERRNO_NONE;
 
-    if (pBuf == NULL || uLen == 0)
-    {
-        res = KVS_ERROR_INVALID_ARGUMENT;
-    }
-    else if ((prvParseHttpResponse(pBuf, uLen, puStatusCode, ppBodyLoc, puBodyLen) != HPE_OK))
-    {
-        res = KVS_ERROR_HTTP_PARSE_EXECUTE_FAIL;
+    if (pBuf == NULL || uLen == 0) {
+        res = PUT_MEDIA_ERROR_INVALID_ARGUMENT;
+    } else if ((prvParseHttpResponse(pBuf, uLen, puStatusCode, ppBodyLoc, puBodyLen) != HPE_OK)) {
+        res = PUT_MEDIA_ERROR_HTTP_PARSE_EXECUTE_FAIL;
     }
 
     return res;

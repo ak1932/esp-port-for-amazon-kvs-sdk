@@ -14,7 +14,7 @@
  */
 
 /* Public headers */
-#include "kvs/errors.h"
+#include "kvs/put_media_errors.h"
 
 /* Internal headers */
 #include "net/http_parser_adapter.h"
@@ -34,13 +34,12 @@
  */
 static int prvGetLine(const char *pStr, size_t uStrLen, size_t *puLineLen)
 {
-    int res = KVS_ERRNO_FAIL;
+    int res = PUT_MEDIA_ERRNO_FAIL;
     const char *p = NULL;
 
     for (p = pStr; p != NULL && (p - pStr) < uStrLen; p++) {
-        if (*p == '\n')
-        {
-            res = KVS_ERRNO_NONE;
+        if (*p == '\n') {
+            res = PUT_MEDIA_ERRNO_NONE;
             *puLineLen = p - pStr + 1;
             break;
         }
@@ -62,14 +61,12 @@ static unsigned int prvStrToUInt(const char *pStr, size_t uStrLen)
     unsigned int n = 0;
 
     /* Step to the first digital character. */
-    while ((p - pStr) < uStrLen && !(*p >= '0' && *p <= '9'))
-    {
+    while ((p - pStr) < uStrLen && !(*p >= '0' && *p <= '9')) {
         p++;
     }
 
     /* Convert until the first non-digital character. */
-    while ((p - pStr) < uStrLen && (*p >= '0' && *p <= '9'))
-    {
+    while ((p - pStr) < uStrLen && (*p >= '0' && *p <= '9')) {
         n = n * 10 + (*p - '0');
         p++;
     }
@@ -90,31 +87,20 @@ static int prvStrNCmpCi(const char *pStr1, const char *pStr2, size_t uLen)
     int res = 0;
     int n = 0;
 
-    while (n < uLen)
-    {
-        if (pStr1 == NULL)
-        {
-            if (pStr2 == NULL)
-            {
+    while (n < uLen) {
+        if (pStr1 == NULL) {
+            if (pStr2 == NULL) {
                 res = -1;
                 break;
-            }
-            else
-            {
+            } else {
                 res = 1;
             }
-        }
-        else
-        {
-            if (pStr2 == NULL)
-            {
+        } else {
+            if (pStr2 == NULL) {
                 res = -1;
-            }
-            else
-            {
+            } else {
                 res = TOLOWERCASE(*pStr1) - TOLOWERCASE(*pStr2);
-                if (res != 0)
-                {
+                if (res != 0) {
                     break;
                 }
                 n++;
@@ -129,33 +115,23 @@ static int prvStrNCmpCi(const char *pStr1, const char *pStr2, size_t uLen)
 
 int HttpParser_parseHttpResponse(const char *pBuf, size_t uLen, unsigned int *puStatusCode, const char **ppBodyLoc, size_t *puBodyLen)
 {
-    int res = KVS_ERRNO_NONE;
+    int res = PUT_MEDIA_ERRNO_NONE;
     const char *p = pBuf;
     size_t uLineLen = 0;
     const char *pBodyLoc = NULL;
     size_t uBodyLen = 0;
 
-    if (pBuf == NULL || uLen == 0)
-    {
-        res = KVS_ERROR_INVALID_ARGUMENT;
-    }
-    else
-    {
-        while (prvGetLine(p, uLen, &uLineLen) == KVS_ERRNO_NONE)
-        {
-            if (prvStrNCmpCi(p, HTTP_RSP_STATUS_HDR, sizeof(HTTP_RSP_STATUS_HDR) - 1) == 0)
-            {
-                if (puStatusCode != NULL)
-                {
+    if (pBuf == NULL || uLen == 0) {
+        res = PUT_MEDIA_ERROR_INVALID_ARGUMENT;
+    } else {
+        while (prvGetLine(p, uLen, &uLineLen) == PUT_MEDIA_ERRNO_NONE) {
+            if (prvStrNCmpCi(p, HTTP_RSP_STATUS_HDR, sizeof(HTTP_RSP_STATUS_HDR) - 1) == 0) {
+                if (puStatusCode != NULL) {
                     *puStatusCode = prvStrToUInt(p + sizeof(HTTP_RSP_STATUS_HDR), uLineLen - sizeof(HTTP_RSP_STATUS_HDR));
                 }
-            }
-            else if (prvStrNCmpCi(p, HTTP_HDR_CONTENT_LENGTH, sizeof(HTTP_HDR_CONTENT_LENGTH) - 1) == 0)
-            {
+            } else if (prvStrNCmpCi(p, HTTP_HDR_CONTENT_LENGTH, sizeof(HTTP_HDR_CONTENT_LENGTH) - 1) == 0) {
                 uBodyLen = prvStrToUInt(p + sizeof(HTTP_HDR_CONTENT_LENGTH), uLineLen - sizeof(HTTP_HDR_CONTENT_LENGTH));
-            }
-            else if (uLineLen == 2 && *p == '\r')
-            {
+            } else if (uLineLen == 2 && *p == '\r') {
                 p += 2;
                 uLen -= 2;
                 break;
@@ -165,23 +141,18 @@ int HttpParser_parseHttpResponse(const char *pBuf, size_t uLen, unsigned int *pu
             uLen -= uLineLen;
         }
 
-        if (uBodyLen > 0)
-        {
-            if (uLen == uBodyLen)
-            {
+        if (uBodyLen > 0) {
+            if (uLen == uBodyLen) {
                 pBodyLoc = p;
-            }
-            else
-            {
+            } else {
                 /* The body length does not match the remaining length of the buffer. Reset the result. */
                 pBodyLoc = NULL;
                 uBodyLen = 0;
-                res = KVS_ERROR_HTTP_PARSE_EXECUTE_FAIL;
+                res = PUT_MEDIA_ERROR_HTTP_PARSE_EXECUTE_FAIL;
             }
         }
 
-        if (ppBodyLoc != NULL && puBodyLen != NULL)
-        {
+        if (ppBodyLoc != NULL && puBodyLen != NULL) {
             *ppBodyLoc = pBodyLoc;
             *puBodyLen = uBodyLen;
         }

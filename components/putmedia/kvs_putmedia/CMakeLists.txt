@@ -8,6 +8,7 @@ set(srcs
     "source/restful/iot/iot_credential_provider.c"
     "source/restful/kvs/restapi_kvs.c"
     "source/restful/aws_signer_v4.c"
+    "source/put_media/put_media.c"
 )
 
 # parson and c_utility are used solely from source/ (json_helper.c, http_helper.c,

@@ -1,0 +1,8 @@
+## IDF Component Manager Manifest File
+##
+## Subset of Azure/azure-c-shared-utility (MIT). No upstream commit is recorded
+## in the vendored tree, so no version is declared here either - see README.md.
+description: "Azure C shared utility subset - STRING/BUFFER/Map/DList/Lock/HTTPHeaders (vendored, MIT)"
+dependencies:
+  idf:
+    version: ">=5.4.0"

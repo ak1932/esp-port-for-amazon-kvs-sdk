@@ -50,6 +50,7 @@
 
 #include "webrtc_mem_utils.h"
 #include "video_capture.h"
+#include "video_sink_priv.h"
 #include "esp_h264_alloc.h"
 #if USE_ESP_VIDEO_IF
 #include "esp_video_if.h"
@@ -406,7 +407,6 @@ void esp32p4_frame_grabber_cleanup(void)
 }
 
 typedef struct {
-    QueueHandle_t frame_queue;
     TaskHandle_t encoder_task_handle;
     StaticTask_t *task_buffer;
     void *task_stack;
@@ -434,21 +434,185 @@ typedef struct {
 
 static snapshot_intercept_t s_snapshot = {0};
 
-#define QUEUE_RECEIVE_WAIT_MS  CONFIG_VIDEO_QUEUE_RECEIVE_WAIT_MS
-#define QUEUE_SEND_WAIT_MS     CONFIG_VIDEO_QUEUE_SEND_WAIT_MS
-
-esp_h264_out_buf_t *esp32p4_grab_one_frame()
-{
-    esp_h264_out_buf_t *frame_data = heap_caps_calloc(1, sizeof(esp_h264_out_buf_t), MALLOC_CAP_SPIRAM);
-    if (xQueueReceive(s_p4_enc_data.frame_queue, frame_data, pdMS_TO_TICKS(QUEUE_RECEIVE_WAIT_MS)) != pdTRUE) {
-        heap_caps_free(frame_data);
-        return NULL;
-    }
-    return frame_data;
-}
+/* Backoff when the camera hands back no frame. Named for the queue it used to
+ * pace; it is now purely a camera-starvation retry interval. */
+#define CAMERA_RETRY_WAIT_MS   CONFIG_VIDEO_QUEUE_RECEIVE_WAIT_MS
 
 extern void *get_buffer();
 extern esp_err_t esp_h264_hw_enc_set_reset_request();
+
+/*  The grab loop does not encode inline. It hands the raw frame to the       
+ *  registered raw sink (the H.264 encoder, below), which encodes and fans the
+ *  result out to every enabled encoded sink with a BORROWED frame.           
+ */
+
+static inline video_frame_type_t h264_to_video_frame_type(esp_h264_frame_type_t t)
+{
+    switch (t) {
+        case ESP_H264_FRAME_TYPE_IDR:
+        case ESP_H264_FRAME_TYPE_I:
+            return VIDEO_FRAME_TYPE_I;
+        case ESP_H264_FRAME_TYPE_P:
+            return VIDEO_FRAME_TYPE_P;
+        default:
+            return VIDEO_FRAME_TYPE_OTHER;
+    }
+}
+
+/*  Triple-buffered encoder output                                            
+ *
+*  Keep a small pool of pre-allocated buffers and rotate through it. 
+ */
+
+#ifndef CONFIG_VIDEO_ENC_POOL_SLOTS
+#define CONFIG_VIDEO_ENC_POOL_SLOTS 3
+#endif
+
+typedef struct {
+    uint8_t *buf;
+    size_t   cap;
+} enc_slot_t;
+
+static enc_slot_t s_enc_pool[CONFIG_VIDEO_ENC_POOL_SLOTS];
+static uint8_t    s_enc_pool_idx;
+static uint32_t   s_enc_pool_grows;
+
+/* Returns the next slot, grown if this frame does not fit. NULL only on OOM. */
+static uint8_t *enc_pool_take(size_t len)
+{
+    enc_slot_t *slot = &s_enc_pool[s_enc_pool_idx];
+    s_enc_pool_idx = (uint8_t)((s_enc_pool_idx + 1) % CONFIG_VIDEO_ENC_POOL_SLOTS);
+
+    if (slot->cap < len) {
+        /* Growing frees the slot's old buffer. That is safe only because
+         * dispatch is synchronous: by the time this slot comes round again,
+         * every sink that saw its previous contents has already returned. An
+         * asynchronous dispatcher would have to retire the old buffer instead
+         * of freeing it here. */
+
+        /* Over-allocate by 25% and round to a cache line, so a frame size that
+         * creeps upwards does not trigger a realloc on every single frame. */
+        size_t want = (len + (len / 4) + 63) & ~((size_t)63);
+        uint8_t *nb = heap_caps_aligned_alloc(64, want, MALLOC_CAP_SPIRAM);
+        if (!nb) {
+            ESP_LOGE(TAG, "enc pool: cannot grow slot to %u bytes", (unsigned) want);
+            return NULL;
+        }
+        if (slot->buf) {
+            heap_caps_free(slot->buf);
+        }
+        slot->buf = nb;
+        slot->cap = want;
+        s_enc_pool_grows++;
+        /* Expected a handful of times at startup. A continuing stream of these
+         * means the frame size is not settling - worth looking at. */
+        ESP_LOGI(TAG, "enc pool: slot grown to %u bytes (grow #%" PRIu32 ")",
+                 (unsigned) want, s_enc_pool_grows);
+    }
+    return slot->buf;
+}
+
+static void enc_pool_free(void)
+{
+    for (int i = 0; i < CONFIG_VIDEO_ENC_POOL_SLOTS; i++) {
+        if (s_enc_pool[i].buf) {
+            heap_caps_free(s_enc_pool[i].buf);
+            s_enc_pool[i].buf = NULL;
+            s_enc_pool[i].cap = 0;
+        }
+    }
+    s_enc_pool_idx = 0;
+}
+
+/**
+ * Publish one encoded frame to every enabled sink and update the fps window.
+ * `buffer` is BORROWED for the duration of the dispatch and freed by the caller.
+ */
+static void publish_encoded_frame(uint8_t *buffer, uint32_t len, esp_h264_frame_type_t type)
+{
+    video_frame_t frame = {
+        .buffer    = buffer,
+        .len       = len,
+        .timestamp = esp_timer_get_time(),
+        .type      = h264_to_video_frame_type(type),
+    };
+
+    video_sink_dispatch(&frame);
+
+    static uint64_t enc_fps_window_start_us;
+    static uint32_t enc_fps_window_out;
+    enc_fps_window_out++;
+    uint64_t enc_now_us = esp_timer_get_time();
+    if (enc_fps_window_start_us == 0) {
+        enc_fps_window_start_us = enc_now_us;
+    } else if (enc_now_us - enc_fps_window_start_us >= 1000000ULL) {
+        uint64_t enc_window_us = enc_now_us - enc_fps_window_start_us;
+        uint32_t enc_fps = (uint32_t)((uint64_t)enc_fps_window_out * 1000000ULL / enc_window_us);
+        uint32_t sink_us = video_sink_take_window_us();
+        ESP_LOGI(TAG, "enc_fps: out=%" PRIu32 " (sink_ms=%" PRIu32 "/%" PRIu32 ")",
+                 enc_fps, sink_us / 1000, (uint32_t)(enc_window_us / 1000));
+        enc_fps_window_start_us = enc_now_us;
+        enc_fps_window_out = 0;
+    }
+}
+
+/**
+ * The single raw sink: encode, publish, free. Runs on the grabber task with the
+ * camera buffer still checked out, so everything here is on the camera's critical
+ * path - which is exactly why the encoded sinks below it must be quick.
+ */
+static esp_err_t h264_raw_sink_on_frame(const video_frame_raw_t *raw, void *user)
+{
+    (void)user;
+
+    /* Borrowed: valid only until the next encode, which is why it is copied into
+     * the pool below rather than published directly. */
+    esp_h264_out_buf_t enc = {0};
+    if (esp_h264_hw_enc_encode_frame_borrow(raw->buffer, raw->len, &enc) != ESP_OK) {
+        static uint32_t enc_fail_count;
+        enc_fail_count++;
+        if (enc_fail_count == 1 || (enc_fail_count & 0x1F) == 0) {
+            ESP_LOGW(TAG, "esp_h264_hw_enc_encode_frame_borrow() failed (count=%" PRIu32 ")",
+                     enc_fail_count);
+        }
+        return ESP_FAIL;
+    }
+
+    /* Skip empty encoder output: a zero-length frame yields calloc(_, 0), a
+     * pathological tiny pointer that NULL-checks pass and free() later corrupts
+     * TLSF with (same crash family as the Opus zero-frame bug). */
+    if (enc.len == 0) {
+        return ESP_OK;
+    }
+
+    uint8_t *slot = enc_pool_take(enc.len);
+    if (slot == NULL) {
+        /* Already logged. Dropping one frame beats stalling the camera. */
+        return ESP_OK;
+    }
+    memcpy(slot, enc.buffer, enc.len);
+
+    publish_encoded_frame(slot, enc.len, enc.type);
+    /* Nothing to free: the pool owns the buffer and will reuse this slot two
+     * frames from now. */
+    return ESP_OK;
+}
+
+/* The encoder is the single raw-frame sink; encoded frames go out through the
+ * video_sink registry, which consumers join with video_sink_register(). */
+static void register_raw_sink(void)
+{
+    static const video_raw_sink_t raw_sink = {
+        .name     = "h264-enc",
+        .on_frame = h264_raw_sink_on_frame,
+        .user     = NULL,
+    };
+    esp_err_t err = video_raw_sink_register(&raw_sink);
+    if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGE(TAG, "Failed to register raw sink: %s", esp_err_to_name(err));
+    }
+}
+
 static void video_encoder_task(void *arg)
 {
     ESP_LOGD(TAG, "Video encoder task started (singleton mode - runs continuously)");
@@ -478,7 +642,7 @@ static void video_encoder_task(void *arg)
             if (null_frame_count == 1 || (null_frame_count & 0x3F) == 0) {
                 ESP_LOGW(TAG, "esp_video_if_get_frame() returned NULL (count=%" PRIu32 ")", null_frame_count);
             }
-            vTaskDelay(pdMS_TO_TICKS(QUEUE_RECEIVE_WAIT_MS));
+            vTaskDelay(pdMS_TO_TICKS(CAMERA_RETRY_WAIT_MS));
             continue;
         }
 
@@ -607,22 +771,32 @@ static void video_encoder_task(void *arg)
                         frame->type = au.has_idr ? ESP_H264_FRAME_TYPE_IDR : ESP_H264_FRAME_TYPE_P;
                     }
                 }
+        /* Hand the frame to the raw sink - the H.264 encoder - which encodes and
+         * fans the result out to the encoded sinks. The camera buffer is still
+         * checked out until the release below, so this is on the camera's
+         * critical path. */
+        {
+            video_resolution_t enc_res = {0};
+            video_frame_raw_t raw_for_sink = {
+                .buffer = raw_frame->buf,
+                .len    = raw_frame->len,
+                .pixfmt = PIXFMT_YUV420,
+            };
+            if (esp_video_if_get_resolution(&enc_res) == ESP_OK) {
+                raw_for_sink.width  = enc_res.width;
+                raw_for_sink.height = enc_res.height;
+            }
+            if (video_raw_sink_dispatch(&raw_for_sink) != ESP_OK) {
+                /* Encoder hiccup or no sink registered - back off a little so a
+                 * persistent failure does not spin the task. */
+                esp_video_if_release_frame(raw_frame);
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
             }
         }
 
         // Release the raw frame as we're done with it
         esp_video_if_release_frame(raw_frame);
-
-        // If encoding failed, continue to next frame
-        if (!frame) {
-            static uint32_t enc_fail_count;
-            enc_fail_count++;
-            if (enc_fail_count == 1 || (enc_fail_count & 0x1F) == 0) {
-                ESP_LOGW(TAG, "esp_h264_hw_enc_encode_frame() failed (count=%" PRIu32 ")", enc_fail_count);
-            }
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
 #else
         static int frames_cnt = 0;
         esp_err_t ret = esp_h264_hw_enc_process_one_frame();
@@ -653,24 +827,12 @@ static void video_encoder_task(void *arg)
             continue;
         }
 
-        // frame copy
-        esp_h264_out_buf_t *frame = calloc(1, sizeof(esp_h264_out_buf_t));
-        if (!frame) {
-            ESP_LOGE(TAG, "Failed to alloc frame");
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-        frame->len = h264_out_data.len;
-        frame->buffer = heap_caps_aligned_calloc(64, 1, frame->len, MALLOC_CAP_SPIRAM);
-        if (!frame->buffer) {
-            ESP_LOGE(TAG, "Failed to alloc buffer. size %d", (int) frame->len);
-            free(frame);
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-        esp_cache_msync(h264_out_data.buffer, (frame->len + 63) & ~63, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
-        memcpy(frame->buffer, h264_out_data.buffer, frame->len);
-        frame->type = h264_out_data.type;
+        /* This path has no separate raw frame to hand to the raw sink - the camera
+         * pushes straight into the encoder - so publish the encoder's own output
+         * buffer directly. Sinks borrow it for the duration of the dispatch, which
+         * removes the alloc+memcpy this loop used to do on every frame. */
+        esp_cache_msync(h264_out_data.buffer, (h264_out_data.len + 63) & ~63, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+        publish_encoded_frame(h264_out_data.buffer, h264_out_data.len, h264_out_data.type);
 #endif
         bool queue_full = false;
 
@@ -774,12 +936,6 @@ void esp32p4_frame_grabber_init(video_frame_preprocess_fn_t frame_preprocess_fn)
     init_chip();
     init_clock();
 
-    s_p4_enc_data.frame_queue = xQueueCreate(CONFIG_VIDEO_FRAME_QUEUE_SIZE, sizeof(esp_h264_out_buf_t));
-    if (!s_p4_enc_data.frame_queue) {
-        ESP_LOGE(TAG, "Failed to create frame queue");
-        goto cleanup;
-    }
-
     // Create semaphore for start/stop control
     s_p4_enc_data.run_semaphore = xSemaphoreCreateBinary();
     if (!s_p4_enc_data.run_semaphore) {
@@ -860,7 +1016,6 @@ void esp32p4_frame_grabber_init(video_frame_preprocess_fn_t frame_preprocess_fn)
                  cfg.enc_cfg.res.width, cfg.enc_cfg.res.height, cfg.enc_cfg.fps);
     }
 
-    cfg.enc_cfg.fps = 27; /* used to distribute the bitrate */
     /* Encoder bitrate ceiling = rate-controller max, derived as
      *     max = LINK_BASE * (height / REF_HEIGHT)
      * LINK_BASE is the link's sustainable budget (~1 Mbps on a contended 2.4 GHz
@@ -931,6 +1086,10 @@ void esp32p4_frame_grabber_init(video_frame_preprocess_fn_t frame_preprocess_fn)
     }
 
     s_p4_enc_data.running = false;  // Start in stopped state
+
+    /* Wire the encoder in as the raw sink before the task can run. */
+    register_raw_sink();
+
     /* Video path pinned to core 1, leaving core 0 free for audio I/O. */
     s_p4_enc_data.encoder_task_handle = xTaskCreateStatic(video_encoder_task, "video_encoder", ENC_TASK_STACK_SIZE,
                                                           frame_preprocess_fn, ENC_TASK_PRIO, s_p4_enc_data.task_stack, s_p4_enc_data.task_buffer);
@@ -960,11 +1119,6 @@ cleanup:
         vSemaphoreDelete(s_p4_enc_data.run_semaphore);
         s_p4_enc_data.run_semaphore = NULL;
     }
-    if (s_p4_enc_data.frame_queue != NULL) {
-        vQueueDelete(s_p4_enc_data.frame_queue);
-        s_p4_enc_data.frame_queue = NULL;
-    }
-
     ESP_LOGE(TAG, "ESP32P4 frame grabber initialization failed");
 }
 
@@ -1034,28 +1188,10 @@ esp_err_t esp32p4_frame_grabber_deinit(void)
     // Stop encoding first
     esp32p4_frame_grabber_stop();
 
-    // Drain the frame queue with limited iterations to prevent infinite loop
-    if (s_p4_enc_data.frame_queue != NULL) {
-        ESP_LOGD(TAG, "Draining video frame queue...");
-        esp_h264_out_buf_t h264_frame;
-        int drained_count = 0;
-        const int max_drain_iterations = CONFIG_VIDEO_FRAME_QUEUE_SIZE;  // Prevent infinite loop
-
-        while (xQueueReceive(s_p4_enc_data.frame_queue, &h264_frame, 0) == pdTRUE &&
-               drained_count < max_drain_iterations) {
-            if (h264_frame.buffer) {
-                heap_caps_free(h264_frame.buffer);
-            }
-            drained_count++;
-        }
-
-        if (drained_count > 0) {
-            ESP_LOGD(TAG, "Drained %d video frames from queue", drained_count);
-        }
-        if (drained_count >= max_drain_iterations) {
-            ESP_LOGI(TAG, "Reached max drain limit, queue may still contain frames");
-        }
-    }
+    /* Release the encoder output pool. Safe here: the task is stopped, so no
+     * dispatch can be reading a slot. It is rebuilt on demand by the first
+     * frame after the next start(). */
+    enc_pool_free();
 
     // Singleton pattern: encoder task remains running but paused
     ESP_LOGD(TAG, "ESP32P4 frame grabber is singleton - task remains paused until start() is called");

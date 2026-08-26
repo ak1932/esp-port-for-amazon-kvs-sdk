@@ -15,6 +15,7 @@
 
 #include <ctype.h>
 #include <inttypes.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -24,7 +25,6 @@
 /* Thirdparty headers */
 #include "azure_c_shared_utility/doublylinkedlist.h"
 #include "azure_c_shared_utility/lock.h"
-#include "azure_c_shared_utility/strings.h"
 
 /* Public headers */
 #include "kvs/put_media_errors.h"
@@ -73,6 +73,15 @@
 #define KVS_URI_PUT_MEDIA "/putMedia"
 
 /*-----------------------------------------------------------*/
+
+/* KVS caps a stream name at 256 characters and the JSON wrappers below add well under 64. */
+#define KVS_HTTP_BODY_MAX_LEN 512
+
+/* Decimal content-length of a body bounded by KVS_HTTP_BODY_MAX_LEN. */
+#define KVS_CONTENT_LENGTH_STR_SIZE 12
+
+/* "<seconds>.<milliseconds>": 20 digits of uint64 seconds, a dot, 3 digits, NUL. */
+#define PRODUCER_START_TIMESTAMP_STR_SIZE 32
 
 #define DESCRIBE_STREAM_HTTP_BODY_TEMPLATE "{\"StreamName\": \"%s\"}"
 
@@ -280,22 +289,44 @@ static char *prvGetTimecodeValue(FragmentTimecodeType_t xTimecodeType)
     }
 }
 
-static int prvGetEpochTimestampInStr(uint64_t uProducerStartTimestampMs, STRING_HANDLE *pxStProducerStartTimestamp)
+static int prvGetEpochTimestampInStr(uint64_t uProducerStartTimestampMs, char *pcBuf, size_t uBufSize)
 {
-    int res = PUT_MEDIA_ERRNO_NONE;
     uint64_t uProducerStartTimestamp = 0;
-    STRING_HANDLE xStProducerStartTimestamp = NULL;
 
-    uProducerStartTimestamp = (uProducerStartTimestampMs == 0) ? getEpochTimestampInMs() : uProducerStartTimestampMs;
-    xStProducerStartTimestamp = STRING_construct_sprintf("%." PRIu64 ".%03d", uProducerStartTimestamp / 1000, uProducerStartTimestamp % 1000);
-
-    if (xStProducerStartTimestamp == NULL) {
-        res = PUT_MEDIA_ERROR_C_UTIL_STRING_ERROR;
-    } else {
-        *pxStProducerStartTimestamp = xStProducerStartTimestamp;
+    if (pcBuf == NULL || uBufSize == 0) {
+        return PUT_MEDIA_ERROR_INVALID_ARGUMENT;
     }
 
-    return res;
+    uProducerStartTimestamp = (uProducerStartTimestampMs == 0) ? getEpochTimestampInMs() : uProducerStartTimestampMs;
+
+    if (snprintf(pcBuf, uBufSize, "%" PRIu64 ".%03d", uProducerStartTimestamp / 1000, (int)(uProducerStartTimestamp % 1000)) >= (int)uBufSize) {
+        return PUT_MEDIA_ERROR_STRING_ERROR;
+    }
+
+    return PUT_MEDIA_ERRNO_NONE;
+}
+
+/*
+ * Render a request body from a template together with its content-length; the
+ * three JSON control-plane calls below need both, and always as a matched pair.
+ */
+static int prvFormatHttpBody(char *pcBody, size_t uBodySize, char *pcContentLength, size_t uContentLengthSize, const char *pcFormat, ...)
+{
+    va_list xArgs;
+    int iLen = 0;
+
+    va_start(xArgs, pcFormat);
+    iLen = vsnprintf(pcBody, uBodySize, pcFormat, xArgs);
+    va_end(xArgs);
+
+    if (iLen < 0 || (size_t)iLen >= uBodySize) {
+        return PUT_MEDIA_ERROR_STRING_ERROR;
+    }
+    if (snprintf(pcContentLength, uContentLengthSize, "%d", iLen) >= (int)uContentLengthSize) {
+        return PUT_MEDIA_ERROR_STRING_ERROR;
+    }
+
+    return PUT_MEDIA_ERRNO_NONE;
 }
 
 static int prvParseFragmentAckLength(char *pcSrc, size_t uLen, size_t *puMsgLen, size_t *puBytesRead)
@@ -574,8 +605,8 @@ int Kvs_describeStream(KvsServiceParameter_t *pServPara, KvsDescribeStreamParame
 {
     int res = PUT_MEDIA_ERRNO_NONE;
 
-    STRING_HANDLE xStHttpBody = NULL;
-    STRING_HANDLE xStContentLength = NULL;
+    char pcHttpBody[KVS_HTTP_BODY_MAX_LEN] = {0};
+    char pcContentLength[KVS_CONTENT_LENGTH_STR_SIZE] = {0};
     char pcXAmzDate[DATE_TIME_ISO_8601_FORMAT_STRING_SIZE] = {0};
 
     AwsSigV4Handle xAwsSigV4Handle = NULL;
@@ -600,15 +631,16 @@ int Kvs_describeStream(KvsServiceParameter_t *pServPara, KvsDescribeStreamParame
             ESP_LOGE(TAG, "Failed to get time");
             /* Propagate the res error */
         } else if (
-            (xStHttpBody = STRING_construct_sprintf(DESCRIBE_STREAM_HTTP_BODY_TEMPLATE, pDescPara->pcStreamName)) == NULL ||
-            (xStContentLength = STRING_construct_sprintf("%u", STRING_length(xStHttpBody))) == NULL) {
+            prvFormatHttpBody(
+                pcHttpBody, sizeof(pcHttpBody), pcContentLength, sizeof(pcContentLength), DESCRIBE_STREAM_HTTP_BODY_TEMPLATE, pDescPara->pcStreamName) !=
+                PUT_MEDIA_ERRNO_NONE) {
             res = PUT_MEDIA_ERROR_UNABLE_TO_ALLOCATE_HTTP_BODY;
             ESP_LOGE(TAG, "Failed to allocate HTTP body");
         } else if (
             (xHttpReqHeaders = HttpHeaders_create()) == NULL ||
             HttpHeaders_add(xHttpReqHeaders, HDR_HOST, pServPara->pcHost) != PUT_MEDIA_ERRNO_NONE ||
             HttpHeaders_add(xHttpReqHeaders, HDR_ACCEPT, VAL_ACCEPT_ANY) != PUT_MEDIA_ERRNO_NONE ||
-            HttpHeaders_add(xHttpReqHeaders, HDR_CONTENT_LENGTH, STRING_c_str(xStContentLength)) != PUT_MEDIA_ERRNO_NONE ||
+            HttpHeaders_add(xHttpReqHeaders, HDR_CONTENT_LENGTH, pcContentLength) != PUT_MEDIA_ERRNO_NONE ||
             HttpHeaders_add(xHttpReqHeaders, HDR_CONTENT_TYPE, VAL_CONTENT_TYPE_APPLICATION_jSON) != PUT_MEDIA_ERRNO_NONE ||
             HttpHeaders_add(xHttpReqHeaders, HDR_USER_AGENT, VAL_USER_AGENT) != PUT_MEDIA_ERRNO_NONE ||
             HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZ_DATE, pcXAmzDate) != PUT_MEDIA_ERRNO_NONE ||
@@ -616,12 +648,12 @@ int Kvs_describeStream(KvsServiceParameter_t *pServPara, KvsDescribeStreamParame
             res = PUT_MEDIA_ERROR_UNABLE_TO_GENERATE_HTTP_HEADER;
             ESP_LOGE(TAG, "Failed to generate HTTP headers");
         } else if (
-            (xAwsSigV4Handle = prvSign(pServPara, KVS_URI_DESCRIBE_STREAM, URI_QUERY_EMPTY, xHttpReqHeaders, STRING_c_str(xStHttpBody))) == NULL ||
+            (xAwsSigV4Handle = prvSign(pServPara, KVS_URI_DESCRIBE_STREAM, URI_QUERY_EMPTY, xHttpReqHeaders, pcHttpBody)) == NULL ||
             HttpHeaders_add(xHttpReqHeaders, HDR_AUTHORIZATION, AwsSigV4_GetAuthorization(xAwsSigV4Handle)) != PUT_MEDIA_ERRNO_NONE) {
             res = PUT_MEDIA_ERROR_FAIL_TO_SIGN_HTTP_REQ;
             ESP_LOGE(TAG, "Failed to sign");
         } else if ((res = Http_performRequest(pServPara->pcHost, PORT_HTTPS, KVS_URI_DESCRIBE_STREAM, HTTP_METHOD_POST,
-                    xHttpReqHeaders, STRING_c_str(xStHttpBody), pServPara->uRecvTimeoutMs, pServPara->uSendTimeoutMs,
+                    xHttpReqHeaders, pcHttpBody, pServPara->uRecvTimeoutMs, pServPara->uSendTimeoutMs,
                     &uHttpStatusCode, &pRspBody, &uRspBodyLen)) != PUT_MEDIA_ERRNO_NONE) {
             ESP_LOGE(TAG, "Failed http request to %s", pServPara->pcHost);
             /* Propagate the res error */
@@ -639,8 +671,6 @@ int Kvs_describeStream(KvsServiceParameter_t *pServPara, KvsDescribeStreamParame
         SAFE_FREE(pRspBody);
         HttpHeaders_free(xHttpReqHeaders);
         AwsSigV4_Terminate(xAwsSigV4Handle);
-        STRING_delete(xStContentLength);
-        STRING_delete(xStHttpBody);
     }
     return res;
 }
@@ -649,8 +679,8 @@ int Kvs_createStream(KvsServiceParameter_t *pServPara, KvsCreateStreamParameter_
 {
     int res = PUT_MEDIA_ERRNO_NONE;
 
-    STRING_HANDLE xStHttpBody = NULL;
-    STRING_HANDLE xStContentLength = NULL;
+    char pcHttpBody[KVS_HTTP_BODY_MAX_LEN] = {0};
+    char pcContentLength[KVS_CONTENT_LENGTH_STR_SIZE] = {0};
     char pcXAmzDate[DATE_TIME_ISO_8601_FORMAT_STRING_SIZE] = {0};
 
     AwsSigV4Handle xAwsSigV4Handle = NULL;
@@ -672,15 +702,16 @@ int Kvs_createStream(KvsServiceParameter_t *pServPara, KvsCreateStreamParameter_
         ESP_LOGE(TAG, "Failed to get time");
         /* Propagate the res error */
     } else if (
-        (xStHttpBody = STRING_construct_sprintf(CREATE_STREAM_HTTP_BODY_TEMPLATE, pCreatePara->pcStreamName, pCreatePara->uDataRetentionInHours)) == NULL ||
-        (xStContentLength = STRING_construct_sprintf("%u", STRING_length(xStHttpBody))) == NULL) {
+        prvFormatHttpBody(
+            pcHttpBody, sizeof(pcHttpBody), pcContentLength, sizeof(pcContentLength), CREATE_STREAM_HTTP_BODY_TEMPLATE, pCreatePara->pcStreamName,
+            pCreatePara->uDataRetentionInHours) != PUT_MEDIA_ERRNO_NONE) {
         res = PUT_MEDIA_ERROR_UNABLE_TO_ALLOCATE_HTTP_BODY;
         ESP_LOGE(TAG, "Failed to allocate HTTP body");
     } else if (
         (xHttpReqHeaders = HttpHeaders_create()) == NULL ||
         HttpHeaders_add(xHttpReqHeaders, HDR_HOST, pServPara->pcHost) != PUT_MEDIA_ERRNO_NONE ||
         HttpHeaders_add(xHttpReqHeaders, HDR_ACCEPT, VAL_ACCEPT_ANY) != PUT_MEDIA_ERRNO_NONE ||
-        HttpHeaders_add(xHttpReqHeaders, HDR_CONTENT_LENGTH, STRING_c_str(xStContentLength)) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_CONTENT_LENGTH, pcContentLength) != PUT_MEDIA_ERRNO_NONE ||
         HttpHeaders_add(xHttpReqHeaders, HDR_CONTENT_TYPE, VAL_CONTENT_TYPE_APPLICATION_jSON) != PUT_MEDIA_ERRNO_NONE ||
         HttpHeaders_add(xHttpReqHeaders, HDR_USER_AGENT, VAL_USER_AGENT) != PUT_MEDIA_ERRNO_NONE ||
         HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZ_DATE, pcXAmzDate) != PUT_MEDIA_ERRNO_NONE ||
@@ -688,12 +719,12 @@ int Kvs_createStream(KvsServiceParameter_t *pServPara, KvsCreateStreamParameter_
         res = PUT_MEDIA_ERROR_UNABLE_TO_GENERATE_HTTP_HEADER;
         ESP_LOGE(TAG, "Failed to generate HTTP headers");
     } else if (
-        (xAwsSigV4Handle = prvSign(pServPara, KVS_URI_CREATE_STREAM, URI_QUERY_EMPTY, xHttpReqHeaders, STRING_c_str(xStHttpBody))) == NULL ||
+        (xAwsSigV4Handle = prvSign(pServPara, KVS_URI_CREATE_STREAM, URI_QUERY_EMPTY, xHttpReqHeaders, pcHttpBody)) == NULL ||
         HttpHeaders_add(xHttpReqHeaders, HDR_AUTHORIZATION, AwsSigV4_GetAuthorization(xAwsSigV4Handle)) != PUT_MEDIA_ERRNO_NONE) {
         ESP_LOGE(TAG, "Failed to sign");
         res = PUT_MEDIA_ERROR_FAIL_TO_SIGN_HTTP_REQ;
     } else if ((res = Http_performRequest(pServPara->pcHost, PORT_HTTPS, KVS_URI_CREATE_STREAM, HTTP_METHOD_POST,
-                xHttpReqHeaders, STRING_c_str(xStHttpBody), pServPara->uRecvTimeoutMs, pServPara->uSendTimeoutMs,
+                xHttpReqHeaders, pcHttpBody, pServPara->uRecvTimeoutMs, pServPara->uSendTimeoutMs,
                 &uHttpStatusCode, &pRspBody, &uRspBodyLen)) != PUT_MEDIA_ERRNO_NONE) {
         ESP_LOGE(TAG, "Failed http request to %s", pServPara->pcHost);
         /* Propagate the res error */
@@ -711,8 +742,6 @@ int Kvs_createStream(KvsServiceParameter_t *pServPara, KvsCreateStreamParameter_
     SAFE_FREE(pRspBody);
     HttpHeaders_free(xHttpReqHeaders);
     AwsSigV4_Terminate(xAwsSigV4Handle);
-    STRING_delete(xStContentLength);
-    STRING_delete(xStHttpBody);
 
     return res;
 }
@@ -721,8 +750,8 @@ int Kvs_getDataEndpoint(KvsServiceParameter_t *pServPara, KvsGetDataEndpointPara
 {
     int res = PUT_MEDIA_ERRNO_NONE;
 
-    STRING_HANDLE xStHttpBody = NULL;
-    STRING_HANDLE xStContentLength = NULL;
+    char pcHttpBody[KVS_HTTP_BODY_MAX_LEN] = {0};
+    char pcContentLength[KVS_CONTENT_LENGTH_STR_SIZE] = {0};
     char pcXAmzDate[DATE_TIME_ISO_8601_FORMAT_STRING_SIZE] = {0};
 
     AwsSigV4Handle xAwsSigV4Handle = NULL;
@@ -744,15 +773,16 @@ int Kvs_getDataEndpoint(KvsServiceParameter_t *pServPara, KvsGetDataEndpointPara
         ESP_LOGE(TAG, "Failed to get time");
         /* Propagate the res error */
     } else if (
-        (xStHttpBody = STRING_construct_sprintf(GET_DATA_ENDPOINT_HTTP_BODY_TEMPLATE, pGetDataEpPara->pcStreamName)) == NULL ||
-        (xStContentLength = STRING_construct_sprintf("%u", STRING_length(xStHttpBody))) == NULL) {
+        prvFormatHttpBody(
+            pcHttpBody, sizeof(pcHttpBody), pcContentLength, sizeof(pcContentLength), GET_DATA_ENDPOINT_HTTP_BODY_TEMPLATE, pGetDataEpPara->pcStreamName) !=
+            PUT_MEDIA_ERRNO_NONE) {
         res = PUT_MEDIA_ERROR_UNABLE_TO_ALLOCATE_HTTP_BODY;
         ESP_LOGE(TAG, "Failed to allocate HTTP body");
     } else if (
         (xHttpReqHeaders = HttpHeaders_create()) == NULL ||
         HttpHeaders_add(xHttpReqHeaders, HDR_HOST, pServPara->pcHost) != PUT_MEDIA_ERRNO_NONE ||
         HttpHeaders_add(xHttpReqHeaders, HDR_ACCEPT, VAL_ACCEPT_ANY) != PUT_MEDIA_ERRNO_NONE ||
-        HttpHeaders_add(xHttpReqHeaders, HDR_CONTENT_LENGTH, STRING_c_str(xStContentLength)) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_CONTENT_LENGTH, pcContentLength) != PUT_MEDIA_ERRNO_NONE ||
         HttpHeaders_add(xHttpReqHeaders, HDR_CONTENT_TYPE, VAL_CONTENT_TYPE_APPLICATION_jSON) != PUT_MEDIA_ERRNO_NONE ||
         HttpHeaders_add(xHttpReqHeaders, HDR_USER_AGENT, VAL_USER_AGENT) != PUT_MEDIA_ERRNO_NONE ||
         HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZ_DATE, pcXAmzDate) != PUT_MEDIA_ERRNO_NONE ||
@@ -760,12 +790,12 @@ int Kvs_getDataEndpoint(KvsServiceParameter_t *pServPara, KvsGetDataEndpointPara
         res = PUT_MEDIA_ERROR_UNABLE_TO_GENERATE_HTTP_HEADER;
         ESP_LOGE(TAG, "Failed to generate HTTP headers");
     } else if (
-        (xAwsSigV4Handle = prvSign(pServPara, KVS_URI_GET_DATA_ENDPOINT, URI_QUERY_EMPTY, xHttpReqHeaders, STRING_c_str(xStHttpBody))) == NULL ||
+        (xAwsSigV4Handle = prvSign(pServPara, KVS_URI_GET_DATA_ENDPOINT, URI_QUERY_EMPTY, xHttpReqHeaders, pcHttpBody)) == NULL ||
         HttpHeaders_add(xHttpReqHeaders, HDR_AUTHORIZATION, AwsSigV4_GetAuthorization(xAwsSigV4Handle)) != PUT_MEDIA_ERRNO_NONE) {
         res = PUT_MEDIA_ERROR_FAIL_TO_SIGN_HTTP_REQ;
         ESP_LOGE(TAG, "Failed to sign");
     } else if ((res = Http_performRequest(pServPara->pcHost, PORT_HTTPS, KVS_URI_GET_DATA_ENDPOINT, HTTP_METHOD_POST,
-                xHttpReqHeaders, STRING_c_str(xStHttpBody), pServPara->uRecvTimeoutMs, pServPara->uSendTimeoutMs,
+                xHttpReqHeaders, pcHttpBody, pServPara->uRecvTimeoutMs, pServPara->uSendTimeoutMs,
                 &uHttpStatusCode, &pRspBody, &uRspBodyLen)) != PUT_MEDIA_ERRNO_NONE) {
         ESP_LOGE(TAG, "Failed http request to %s", pServPara->pcHost);
         /* Propagate the res error */
@@ -788,8 +818,6 @@ int Kvs_getDataEndpoint(KvsServiceParameter_t *pServPara, KvsGetDataEndpointPara
     SAFE_FREE(pRspBody);
     HttpHeaders_free(xHttpReqHeaders);
     AwsSigV4_Terminate(xAwsSigV4Handle);
-    STRING_delete(xStContentLength);
-    STRING_delete(xStHttpBody);
 
     return res;
 }
@@ -800,7 +828,7 @@ int Kvs_putMediaStart(KvsServiceParameter_t *pServPara, KvsPutMediaParameter_t *
     PutMedia_t *pPutMedia = NULL;
 
     char pcXAmzDate[DATE_TIME_ISO_8601_FORMAT_STRING_SIZE] = {0};
-    STRING_HANDLE xStProducerStartTimestamp = NULL;
+    char pcProducerStartTimestamp[PRODUCER_START_TIMESTAMP_STR_SIZE] = {0};
 
     AwsSigV4Handle xAwsSigV4Handle = NULL;
 
@@ -824,7 +852,7 @@ int Kvs_putMediaStart(KvsServiceParameter_t *pServPara, KvsPutMediaParameter_t *
     } else if ((res = getTimeInIso8601(pcXAmzDate, sizeof(pcXAmzDate))) != PUT_MEDIA_ERRNO_NONE) {
         ESP_LOGE(TAG, "Failed to get time");
         /* Propagate the res error */
-    } else if ((res = prvGetEpochTimestampInStr(pPutMediaPara->uProducerStartTimestampMs, &xStProducerStartTimestamp)) != PUT_MEDIA_ERRNO_NONE) {
+    } else if ((res = prvGetEpochTimestampInStr(pPutMediaPara->uProducerStartTimestampMs, pcProducerStartTimestamp, sizeof(pcProducerStartTimestamp))) != PUT_MEDIA_ERRNO_NONE) {
         ESP_LOGE(TAG, "Failed to get epoch time");
         /* Propagate the res error */
     } else if (
@@ -839,7 +867,7 @@ int Kvs_putMediaStart(KvsServiceParameter_t *pServPara, KvsPutMediaParameter_t *
         (pServPara->pcToken != NULL && (HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZ_SECURITY_TOKEN, pServPara->pcToken) != PUT_MEDIA_ERRNO_NONE)) ||
         HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZN_FRAG_ACK_REQUIRED, VAL_FRAGMENT_ACK_REQUIRED_TRUE) != PUT_MEDIA_ERRNO_NONE ||
         HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZN_FRAG_T_TYPE, prvGetTimecodeValue(pPutMediaPara->xTimecodeType)) != PUT_MEDIA_ERRNO_NONE ||
-        HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZN_PRODUCER_START_T, STRING_c_str(xStProducerStartTimestamp)) != PUT_MEDIA_ERRNO_NONE ||
+        HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZN_PRODUCER_START_T, pcProducerStartTimestamp) != PUT_MEDIA_ERRNO_NONE ||
         HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZN_STREAM_NAME, pPutMediaPara->pcStreamName) != PUT_MEDIA_ERRNO_NONE ||
         HttpHeaders_add(xHttpReqHeaders, "expect", "100-continue") != PUT_MEDIA_ERRNO_NONE) {
         res = PUT_MEDIA_ERROR_UNABLE_TO_GENERATE_HTTP_HEADER;
@@ -884,7 +912,6 @@ int Kvs_putMediaStart(KvsServiceParameter_t *pServPara, KvsPutMediaParameter_t *
     }
     HttpHeaders_free(xHttpReqHeaders);
     AwsSigV4_Terminate(xAwsSigV4Handle);
-    STRING_delete(xStProducerStartTimestamp);
 
     return res;
 }

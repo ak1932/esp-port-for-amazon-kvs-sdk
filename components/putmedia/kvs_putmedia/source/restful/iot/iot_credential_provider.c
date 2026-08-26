@@ -14,10 +14,10 @@
  */
 
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 /* Thirdparty headers */
-#include "azure_c_shared_utility/strings.h"
 
 /* Public headers */
 #include "kvs/put_media_errors.h"
@@ -35,6 +35,9 @@
 #define IOT_URI_ROLE_ALIASES_BEGIN  "/role-aliases"
 #define IOT_URI_ROLE_ALIASES_END    "/credentials"
 #define IOT_HTTP_TIMEOUT_MS         10000
+
+/* "/role-aliases/<alias>/credentials"; AWS IoT caps a role alias at 128 characters. */
+#define IOT_URI_MAX_LEN             192
 
 static int parseIoTCredential(const char *pcJsonSrc, size_t uJsonSrcLen, IotCredentialToken_t *pToken)
 {
@@ -65,7 +68,7 @@ IotCredentialToken_t *Iot_getCredential(IotCredentialRequest_t *pReq)
     int res = PUT_MEDIA_ERRNO_NONE;
     IotCredentialToken_t *pToken = NULL;
 
-    STRING_HANDLE xStUri = NULL;
+    char pcUri[IOT_URI_MAX_LEN] = {0};
 
     unsigned int uHttpStatusCode = 0;
     HttpHeaders_t *xHttpReqHeaders = NULL;
@@ -76,16 +79,16 @@ IotCredentialToken_t *Iot_getCredential(IotCredentialRequest_t *pReq)
             pReq->pPrivateKey == NULL) {
         res = PUT_MEDIA_ERROR_INVALID_ARGUMENT;
         ESP_LOGE(TAG, "Invalid argument");
-    } else if ((xStUri = STRING_construct_sprintf("%s/%s%s", IOT_URI_ROLE_ALIASES_BEGIN, pReq->pRoleAlias, IOT_URI_ROLE_ALIASES_END)) == NULL) {
-        res = PUT_MEDIA_ERROR_OUT_OF_MEMORY;
-        ESP_LOGE(TAG, "OOM: Failed to allocate IoT URI");
+    } else if (snprintf(pcUri, sizeof(pcUri), "%s/%s%s", IOT_URI_ROLE_ALIASES_BEGIN, pReq->pRoleAlias, IOT_URI_ROLE_ALIASES_END) >= (int)sizeof(pcUri)) {
+        res = PUT_MEDIA_ERROR_STRING_ERROR;
+        ESP_LOGE(TAG, "Role alias too long for the IoT URI");
     } else if (
         (xHttpReqHeaders = HttpHeaders_create()) == NULL || HttpHeaders_add(xHttpReqHeaders, HDR_HOST, pReq->pCredentialHost) != PUT_MEDIA_ERRNO_NONE ||
         HttpHeaders_add(xHttpReqHeaders, "accept", "*/*") != PUT_MEDIA_ERRNO_NONE ||
         HttpHeaders_add(xHttpReqHeaders, HDR_X_AMZN_IOT_THINGNAME, pReq->pThingName) != PUT_MEDIA_ERRNO_NONE) {
         res = PUT_MEDIA_ERROR_FAIL_TO_GENERATE_HTTP_HEADERS;
         ESP_LOGE(TAG, "Failed to generate HTTP headers");
-    } else if ((res = Http_performRequestWithX509(pReq->pCredentialHost, "443", STRING_c_str(xStUri), HTTP_METHOD_GET,
+    } else if ((res = Http_performRequestWithX509(pReq->pCredentialHost, "443", pcUri, HTTP_METHOD_GET,
                 xHttpReqHeaders, HTTP_BODY_EMPTY, IOT_HTTP_TIMEOUT_MS, IOT_HTTP_TIMEOUT_MS,
                 pReq->pRootCA, pReq->pCertificate, pReq->pPrivateKey,
                 &uHttpStatusCode, &pRspBody, &uRspBodyLen)) != PUT_MEDIA_ERRNO_NONE) {
@@ -119,7 +122,6 @@ IotCredentialToken_t *Iot_getCredential(IotCredentialRequest_t *pReq)
     }
 
     HttpHeaders_free(xHttpReqHeaders);
-    STRING_delete(xStUri);
 
     return pToken;
 }

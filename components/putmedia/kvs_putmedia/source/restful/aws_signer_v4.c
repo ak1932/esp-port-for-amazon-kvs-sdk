@@ -13,12 +13,12 @@
  * permissions and limitations under the License.
  */
 
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
 /* Third party headers */
-#include "azure_c_shared_utility/strings.h"
 #include "mbedtls/build_info.h"
 #include "mbedtls/md.h"
 #if defined(MBEDTLS_VERSION_MAJOR) && (MBEDTLS_VERSION_MAJOR >= 4)
@@ -69,13 +69,129 @@
 
 #define TEMPLATE_SIGNATURE_START "%s%s"
 
+/* Growth floor for StrBuf_t; a canonical request runs to roughly 1 KB. */
+#define STR_BUF_MIN_CAPACITY 128
+
+/*
+ * A minimal growable string.
+ *
+ * The canonical request and the signed-header list accumulate over a header set
+ * that varies per request, so they cannot be sized up front the way the rest of
+ * this component's strings are. All zeroes is a valid empty buffer, so a
+ * memset() is enough to initialise one.
+ */
+typedef struct StrBuf {
+    char *pcBuf;
+    size_t uLen;
+    size_t uCapacity;
+} StrBuf_t;
+
 typedef struct AwsSigV4 {
-    STRING_HANDLE xStCanonicalRequest;
-    STRING_HANDLE xStSignedHeaders;
-    STRING_HANDLE xStScope;
-    STRING_HANDLE xStHmacHexEncoded;
-    STRING_HANDLE xStAuthorization;
+    StrBuf_t xCanonicalRequest;
+    StrBuf_t xSignedHeaders;
+    StrBuf_t xScope;
+    StrBuf_t xHmacHexEncoded;
+    StrBuf_t xAuthorization;
 } AwsSigV4_t;
+
+static void prvSbFree(StrBuf_t *pxSb)
+{
+    if (pxSb != NULL) {
+        kvsFree(pxSb->pcBuf);
+        pxSb->pcBuf = NULL;
+        pxSb->uLen = 0;
+        pxSb->uCapacity = 0;
+    }
+}
+
+static const char *prvSbStr(const StrBuf_t *pxSb)
+{
+    return (pxSb != NULL && pxSb->pcBuf != NULL) ? pxSb->pcBuf : "";
+}
+
+static size_t prvSbLen(const StrBuf_t *pxSb)
+{
+    return (pxSb != NULL) ? pxSb->uLen : 0;
+}
+
+/* Make room for uExtra more characters plus the terminator. */
+static int prvSbReserve(StrBuf_t *pxSb, size_t uExtra)
+{
+    size_t uNeeded = pxSb->uLen + uExtra + 1;
+    size_t uCapacity = 0;
+    char *pcBuf = NULL;
+
+    if (uNeeded <= pxSb->uCapacity) {
+        return PUT_MEDIA_ERRNO_NONE;
+    }
+
+    uCapacity = (pxSb->uCapacity != 0) ? pxSb->uCapacity : STR_BUF_MIN_CAPACITY;
+    while (uCapacity < uNeeded) {
+        uCapacity *= 2;
+    }
+
+    if ((pcBuf = (char *)kvsRealloc(pxSb->pcBuf, uCapacity)) == NULL) {
+        return PUT_MEDIA_ERROR_OUT_OF_MEMORY;
+    }
+    if (pxSb->pcBuf == NULL) {
+        pcBuf[0] = '\0';
+    }
+    pxSb->pcBuf = pcBuf;
+    pxSb->uCapacity = uCapacity;
+
+    return PUT_MEDIA_ERRNO_NONE;
+}
+
+static int prvSbAppend(StrBuf_t *pxSb, const char *pcStr)
+{
+    int res = PUT_MEDIA_ERRNO_NONE;
+    size_t uLen = 0;
+
+    if (pxSb == NULL || pcStr == NULL) {
+        return PUT_MEDIA_ERROR_INVALID_ARGUMENT;
+    }
+
+    uLen = strlen(pcStr);
+    if ((res = prvSbReserve(pxSb, uLen)) == PUT_MEDIA_ERRNO_NONE) {
+        memcpy(pxSb->pcBuf + pxSb->uLen, pcStr, uLen + 1);
+        pxSb->uLen += uLen;
+    }
+
+    return res;
+}
+
+static int prvSbAppendF(StrBuf_t *pxSb, const char *pcFormat, ...)
+{
+    int res = PUT_MEDIA_ERRNO_NONE;
+    va_list xArgs;
+    int iLen = 0;
+
+    if (pxSb == NULL || pcFormat == NULL) {
+        return PUT_MEDIA_ERROR_INVALID_ARGUMENT;
+    }
+
+    va_start(xArgs, pcFormat);
+    iLen = vsnprintf(NULL, 0, pcFormat, xArgs);
+    va_end(xArgs);
+
+    if (iLen < 0) {
+        return PUT_MEDIA_ERROR_STRING_ERROR;
+    }
+    if ((res = prvSbReserve(pxSb, (size_t)iLen)) != PUT_MEDIA_ERRNO_NONE) {
+        return res;
+    }
+
+    va_start(xArgs, pcFormat);
+    iLen = vsnprintf(pxSb->pcBuf + pxSb->uLen, pxSb->uCapacity - pxSb->uLen, pcFormat, xArgs);
+    va_end(xArgs);
+
+    if (iLen < 0) {
+        return PUT_MEDIA_ERROR_STRING_ERROR;
+    }
+    pxSb->uLen += (size_t)iLen;
+
+    return PUT_MEDIA_ERRNO_NONE;
+}
 
 static int prvValidateHttpMethod(const char *pcHttpMethod)
 {
@@ -157,15 +273,10 @@ AwsSigV4Handle AwsSigV4_Create(char *pcHttpMethod, char *pcUri, char *pcQuery)
                 res = PUT_MEDIA_ERROR_OUT_OF_MEMORY;
                 break;
             }
+            /* All zeroes is a valid empty StrBuf_t, so only the request line needs seeding. */
             memset(pxAwsSigV4, 0, sizeof(AwsSigV4_t));
 
-            pxAwsSigV4->xStCanonicalRequest = STRING_construct_sprintf("%s\n%s\n%s\n", pcHttpMethod, pcUri, (pcQuery == NULL) ? "" : pcQuery);
-            pxAwsSigV4->xStSignedHeaders = STRING_new();
-            pxAwsSigV4->xStScope = STRING_new();
-            pxAwsSigV4->xStHmacHexEncoded = STRING_new();
-            pxAwsSigV4->xStAuthorization = STRING_new();
-
-            if (pxAwsSigV4->xStCanonicalRequest == NULL || pxAwsSigV4->xStSignedHeaders == NULL || pxAwsSigV4->xStHmacHexEncoded == NULL) {
+            if (prvSbAppendF(&pxAwsSigV4->xCanonicalRequest, "%s\n%s\n%s\n", pcHttpMethod, pcUri, (pcQuery == NULL) ? "" : pcQuery) != PUT_MEDIA_ERRNO_NONE) {
                 res = PUT_MEDIA_ERROR_OUT_OF_MEMORY;
                 break;
             }
@@ -186,11 +297,11 @@ void AwsSigV4_Terminate(AwsSigV4Handle xSigV4Handle)
     AwsSigV4_t *pxAwsSigV4 = (AwsSigV4_t *)xSigV4Handle;
 
     if (pxAwsSigV4 != NULL) {
-        STRING_delete(pxAwsSigV4->xStCanonicalRequest);
-        STRING_delete(pxAwsSigV4->xStSignedHeaders);
-        STRING_delete(pxAwsSigV4->xStScope);
-        STRING_delete(pxAwsSigV4->xStHmacHexEncoded);
-        STRING_delete(pxAwsSigV4->xStAuthorization);
+        prvSbFree(&pxAwsSigV4->xCanonicalRequest);
+        prvSbFree(&pxAwsSigV4->xSignedHeaders);
+        prvSbFree(&pxAwsSigV4->xScope);
+        prvSbFree(&pxAwsSigV4->xHmacHexEncoded);
+        prvSbFree(&pxAwsSigV4->xAuthorization);
         kvsFree(pxAwsSigV4);
     }
 }
@@ -204,12 +315,12 @@ int AwsSigV4_AddCanonicalHeader(AwsSigV4Handle xSigV4Handle, const char *pcHeade
         res = PUT_MEDIA_ERROR_INVALID_ARGUMENT;
     } else if ((res = prvValidateHttpHeader(pcHeader, pcValue)) != PUT_MEDIA_ERRNO_NONE) {
         /* Propagate the res error */
-    } else if (STRING_sprintf(pxAwsSigV4->xStCanonicalRequest, "%s:%s\n", pcHeader, pcValue) != 0) {
-        res = PUT_MEDIA_ERROR_C_UTIL_STRING_ERROR;
-    } else if (STRING_length(pxAwsSigV4->xStSignedHeaders) > 0 && STRING_concat(pxAwsSigV4->xStSignedHeaders, ";") != 0) {
-        res = PUT_MEDIA_ERROR_C_UTIL_STRING_ERROR;
-    } else if (STRING_concat(pxAwsSigV4->xStSignedHeaders, pcHeader) != 0) {
-        res = PUT_MEDIA_ERROR_C_UTIL_STRING_ERROR;
+    } else if (prvSbAppendF(&pxAwsSigV4->xCanonicalRequest, "%s:%s\n", pcHeader, pcValue) != PUT_MEDIA_ERRNO_NONE) {
+        res = PUT_MEDIA_ERROR_STRING_ERROR;
+    } else if (prvSbLen(&pxAwsSigV4->xSignedHeaders) > 0 && prvSbAppend(&pxAwsSigV4->xSignedHeaders, ";") != PUT_MEDIA_ERRNO_NONE) {
+        res = PUT_MEDIA_ERROR_STRING_ERROR;
+    } else if (prvSbAppend(&pxAwsSigV4->xSignedHeaders, pcHeader) != PUT_MEDIA_ERRNO_NONE) {
+        res = PUT_MEDIA_ERROR_STRING_ERROR;
     } else {
         /* nop */
     }
@@ -225,12 +336,12 @@ int AwsSigV4_AddCanonicalBody(AwsSigV4Handle xSigV4Handle, const char *pBody, si
 
     if (pxAwsSigV4 == NULL || pBody == NULL) {
         res = PUT_MEDIA_ERROR_INVALID_ARGUMENT;
-    } else if (STRING_sprintf(pxAwsSigV4->xStCanonicalRequest, "\n%s\n", STRING_c_str(pxAwsSigV4->xStSignedHeaders)) != 0) {
-        res = PUT_MEDIA_ERROR_C_UTIL_STRING_ERROR;
+    } else if (prvSbAppendF(&pxAwsSigV4->xCanonicalRequest, "\n%s\n", prvSbStr(&pxAwsSigV4->xSignedHeaders)) != PUT_MEDIA_ERRNO_NONE) {
+        res = PUT_MEDIA_ERROR_STRING_ERROR;
     } else if (prvHexEncodedSha256((const unsigned char *)pBody, uBodyLen, pcBodyHexEncodedSha256) != 0) {
-        res = PUT_MEDIA_ERROR_C_UTIL_STRING_ERROR;
-    } else if (STRING_concat(pxAwsSigV4->xStCanonicalRequest, pcBodyHexEncodedSha256) != 0) {
-        res = PUT_MEDIA_ERROR_C_UTIL_STRING_ERROR;
+        res = PUT_MEDIA_ERROR_STRING_ERROR;
+    } else if (prvSbAppend(&pxAwsSigV4->xCanonicalRequest, pcBodyHexEncodedSha256) != PUT_MEDIA_ERRNO_NONE) {
+        res = PUT_MEDIA_ERROR_STRING_ERROR;
     } else {
         /* nop */
     }
@@ -300,7 +411,7 @@ int AwsSigV4_Sign(AwsSigV4Handle xSigV4Handle, char *pcAccessKey, char *pcSecret
     AwsSigV4_t *pxAwsSigV4 = (AwsSigV4_t *)xSigV4Handle;
     char pcCanonicalReqHexEncSha256[HEX_ENCODED_SHA_256_STRING_SIZE] = {0};
     const mbedtls_md_info_t *pxMdInfo = NULL;
-    STRING_HANDLE xStSignedStr = NULL;
+    StrBuf_t xSignedStr = {0};
     size_t uHmacSize = 0;
     char pHmac[AWS_SIG_V4_MAX_HMAC_SIZE] = {0};
     int i = 0;
@@ -310,8 +421,8 @@ int AwsSigV4_Sign(AwsSigV4Handle xSigV4Handle, char *pcAccessKey, char *pcSecret
     }
     /* Do SHA256 on canonical request and then hex encode it. */
     else if (
-        (res = prvHexEncodedSha256((const unsigned char *)STRING_c_str(pxAwsSigV4->xStCanonicalRequest), STRING_length(pxAwsSigV4->xStCanonicalRequest), pcCanonicalReqHexEncSha256)) !=
-        PUT_MEDIA_ERRNO_NONE) {
+        (res = prvHexEncodedSha256(
+             (const unsigned char *)prvSbStr(&pxAwsSigV4->xCanonicalRequest), prvSbLen(&pxAwsSigV4->xCanonicalRequest), pcCanonicalReqHexEncSha256)) != PUT_MEDIA_ERRNO_NONE) {
         /* Propagate the res error */
     } else if ((pxMdInfo = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256)) == NULL) {
         res = PUT_MEDIA_ERROR_UNKNOWN_MBEDTLS_MESSAGE_DIGEST;
@@ -321,18 +432,21 @@ int AwsSigV4_Sign(AwsSigV4Handle xSigV4Handle, char *pcAccessKey, char *pcSecret
         res = PUT_MEDIA_ERROR_INVALID_MBEDTLS_MESSAGE_DIGEST_SIZE;
     }
     /* Generate the scope string. */
-    else if (STRING_sprintf(pxAwsSigV4->xStScope, TEMPLATE_CANONICAL_SCOPE, SIGNATURE_DATE_STRING_LEN, pcXAmzDate, pcRegion, pcService, AWS_SIG_V4_SIGNATURE_END) != 0) {
-        res = PUT_MEDIA_ERROR_C_UTIL_STRING_ERROR;
+    else if (
+        prvSbAppendF(&pxAwsSigV4->xScope, TEMPLATE_CANONICAL_SCOPE, SIGNATURE_DATE_STRING_LEN, pcXAmzDate, pcRegion, pcService, AWS_SIG_V4_SIGNATURE_END) !=
+        PUT_MEDIA_ERRNO_NONE) {
+        res = PUT_MEDIA_ERROR_STRING_ERROR;
     }
     /* Generate the signed string. */
     else if (
-        (xStSignedStr =
-             STRING_construct_sprintf(TEMPLATE_CANONICAL_SIGNED_STRING, AWS_SIG_V4_ALGORITHM, pcXAmzDate, STRING_c_str(pxAwsSigV4->xStScope), pcCanonicalReqHexEncSha256)) == NULL) {
-        res = PUT_MEDIA_ERROR_C_UTIL_STRING_ERROR;
+        prvSbAppendF(
+            &xSignedStr, TEMPLATE_CANONICAL_SIGNED_STRING, AWS_SIG_V4_ALGORITHM, pcXAmzDate, prvSbStr(&pxAwsSigV4->xScope), pcCanonicalReqHexEncSha256) !=
+        PUT_MEDIA_ERRNO_NONE) {
+        res = PUT_MEDIA_ERROR_STRING_ERROR;
     }
     /* Generate the beginning of the signature. */
     else if (snprintf(pHmac, AWS_SIG_V4_MAX_HMAC_SIZE, TEMPLATE_SIGNATURE_START, AWS_SIG_V4_SIGNATURE_START, pcSecretKey) == 0) {
-        res = PUT_MEDIA_ERROR_C_UTIL_STRING_ERROR;
+        res = PUT_MEDIA_ERROR_STRING_ERROR;
     }
     /* Calculate the HMAC of date, region, service, signature end, and signed string*/
     else if (
@@ -340,30 +454,30 @@ int AwsSigV4_Sign(AwsSigV4Handle xSigV4Handle, char *pcAccessKey, char *pcSecret
         (retVal = prvHmacSha256(pxMdInfo, (const unsigned char *)pHmac, uHmacSize, (const unsigned char *)pcRegion, strlen(pcRegion), (unsigned char *)pHmac)) != 0 ||
         (retVal = prvHmacSha256(pxMdInfo, (const unsigned char *)pHmac, uHmacSize, (const unsigned char *)pcService, strlen(pcService), (unsigned char *)pHmac)) != 0 ||
         (retVal = prvHmacSha256(pxMdInfo, (const unsigned char *)pHmac, uHmacSize, (const unsigned char *)AWS_SIG_V4_SIGNATURE_END, sizeof(AWS_SIG_V4_SIGNATURE_END) - 1, (unsigned char *)pHmac)) != 0 ||
-        (retVal = prvHmacSha256(pxMdInfo, (const unsigned char *)pHmac, uHmacSize, (const unsigned char *)STRING_c_str(xStSignedStr), STRING_length(xStSignedStr), (unsigned char *)pHmac)) != 0) {
+        (retVal = prvHmacSha256(pxMdInfo, (const unsigned char *)pHmac, uHmacSize, (const unsigned char *)prvSbStr(&xSignedStr), prvSbLen(&xSignedStr), (unsigned char *)pHmac)) != 0) {
         res = PUT_MEDIA_GENERATE_MBEDTLS_ERROR(retVal);
     } else {
         for (i = 0; i < uHmacSize; i++) {
-            if (STRING_sprintf(pxAwsSigV4->xStHmacHexEncoded, "%02x", pHmac[i] & 0xFF) != 0) {
-                res = PUT_MEDIA_ERROR_C_UTIL_STRING_ERROR;
+            if (prvSbAppendF(&pxAwsSigV4->xHmacHexEncoded, "%02x", pHmac[i] & 0xFF) != PUT_MEDIA_ERRNO_NONE) {
+                res = PUT_MEDIA_ERROR_STRING_ERROR;
                 break;
             }
         }
 
         if (res == 0) {
-            if (STRING_sprintf(
-                        pxAwsSigV4->xStAuthorization,
+            if (prvSbAppendF(
+                        &pxAwsSigV4->xAuthorization,
                         "AWS4-HMAC-SHA256 Credential=%s/%s, SignedHeaders=%s, Signature=%s",
                         pcAccessKey,
-                        STRING_c_str(pxAwsSigV4->xStScope),
-                        STRING_c_str(pxAwsSigV4->xStSignedHeaders),
-                        STRING_c_str(pxAwsSigV4->xStHmacHexEncoded)) != 0) {
-                res = PUT_MEDIA_ERROR_C_UTIL_STRING_ERROR;
+                        prvSbStr(&pxAwsSigV4->xScope),
+                        prvSbStr(&pxAwsSigV4->xSignedHeaders),
+                        prvSbStr(&pxAwsSigV4->xHmacHexEncoded)) != PUT_MEDIA_ERRNO_NONE) {
+                res = PUT_MEDIA_ERROR_STRING_ERROR;
             }
         }
     }
 
-    STRING_delete(xStSignedStr);
+    prvSbFree(&xSignedStr);
 
     return res;
 }
@@ -373,7 +487,7 @@ const char *AwsSigV4_GetAuthorization(AwsSigV4Handle xSigV4Handle)
     AwsSigV4_t *pxAwsSigV4 = (AwsSigV4_t *)xSigV4Handle;
 
     if (pxAwsSigV4 != NULL) {
-        return STRING_c_str(pxAwsSigV4->xStAuthorization);
+        return prvSbStr(&pxAwsSigV4->xAuthorization);
     } else {
         return NULL;
     }

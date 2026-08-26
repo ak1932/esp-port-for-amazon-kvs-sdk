@@ -1,0 +1,44 @@
+menu "KVS Combined Example"
+
+    config KVS_COMBINED_STREAM_NAME
+        string "KVS stream name for PutMedia"
+        default "esp-putmedia"
+        help
+            Kinesis Video Stream that PutMedia uploads to. This is the
+            PutMedia stream, and is separate from the WebRTC signaling channel
+            configured by AWS_KVS_CHANNEL_NAME.
+
+    config KVS_COMBINED_RETENTION_HOURS
+        int "Stream retention (hours)"
+        range 0 87600
+        default 2
+        help
+            Retention of the KVS stream, used only when the stream has to be
+            created. 0 means no retention (live only).
+
+    menu "Video capture profile"
+        comment "Whichever consumer starts first sets the profile; the other joins it."
+
+        config KVS_COMBINED_VIDEO_WIDTH
+            int "Capture width"
+            default 640
+
+        config KVS_COMBINED_VIDEO_HEIGHT
+            int "Capture height"
+            default 480
+
+        config KVS_COMBINED_VIDEO_FPS
+            int "Capture frame rate"
+            range 1 60
+            default 30
+
+        config KVS_COMBINED_VIDEO_BITRATE
+            int "Target bitrate (kbps)"
+            default 500
+            help
+                Requested encoder bitrate. Note that on ESP32-P4 the grabber
+                overrides this with a height-scaled value derived from the
+                actual camera resolution, so it is advisory there.
+    endmenu
+
+endmenu

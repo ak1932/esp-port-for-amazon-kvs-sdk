@@ -1,0 +1,45 @@
+# putmedia
+
+The **PutMedia** ingestion path: capture-side MKV muxing plus a KVS Producer data-plane
+client that streams the resulting fragments straight into a Kinesis Video Streams *video
+stream* over a long-lived chunked HTTPS POST.
+
+This is independent of the WebRTC stack. There is no peer connection and no signaling —
+where WebRTC media-storage ingestion archives footage by making the KVS backend the
+*viewer*, PutMedia uploads to the stream directly.
+
+| Component | Purpose |
+|-----------|---------|
+| **[kvs_putmedia](kvs_putmedia/)** | PutMedia client — SigV4 signing, chunked upload, fragment ACKs, `DescribeStream`/`CreateStream`/`GetDataEndpoint` |
+| **[kvs_producer](kvs_producer/)** | MKV/EBML generation, H.264 NALU and SPS parsing, ESP-IDF port layer |
+| **[parson](parson/)** | Vendored JSON parser (MIT) used by the REST layer |
+| **[c_utility](c_utility/)** | Vendored Azure C shared-utility subset (MIT) the imported sources are written against |
+
+Consumers would reference these as `${KVS_SDK_PATH}/components/putmedia/<name>`.
+
+## Status
+
+> **Best on ESP-IDF v6.1+, builds on v5.4 and later. Not in the CI example matrix.**
+>
+> `kvs_putmedia` prefers `esp_http_client_chunk_write_begin()` /
+> `esp_http_client_chunk_write_end()`, which first ship in v6.1 — they landed after the
+> v6.0.2 tag. Older IDFs take a hand-rolled chunk-framing path instead, so the component
+> still builds on v5.4.x and v5.5.x.
+>
+> Building on IDF v6.x also needed two mbedtls 4.x fixes (SigV4 off the now-private
+> SHA-256 and HMAC APIs) and a `-std=gnu17` pin for the vendored `c_utility`.
+>
+> [`examples/kvs_combined`](../../examples/kvs_combined/) exercises this path together
+> with WebRTC. It is not in the CI example matrix, so these components are not built by
+> CI.
+
+## Provenance
+
+`kvs_putmedia` and `kvs_producer` are derived from
+[amazon-kinesis-video-streams-producer-embedded-c](https://github.com/aws-samples/amazon-kinesis-video-streams-producer-embedded-c)
+(Apache-2.0); upstream's `kvsapp` was split into MKV generation (`kvs_producer`) and the
+PutMedia flow (`kvs_putmedia`), and the REST/HTTP layer was reworked onto
+`esp_http_client`.
+
+`parson` and `c_utility` are third-party libraries vendored verbatim; they keep their
+own MIT licences and are grouped here because nothing else in this repository uses them.

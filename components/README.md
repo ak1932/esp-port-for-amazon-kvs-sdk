@@ -31,6 +31,18 @@ This directory contains the complete ecosystem of ESP-IDF components needed for 
 | **[esp_hosted](esp_hosted/)** | ESP-Hosted functionality | - | Dual-chip communication |
 | **[esp_webrtc_utils](esp_webrtc_utils/)** | WebRTC utilities for ESP | - | Platform optimizations |
 
+### Media Ingestion (PutMedia)
+Independent of the WebRTC stack — uploads MKV fragments straight to a KVS video stream.
+Best on ESP-IDF v6.1+, builds on v5.4 and later; not in the CI example matrix. See
+[putmedia/README.md](putmedia/README.md).
+
+| Component | Purpose | Dependencies | Use Case |
+|-----------|---------|--------------|----------|
+| **[putmedia/kvs_putmedia](putmedia/kvs_putmedia/)** | KVS PutMedia client | kvs_producer, parson, c_utility | Archival upload to a KVS stream |
+| **[putmedia/kvs_producer](putmedia/kvs_producer/)** | MKV generation, NALU/SPS parsing | c_utility | Muxing capture output |
+| **[putmedia/parson](putmedia/parson/)** | JSON parser (vendored, MIT) | - | KVS REST responses |
+| **[putmedia/c_utility](putmedia/c_utility/)** | Azure C shared-utility subset (vendored, MIT) | - | Support library for the imported sources |
+
 ### Development & API Components
 | Component | Purpose | Dependencies | Use Case |
 |-----------|---------|--------------|----------|

@@ -38,10 +38,8 @@ Best on ESP-IDF v6.1+, builds on v5.4 and later; not in the CI example matrix. S
 
 | Component | Purpose | Dependencies | Use Case |
 |-----------|---------|--------------|----------|
-| **[putmedia/kvs_putmedia](putmedia/kvs_putmedia/)** | KVS PutMedia client | kvs_producer, parson, c_utility | Archival upload to a KVS stream |
-| **[putmedia/kvs_producer](putmedia/kvs_producer/)** | MKV generation, NALU/SPS parsing | c_utility | Muxing capture output |
-| **[putmedia/parson](putmedia/parson/)** | JSON parser (vendored, MIT) | - | KVS REST responses |
-| **[putmedia/c_utility](putmedia/c_utility/)** | Azure C shared-utility subset (vendored, MIT) | - | Support library for the imported sources |
+| **[putmedia/kvs_putmedia](putmedia/kvs_putmedia/)** | KVS PutMedia client | kvs_producer, espressif/cjson | Archival upload to a KVS stream |
+| **[putmedia/kvs_producer](putmedia/kvs_producer/)** | MKV generation, NALU/SPS parsing | - | Muxing capture output |
 
 ### Development & API Components
 | Component | Purpose | Dependencies | Use Case |

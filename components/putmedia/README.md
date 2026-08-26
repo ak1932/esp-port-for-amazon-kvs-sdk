@@ -12,8 +12,6 @@ where WebRTC media-storage ingestion archives footage by making the KVS backend 
 |-----------|---------|
 | **[kvs_putmedia](kvs_putmedia/)** | PutMedia client — SigV4 signing, chunked upload, fragment ACKs, `DescribeStream`/`CreateStream`/`GetDataEndpoint` |
 | **[kvs_producer](kvs_producer/)** | MKV/EBML generation, H.264 NALU and SPS parsing, ESP-IDF port layer |
-| **[parson](parson/)** | Vendored JSON parser (MIT) used by the REST layer |
-| **[c_utility](c_utility/)** | Vendored Azure C shared-utility subset (MIT) the imported sources are written against |
 
 Consumers would reference these as `${KVS_SDK_PATH}/components/putmedia/<name>`.
 
@@ -26,8 +24,8 @@ Consumers would reference these as `${KVS_SDK_PATH}/components/putmedia/<name>`.
 > v6.0.2 tag. Older IDFs take a hand-rolled chunk-framing path instead, so the component
 > still builds on v5.4.x and v5.5.x.
 >
-> Building on IDF v6.x also needed two mbedtls 4.x fixes (SigV4 off the now-private
-> SHA-256 and HMAC APIs) and a `-std=gnu17` pin for the vendored `c_utility`.
+> Building on IDF v6.x also needed two mbedtls 4.x fixes: SigV4 runs off PSA Crypto
+> rather than the SHA-256 and HMAC APIs that became private.
 >
 > [`examples/kvs_combined`](../../examples/kvs_combined/) exercises this path together
 > with WebRTC. It is not in the CI example matrix, so these components are not built by
@@ -41,5 +39,9 @@ Consumers would reference these as `${KVS_SDK_PATH}/components/putmedia/<name>`.
 PutMedia flow (`kvs_putmedia`), and the REST/HTTP layer was reworked onto
 `esp_http_client`.
 
-`parson` and `c_utility` are third-party libraries vendored verbatim; they keep their
-own MIT licences and are grouped here because nothing else in this repository uses them.
+Upstream is written against `parson` and a subset of the Azure C shared utility, both of
+which were originally vendored here. Neither survives: JSON now goes through
+`espressif/cjson`, which the firmware already links, and the Azure pieces that were
+actually reachable - a header collection, a growable string, two mutexes and two
+intrusive lists - are replaced by a small local header list, `pthread_mutex_t`,
+`sys/queue.h` TAILQs and `snprintf`.

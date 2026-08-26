@@ -11,11 +11,9 @@ set(srcs
     "source/port/port_esp32.c"
 )
 
-# c_utility is private: mkvapp.c and stream.c use its Lock_*/DList_*/
-# mallocAndStrcpy_s, but no public header in include/ exposes those types.
 idf_component_register(
     SRCS ${srcs}
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "source"
-    PRIV_REQUIRES "esp_timer" "c_utility"
+    PRIV_REQUIRES "esp_timer" "pthread"
 )

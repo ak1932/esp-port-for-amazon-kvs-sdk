@@ -3,7 +3,3 @@ description: "KVS MKV generation - MKV/EBML muxing, H.264 NALU and SPS parsing"
 dependencies:
   idf:
     version: ">=5.4.0"
-
-  c_utility:
-    path: "../c_utility"
-    version: "*"

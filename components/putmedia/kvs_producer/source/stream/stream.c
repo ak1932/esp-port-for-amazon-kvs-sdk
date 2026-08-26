@@ -14,13 +14,11 @@
  */
 
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-/* Third party headers */
-#include "azure_c_shared_utility/doublylinkedlist.h"
-#include "azure_c_shared_utility/lock.h"
+#include <sys/queue.h>
 
 /* Public headers */
 #include "kvs/mkv_errors.h"
@@ -38,22 +36,22 @@
 typedef struct DataFrame {
     DataFrameIn_t xDataFrameIn;
 
-    DLIST_ENTRY xClusterEntry;
-    DLIST_ENTRY xDataFrameEntry;
+    TAILQ_ENTRY(DataFrame) xDataFrameEntry;
 
     size_t uMkvHdrLen;
     char *pMkvHdr;
 } DataFrame_t;
 
+TAILQ_HEAD(DataFrameList, DataFrame);
+
 typedef struct Stream {
-    LOCK_HANDLE xLock;
+    pthread_mutex_t xLock;
 
     char *pMkvEbmlSeg;
     size_t uMkvEbmlSegLen;
 
     uint64_t uEarliestClusterTimestamp;
-    DLIST_ENTRY xClusterPending;
-    DLIST_ENTRY xDataFramePending;
+    struct DataFrameList xDataFramePending;
 
     bool bHasVideoTrack;
     bool bHasAudioTrack;
@@ -63,35 +61,27 @@ static DataFrameHandle prvStreamPop(StreamHandle xStreamHandle, bool bPeek)
 {
     Stream_t *pxStream = xStreamHandle;
     DataFrame_t *pxDataFrame = NULL;
-    PDLIST_ENTRY pxListHead = NULL;
-    PDLIST_ENTRY pxListItem = NULL;
 
     if (pxStream == NULL) {
         ESP_LOGE(TAG, "invalid argument");
     } else {
-        if (Lock(pxStream->xLock) != LOCK_OK) {
+        if (pthread_mutex_lock(&(pxStream->xLock)) != 0) {
             ESP_LOGE(TAG, "Failed to Lock");
         } else {
-            if (DList_IsListEmpty(&(pxStream->xDataFramePending))) {
+            if (TAILQ_EMPTY(&(pxStream->xDataFramePending))) {
                 /* ESP_LOGI(TAG,"No data frame to pop"); */
             } else {
-                pxListHead = &(pxStream->xDataFramePending);
+                pxDataFrame = TAILQ_FIRST(&(pxStream->xDataFramePending));
 
                 if (!bPeek) {
-                    pxListItem = DList_RemoveHeadList(pxListHead);
-                } else {
-                    pxListItem = pxListHead->Flink;
-                }
-                pxDataFrame = containingRecord(pxListItem, DataFrame_t, xDataFrameEntry);
-
-                if (!bPeek) {
+                    TAILQ_REMOVE(&(pxStream->xDataFramePending), pxDataFrame, xDataFrameEntry);
                     if (pxDataFrame->xDataFrameIn.xClusterType == MKV_CLUSTER) {
                         pxStream->uEarliestClusterTimestamp = pxDataFrame->xDataFrameIn.uTimestampMs;
                     }
                 }
             }
 
-            Unlock(pxStream->xLock);
+            pthread_mutex_unlock(&(pxStream->xLock));
         }
     }
 
@@ -111,15 +101,15 @@ StreamHandle Kvs_streamCreate(VideoTrackInfo_t *pVideoTrackInfo, AudioTrackInfo_
         ESP_LOGI(TAG, "created stream buffer");
         memset(pxStream, 0, sizeof(Stream_t));
 
-        DList_InitializeListHead(&(pxStream->xClusterPending));
-        DList_InitializeListHead(&(pxStream->xDataFramePending));
+        TAILQ_INIT(&(pxStream->xDataFramePending));
 
-        if (Mkv_initializeHeaders(&xMkvHeader, pVideoTrackInfo, pAudioTrackInfo) != MKV_ERRNO_NONE) {
-            ESP_LOGE(TAG, "Failed to initialize mkv headers");
+        if (pthread_mutex_init(&(pxStream->xLock), NULL) != 0) {
+            ESP_LOGE(TAG, "Failed to initialize lock");
             kvsFree(pxStream);
             pxStream = NULL;
-        } else if ((pxStream->xLock = Lock_Init()) == NULL) {
-            ESP_LOGE(TAG, "Failed to initialize lock");
+        } else if (Mkv_initializeHeaders(&xMkvHeader, pVideoTrackInfo, pAudioTrackInfo) != MKV_ERRNO_NONE) {
+            ESP_LOGE(TAG, "Failed to initialize mkv headers");
+            pthread_mutex_destroy(&(pxStream->xLock));
             kvsFree(pxStream);
             pxStream = NULL;
         } else {
@@ -139,7 +129,7 @@ void Kvs_streamTermintate(StreamHandle xStreamHandle)
 
     if (pxStream != NULL) {
         kvsFree(pxStream->pMkvEbmlSeg);
-        Lock_Deinit(pxStream->xLock);
+        pthread_mutex_destroy(&(pxStream->xLock));
         kvsFree(pxStream);
     }
 }
@@ -170,8 +160,6 @@ DataFrameHandle Kvs_streamAddDataFrame(StreamHandle xStreamHandle, DataFrameIn_t
     DataFrame_t *pxDataFrame = NULL;
     size_t uMkvHdrLen = 0;
     DataFrame_t *pxDataFrameCurrent = NULL;
-    PDLIST_ENTRY pxListHead = NULL;
-    PDLIST_ENTRY pxListItem = NULL;
     bool bListAdded = false;
     bool bNeedCorrectDeltaTimestamp = false;
     bool bCorrectDeltaTimestampStarted = false;
@@ -192,23 +180,19 @@ DataFrameHandle Kvs_streamAddDataFrame(StreamHandle xStreamHandle, DataFrameIn_t
     } else if ((pxDataFrame->pMkvHdr = kvsMalloc(uMkvHdrLen)) == NULL) {
         res = MKV_ERROR_OUT_OF_MEMORY;
         ESP_LOGE(TAG, "OOM: pxDataFrame->pMkvHeader");
-    } else if (Lock(pxStream->xLock) != LOCK_OK) {
+    } else if (pthread_mutex_lock(&(pxStream->xLock)) != 0) {
         res = MKV_ERROR_LOCK_ERROR;
         ESP_LOGE(TAG, "Failed to Lock");
     } else {
         memcpy(pxDataFrame, pxDataFrameIn, sizeof(DataFrameIn_t));
-        DList_InitializeListHead(&(pxDataFrame->xClusterEntry));
-        DList_InitializeListHead(&(pxDataFrame->xDataFrameEntry));
         pxDataFrame->uMkvHdrLen = uMkvHdrLen;
         uClusterTimestamp = pxStream->uEarliestClusterTimestamp;
 
-        pxListHead = &(pxStream->xDataFramePending);
-        pxListItem = pxListHead->Flink;
-        while (pxListItem != pxListHead) {
-            pxDataFrameCurrent = containingRecord(pxListItem, DataFrame_t, xDataFrameEntry);
+        TAILQ_FOREACH(pxDataFrameCurrent, &(pxStream->xDataFramePending), xDataFrameEntry) {
             if (pxDataFrame->xDataFrameIn.uTimestampMs < pxDataFrameCurrent->xDataFrameIn.uTimestampMs ||
                     ((pxDataFrame->xDataFrameIn.uTimestampMs == pxDataFrameCurrent->xDataFrameIn.uTimestampMs) && (pxDataFrame->xDataFrameIn.xTrackType == TRACK_VIDEO))) {
-                DList_InsertTailList(pxListItem, &(pxDataFrame->xDataFrameEntry));
+                /* Keep the list timestamp-sorted: go in ahead of the first later frame. */
+                TAILQ_INSERT_BEFORE(pxDataFrameCurrent, pxDataFrame, xDataFrameEntry);
                 uDeltaTimestampMs = (uint16_t)(pxDataFrame->xDataFrameIn.uTimestampMs - uClusterTimestamp);
                 if (pxDataFrame->xDataFrameIn.xClusterType == MKV_CLUSTER) {
                     uDeltaTimestampMs = 0;
@@ -222,11 +206,10 @@ DataFrameHandle Kvs_streamAddDataFrame(StreamHandle xStreamHandle, DataFrameIn_t
             if (pxDataFrameCurrent->xDataFrameIn.xClusterType == MKV_CLUSTER) {
                 uClusterTimestamp = pxDataFrameCurrent->xDataFrameIn.uTimestampMs;
             }
-            pxListItem = pxListItem->Flink;
         }
         if (!bListAdded) {
             uDeltaTimestampMs = (uint16_t)(pxDataFrame->xDataFrameIn.uTimestampMs - uClusterTimestamp);
-            DList_InsertTailList(&(pxStream->xDataFramePending), &(pxDataFrame->xDataFrameEntry));
+            TAILQ_INSERT_TAIL(&(pxStream->xDataFramePending), pxDataFrame, xDataFrameEntry);
             bListAdded = true;
         }
 
@@ -242,10 +225,7 @@ DataFrameHandle Kvs_streamAddDataFrame(StreamHandle xStreamHandle, DataFrameIn_t
 
         if (bNeedCorrectDeltaTimestamp) {
             bCorrectDeltaTimestampStarted = false;
-            pxListHead = &(pxStream->xDataFramePending);
-            pxListItem = pxListHead->Flink;
-            while (pxListItem != pxListHead) {
-                pxDataFrameCurrent = containingRecord(pxListItem, DataFrame_t, xDataFrameEntry);
+            TAILQ_FOREACH(pxDataFrameCurrent, &(pxStream->xDataFramePending), xDataFrameEntry) {
                 if (pxDataFrameCurrent->xDataFrameIn.xClusterType == MKV_CLUSTER) {
                     uClusterTimestamp = pxDataFrameCurrent->xDataFrameIn.uTimestampMs;
                     bCorrectDeltaTimestampStarted = true;
@@ -262,11 +242,10 @@ DataFrameHandle Kvs_streamAddDataFrame(StreamHandle xStreamHandle, DataFrameIn_t
                         pxDataFrameCurrent->xDataFrameIn.uTimestampMs,
                         uDeltaTimestampMs);
                 }
-                pxListItem = pxListItem->Flink;
             }
         }
 
-        Unlock(pxStream->xLock);
+        pthread_mutex_unlock(&(pxStream->xLock));
     }
 
     if (res != MKV_ERRNO_NONE) {
@@ -298,13 +277,13 @@ bool Kvs_streamIsEmpty(StreamHandle xStreamHandle)
     Stream_t *pxStream = xStreamHandle;
 
     if (pxStream != NULL) {
-        if (Lock(pxStream->xLock) != LOCK_OK) {
+        if (pthread_mutex_lock(&(pxStream->xLock)) != 0) {
             ESP_LOGE(TAG, "Failed to Lock");
         } else {
-            if (!DList_IsListEmpty(&(pxStream->xDataFramePending))) {
+            if (!TAILQ_EMPTY(&(pxStream->xDataFramePending))) {
                 bRes = false;
             }
-            Unlock(pxStream->xLock);
+            pthread_mutex_unlock(&(pxStream->xLock));
         }
     }
 
@@ -315,27 +294,20 @@ bool Kvs_streamAvailOnTrack(StreamHandle xStreamHandle, TrackType_t xTrackType)
 {
     bool bRes = false;
     Stream_t *pxStream = xStreamHandle;
-    PDLIST_ENTRY pxListHead = NULL;
-    PDLIST_ENTRY pxListItem = NULL;
     DataFrame_t *pxDataFrame = NULL;
 
     if (pxStream != NULL) {
-        if (Lock(pxStream->xLock) != LOCK_OK) {
+        if (pthread_mutex_lock(&(pxStream->xLock)) != 0) {
             ESP_LOGE(TAG, "Failed to Lock");
         } else {
-            pxListHead = &(pxStream->xDataFramePending);
-            pxListItem = pxListHead->Flink;
-            while (pxListItem != pxListHead) {
-                pxDataFrame = containingRecord(pxListItem, DataFrame_t, xDataFrameEntry);
+            TAILQ_FOREACH(pxDataFrame, &(pxStream->xDataFramePending), xDataFrameEntry) {
                 if (pxDataFrame->xDataFrameIn.xTrackType == xTrackType) {
                     bRes = true;
                     break;
                 }
-
-                pxListItem = pxListItem->Flink;
             }
 
-            Unlock(pxStream->xLock);
+            pthread_mutex_unlock(&(pxStream->xLock));
         }
     }
 
@@ -347,30 +319,24 @@ int Kvs_streamMemStatTotal(StreamHandle xStreamHandle, size_t *puMemTotal)
     int res = MKV_ERRNO_NONE;
     Stream_t *pxStream = xStreamHandle;
     DataFrame_t *pxDataFrame = NULL;
-    PDLIST_ENTRY pxListHead = NULL;
-    PDLIST_ENTRY pxListItem = NULL;
     size_t uMemTotal = 0;
 
     if (pxStream == NULL || puMemTotal == NULL) {
         res = MKV_ERROR_INVALID_ARGUMENT;
         ESP_LOGE(TAG, "Invalid argument");
-    } else if (Lock(pxStream->xLock) != LOCK_OK) {
+    } else if (pthread_mutex_lock(&(pxStream->xLock)) != 0) {
         res = MKV_ERROR_LOCK_ERROR;
         ESP_LOGE(TAG, "Failed to Lock");
     } else {
         uMemTotal += sizeof(Stream_t) + pxStream->uMkvEbmlSegLen;
 
-        pxListHead = &(pxStream->xDataFramePending);
-        pxListItem = pxListHead->Flink;
-        while (pxListItem != pxListHead) {
-            pxDataFrame = containingRecord(pxListItem, DataFrame_t, xDataFrameEntry);
+        TAILQ_FOREACH(pxDataFrame, &(pxStream->xDataFramePending), xDataFrameEntry) {
             uMemTotal += pxDataFrame->xDataFrameIn.uDataLen;
             uMemTotal += sizeof(DataFrame_t) + pxDataFrame->uMkvHdrLen;
-            pxListItem = pxListItem->Flink;
         }
 
         *puMemTotal = uMemTotal;
-        Unlock(pxStream->xLock);
+        pthread_mutex_unlock(&(pxStream->xLock));
     }
 
     return res;

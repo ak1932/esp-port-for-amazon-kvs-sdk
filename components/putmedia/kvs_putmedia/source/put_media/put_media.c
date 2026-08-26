@@ -1,4 +1,3 @@
-#include "azure_c_shared_utility/crt_abstractions.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -318,7 +317,7 @@ static int prvMallocAndStrcpyHelper(char **destination, const char *source)
             free(*destination);
             *destination = NULL;
         }
-        if (mallocAndStrcpy_s(destination, source) != 0) {
+        if ((*destination = strdup(source)) == NULL) {
             res = PUT_MEDIA_ERROR_OUT_OF_MEMORY;
         }
     }

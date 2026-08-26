@@ -21,8 +21,6 @@
 
 /* Third-party headers */
 #include "FreeRTOSConfig.h"
-#include "azure_c_shared_utility/crt_abstractions.h"
-#include "azure_c_shared_utility/lock.h"
 #include "sdkconfig.h"
 
 /* KVS headers */
@@ -183,12 +181,16 @@ static int prvMallocAndStrcpyHelper(char **destination, const char *source)
         /*If strDestination or strSource is a NULL pointer[...]these functions return EINVAL */
         res = MKV_ERROR_INVALID_ARGUMENT;
     } else {
+        size_t uSrcLen = strlen(source);
+
         if (*destination != NULL) {
             kvsFree(*destination);
             *destination = NULL;
         }
-        if (mallocAndStrcpy_s(destination, source) != 0) {
+        if ((*destination = (char *)kvsMalloc(uSrcLen + 1)) == NULL) {
             res = MKV_ERROR_OUT_OF_MEMORY;
+        } else {
+            memcpy(*destination, source, uSrcLen + 1);
         }
     }
 

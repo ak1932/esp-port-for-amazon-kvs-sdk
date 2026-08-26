@@ -15,16 +15,14 @@
 
 #include <ctype.h>
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-
-/* Thirdparty headers */
-#include "azure_c_shared_utility/doublylinkedlist.h"
-#include "azure_c_shared_utility/lock.h"
+#include <sys/queue.h>
 
 /* Public headers */
 #include "kvs/put_media_errors.h"
@@ -91,19 +89,21 @@
 
 /*-----------------------------------------------------------*/
 
-typedef struct {
+typedef struct FragmentAck {
     ePutMediaFragmentAckEventType eventType;
     uint64_t uFragmentTimecode;
     unsigned int uErrorId;
 
-    DLIST_ENTRY xAckEntry;
+    TAILQ_ENTRY(FragmentAck) xAckEntry;
 } FragmentAck_t;
 
+TAILQ_HEAD(FragmentAckList, FragmentAck);
+
 typedef struct PutMedia {
-    LOCK_HANDLE xLock;
+    pthread_mutex_t xLock;
 
     esp_http_client_handle_t xHttpClient;
-    DLIST_ENTRY xPendingFragmentAcks;
+    struct FragmentAckList xPendingFragmentAcks;
     /* After 100 Continue we must call fetch_headers() once to consume 200 before esp_http_client_read() can return acks */
     int bSecondResponseHeadersFetched;
     /*
@@ -493,21 +493,14 @@ static void prvLogFragmentAck(FragmentAck_t *pFragmentAck)
 
 static void prvLogPendingFragmentAcks(PutMedia_t *pPutMedia)
 {
-    PDLIST_ENTRY pxListHead = NULL;
-    PDLIST_ENTRY pxListItem = NULL;
     FragmentAck_t *pFragmentAck = NULL;
 
-    if (pPutMedia != NULL && Lock(pPutMedia->xLock) == LOCK_OK) {
-        pxListHead = &(pPutMedia->xPendingFragmentAcks);
-        pxListItem = pxListHead->Flink;
-        while (pxListItem != pxListHead) {
-            pFragmentAck = containingRecord(pxListItem, FragmentAck_t, xAckEntry);
+    if (pPutMedia != NULL && pthread_mutex_lock(&(pPutMedia->xLock)) == 0) {
+        TAILQ_FOREACH(pFragmentAck, &(pPutMedia->xPendingFragmentAcks), xAckEntry) {
             prvLogFragmentAck(pFragmentAck);
-
-            pxListItem = pxListItem->Flink;
         }
 
-        Unlock(pPutMedia->xLock);
+        pthread_mutex_unlock(&(pPutMedia->xLock));
     }
 }
 
@@ -522,14 +515,13 @@ static int prvPushFragmentAck(PutMedia_t *pPutMedia, FragmentAck_t *pFragmentAck
         res = PUT_MEDIA_ERROR_OUT_OF_MEMORY;
     } else {
         memcpy(pFragmentAck, pFragmentAckSrc, sizeof(FragmentAck_t));
-        DList_InitializeListHead(&(pFragmentAck->xAckEntry));
 
-        if (Lock(pPutMedia->xLock) != LOCK_OK) {
+        if (pthread_mutex_lock(&(pPutMedia->xLock)) != 0) {
             res = PUT_MEDIA_ERROR_LOCK_ERROR;
         } else {
-            DList_InsertTailList(&(pPutMedia->xPendingFragmentAcks), &(pFragmentAck->xAckEntry));
+            TAILQ_INSERT_TAIL(&(pPutMedia->xPendingFragmentAcks), pFragmentAck, xAckEntry);
 
-            Unlock(pPutMedia->xLock);
+            pthread_mutex_unlock(&(pPutMedia->xLock));
         }
     }
 
@@ -553,20 +545,17 @@ static PutMedia_t *prvCreateDefaultPutMediaHandle()
     } else {
         memset(pPutMedia, 0, sizeof(PutMedia_t));
 
-        if ((pPutMedia->xLock = Lock_Init()) == NULL) {
+        if (pthread_mutex_init(&(pPutMedia->xLock), NULL) != 0) {
             res = PUT_MEDIA_ERROR_LOCK_ERROR;
             ESP_LOGE(TAG, "Failed to initialize lock");
         } else {
-            DList_InitializeListHead(&(pPutMedia->xPendingFragmentAcks));
+            TAILQ_INIT(&(pPutMedia->xPendingFragmentAcks));
             pPutMedia->bSecondResponseHeadersFetched = 0;
         }
     }
 
     if (res != PUT_MEDIA_ERRNO_NONE) {
         if (pPutMedia != NULL) {
-            if (pPutMedia->xLock != NULL) {
-                Lock_Deinit(pPutMedia->xLock);
-            }
             kvsFree(pPutMedia);
             pPutMedia = NULL;
         }
@@ -577,17 +566,14 @@ static PutMedia_t *prvCreateDefaultPutMediaHandle()
 
 static FragmentAck_t *prvReadFragmentAck(PutMedia_t *pPutMedia)
 {
-    PDLIST_ENTRY pxListHead = NULL;
-    PDLIST_ENTRY pxListItem = NULL;
     FragmentAck_t *pFragmentAck = NULL;
 
-    if (Lock(pPutMedia->xLock) == LOCK_OK) {
-        if (!DList_IsListEmpty(&(pPutMedia->xPendingFragmentAcks))) {
-            pxListHead = &(pPutMedia->xPendingFragmentAcks);
-            pxListItem = DList_RemoveHeadList(pxListHead);
-            pFragmentAck = containingRecord(pxListItem, FragmentAck_t, xAckEntry);
+    if (pthread_mutex_lock(&(pPutMedia->xLock)) == 0) {
+        if (!TAILQ_EMPTY(&(pPutMedia->xPendingFragmentAcks))) {
+            pFragmentAck = TAILQ_FIRST(&(pPutMedia->xPendingFragmentAcks));
+            TAILQ_REMOVE(&(pPutMedia->xPendingFragmentAcks), pFragmentAck, xAckEntry);
         }
-        Unlock(pPutMedia->xLock);
+        pthread_mutex_unlock(&(pPutMedia->xLock));
     }
 
     return pFragmentAck;
@@ -1156,7 +1142,7 @@ void Kvs_putMediaFinish(PutMediaHandle xPutMediaHandle)
             pPutMedia->xHttpClient = NULL;
         }
         prvFlushFragmentAck(pPutMedia);
-        Lock_Deinit(pPutMedia->xLock);
+        pthread_mutex_destroy(&(pPutMedia->xLock));
         kvsFree(pPutMedia);
     }
 }

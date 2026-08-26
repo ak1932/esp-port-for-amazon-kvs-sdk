@@ -29,7 +29,6 @@
 #include "os/allocator.h"
 #include "net/http_helper.h"
 #include "misc/json_helper.h"
-#include "net/netio.h"
 
 #include "esp_log.h"
 
@@ -37,6 +36,7 @@
 
 #define IOT_URI_ROLE_ALIASES_BEGIN  "/role-aliases"
 #define IOT_URI_ROLE_ALIASES_END    "/credentials"
+#define IOT_HTTP_TIMEOUT_MS         10000
 
 static int parseIoTCredential(const char *pcJsonSrc, size_t uJsonSrcLen, IotCredentialToken_t *pToken)
 {
@@ -85,8 +85,6 @@ IotCredentialToken_t *Iot_getCredential(IotCredentialRequest_t *pReq)
     char *pRspBody = NULL;
     size_t uRspBodyLen = 0;
 
-    NetIoHandle xNetIoHandle = NULL;
-
     if (pReq == NULL || pReq->pCredentialHost == NULL || pReq->pRoleAlias == NULL || pReq->pThingName == NULL || pReq->pRootCA == NULL || pReq->pCertificate == NULL ||
             pReq->pPrivateKey == NULL) {
         res = PUT_MEDIA_ERROR_INVALID_ARGUMENT;
@@ -100,17 +98,11 @@ IotCredentialToken_t *Iot_getCredential(IotCredentialRequest_t *pReq)
         HTTPHeaders_AddHeaderNameValuePair(xHttpReqHeaders, HDR_X_AMZN_IOT_THINGNAME, pReq->pThingName) != HTTP_HEADERS_OK) {
         res = PUT_MEDIA_ERROR_FAIL_TO_GENERATE_HTTP_HEADERS;
         ESP_LOGE(TAG, "Failed to generate HTTP headers");
-    } else if ((xNetIoHandle = NetIo_create()) == NULL) {
-        res = PUT_MEDIA_ERROR_FAIL_TO_CREATE_NETIO_HANDLE;
-        ESP_LOGE(TAG, "Failed to create netio handle");
-    } else if ((res = NetIo_connectWithX509(xNetIoHandle, pReq->pCredentialHost, "443", pReq->pRootCA, pReq->pCertificate, pReq->pPrivateKey)) != PUT_MEDIA_ERRNO_NONE) {
-        ESP_LOGE(TAG, "Failed to connect to %s\r\n", pReq->pCredentialHost);
-        /* Propagate the res error */
-    } else if ((res = Http_executeHttpReq(xNetIoHandle, HTTP_METHOD_GET, STRING_c_str(xStUri), xHttpReqHeaders, HTTP_BODY_EMPTY)) != PUT_MEDIA_ERRNO_NONE) {
-        ESP_LOGE(TAG, "Failed send http request to %s", pReq->pCredentialHost);
-        /* Propagate the res error */
-    } else if ((res = Http_recvHttpRsp(xNetIoHandle, &uHttpStatusCode, &pRspBody, &uRspBodyLen)) != PUT_MEDIA_ERRNO_NONE) {
-        ESP_LOGE(TAG, "Failed recv http response from %s", pReq->pCredentialHost);
+    } else if ((res = Http_performRequestWithX509(pReq->pCredentialHost, "443", STRING_c_str(xStUri), HTTP_METHOD_GET,
+                xHttpReqHeaders, HTTP_BODY_EMPTY, IOT_HTTP_TIMEOUT_MS, IOT_HTTP_TIMEOUT_MS,
+                pReq->pRootCA, pReq->pCertificate, pReq->pPrivateKey,
+                &uHttpStatusCode, &pRspBody, &uRspBodyLen)) != PUT_MEDIA_ERRNO_NONE) {
+        ESP_LOGE(TAG, "Failed http request to %s", pReq->pCredentialHost);
         /* Propagate the res error */
     } else {
         if (uHttpStatusCode != 200) {
@@ -139,8 +131,6 @@ IotCredentialToken_t *Iot_getCredential(IotCredentialRequest_t *pReq)
         kvsFree(pRspBody);
     }
 
-    NetIo_disconnect(xNetIoHandle);
-    NetIo_terminate(xNetIoHandle);
     HTTPHeaders_Free(xHttpReqHeaders);
     STRING_delete(xStUri);
 

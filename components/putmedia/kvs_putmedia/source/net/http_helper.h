@@ -16,12 +16,14 @@
 #ifndef HTTP_HELPER_H
 #define HTTP_HELPER_H
 
+#include "kvs/put_media_errors.h"
+#include <stddef.h>
+
+#define HTTP_METHOD_GET_STR "GET"
+#define HTTP_METHOD_POST_STR "POST"
+
 #include "azure_c_shared_utility/httpheaders.h"
-
-#include "netio.h"
-
-#define HTTP_METHOD_GET                 "GET"
-#define HTTP_METHOD_POST                "POST"
+#include "esp_http_client.h"
 
 #define URI_QUERY_EMPTY                 ""
 
@@ -54,26 +56,78 @@
 #define HTTP_BODY_EMPTY                 ""
 
 /**
- * @brief Execute HTTP request
+ * @brief Perform HTTP request using esp_http_client (one-shot, no client cert).
  *
- * @param[in] xNetIoHandle The network I/O handle
- * @param[in] pcHttpMethod The HTTP method. (Ex. GET, PUT, POST)
- * @param[in] pcUri The relative path of URI
- * @param[in] xHttpReqHeaders The HTTP headers
- * @param[in] pcBody The HTTP body
- * @return 0 on success, non-zero value otherwise
+ * @param[in] pcHost Hostname
+ * @param[in] pcPort Port (e.g. "443")
+ * @param[in] pcUri URI path (e.g. "/createStream")
+ * @param[in] pcHttpMethod HTTP method (GET, POST)
+ * @param[in] xHttpReqHeaders HTTP request headers
+ * @param[in] pcBody Request body (use HTTP_BODY_EMPTY for none)
+ * @param[in] uRecvTimeoutMs Receive timeout in ms
+ * @param[in] uSendTimeoutMs Send timeout in ms
+ * @param[out] puHttpStatus HTTP status code
+ * @param[out] ppRspBody Response body (caller must kvsFree); may be NULL if not needed
+ * @param[out] puRspBodyLen Length of response body
+ * @return 0 on success, non-zero put_media error otherwise
  */
-int Http_executeHttpReq(NetIoHandle xNetIoHandle, const char *pcHttpMethod, const char *pcUri, HTTP_HEADERS_HANDLE xHttpReqHeaders, const char *pcBody);
+int Http_performRequest(const char *pcHost, const char *pcPort, const char *pcUri,
+                        esp_http_client_method_t http_method, HTTP_HEADERS_HANDLE xHttpReqHeaders,
+                        const char *pcBody, unsigned int uRecvTimeoutMs, unsigned int uSendTimeoutMs,
+                        unsigned int *puHttpStatus, char **ppRspBody, size_t *puRspBodyLen);
 
 /**
- * @brief Receive HTTP response
+ * @brief Perform HTTP request with X.509 client certificate (e.g. IoT credentials).
  *
- * @param[in] xNetIoHandle The network I/O handle
- * @param[out] puHttpStatus The HTTP status code
- * @param[out] ppRspBody The HTTP response body that is memory allocated and the callee has the responsible to free it.
- * @param[out] puRspBodyLen The length of HTTP response body.
- * @return 0 on success, non-zero value otherwise
+ * @param[in] pcHost Hostname
+ * @param[in] pcPort Port (e.g. "443")
+ * @param[in] pcUri URI path
+ * @param[in] pcHttpMethod HTTP method
+ * @param[in] xHttpReqHeaders HTTP request headers
+ * @param[in] pcBody Request body
+ * @param[in] uRecvTimeoutMs Receive timeout in ms
+ * @param[in] uSendTimeoutMs Send timeout in ms
+ * @param[in] pcRootCA Server root CA PEM (NULL to skip verification)
+ * @param[in] pcCertPem Client certificate PEM
+ * @param[in] pcKeyPem Client private key PEM
+ * @param[out] puHttpStatus HTTP status code
+ * @param[out] ppRspBody Response body (caller must kvsFree)
+ * @param[out] puRspBodyLen Length of response body
+ * @return 0 on success, non-zero put_media error otherwise
  */
-int Http_recvHttpRsp(NetIoHandle xNetIoHandle, unsigned int *puHttpStatus, char **ppRspBody, size_t *puRspBodyLen);
+put_media_err_t Http_performRequestWithX509(const char *pcHost, const char *pcPort, const char *pcUri,
+                                            esp_http_client_method_t http_method, HTTP_HEADERS_HANDLE xHttpReqHeaders,
+                                            const char *pcBody, unsigned int uRecvTimeoutMs, unsigned int uSendTimeoutMs,
+                                            const char *pcRootCA, const char *pcCertPem, const char *pcKeyPem,
+                                            unsigned int *puHttpStatus, char **ppRspBody, size_t *puRspBodyLen);
 
+/**
+ * @brief Open HTTP connection for chunked upload (Put Media streaming).
+ * Sends request line and headers; does not send body. Caller uses Http_write_chunk()
+ * (esp_http_client_write_chunk) for each body chunk. Call esp_http_client_cleanup when done.
+ *
+ * @param[in] pcHost Hostname
+ * @param[in] pcPort Port (e.g. "443")
+ * @param[in] pcUri URI path (e.g. "/putMedia")
+ * @param[in] xHttpReqHeaders HTTP request headers
+ * @param[in] uRecvTimeoutMs Receive timeout in ms
+ * @param[in] uSendTimeoutMs Send timeout in ms
+ * @param[out] puHttpStatus Initial response status (100 or 200)
+ * @param[out] ppClient esp_http_client handle (caller must esp_http_client_cleanup)
+ * @return 0 on success, non-zero put_media error otherwise
+ */
+put_media_err_t Http_openChunkedRequest(const char *pcHost, const char *pcPort, const char *pcUri,
+                                        HTTP_HEADERS_HANDLE xHttpReqHeaders,
+                                        unsigned int uRecvTimeoutMs, unsigned int uSendTimeoutMs,
+                                        unsigned int *puHttpStatus, esp_http_client_handle_t *ppClient);
+
+/**
+ * @brief Send http chunk over esp_http_client
+ *
+ * @param[in] http_client esp_http_client handle
+ * @param[in] pBuffer Chunk buffer to write
+ * @param[in] uBytesToSend Bytes to write
+ * @return 0 on success, non-zero put_media error otherwise
+ */
+put_media_err_t Http_write_chunk(esp_http_client_handle_t http_client, const char *pBuffer, size_t uBytesToSend);
 #endif /* HTTP_HELPER_H */

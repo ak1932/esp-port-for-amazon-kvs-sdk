@@ -555,7 +555,7 @@ static void put_media_task(void *pvParameters)
                 }
                 data_sent += mkv_buf_info.uDataLen;
                 if ((res = put_media_maintain()) != PUT_MEDIA_ERRNO_NONE) {
-                    ESP_LOGE(TAG, "put media update failed: %d", res);
+                    ESP_LOGE(TAG, "put media maintain failed: %d", res);
                     put_media_event_data_t ev = { .event = PUT_MEDIA_ON_ERROR, .data = { .error_code = res } };
                     put_media_notify_event(&ev);
                 }

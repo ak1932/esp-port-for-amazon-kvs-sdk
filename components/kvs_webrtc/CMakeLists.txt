@@ -190,6 +190,13 @@ if (CONFIG_ENABLE_DATA_CHANNEL)
     add_definitions(-DENABLE_DATA_CHANNEL)
 endif()
 
+# IDF v6 ships mbedTLS 4 (TF-PSA-Crypto). The SDK crypto adapts to it on its own,
+# but KVS_USE_MBEDTLS4 also switches the signaling client off the OpenSSL-style
+# cipher-list string, which a mbedTLS-4 lws backend rejects.
+if(IDF_VERSION_MAJOR GREATER_EQUAL 6)
+    add_definitions(-DKVS_USE_MBEDTLS4)
+endif()
+
 target_compile_definitions(${COMPONENT_LIB} PUBLIC
     -DKVS_USE_MBEDTLS
     -DKVS_BUILD_WITH_MBEDTLS

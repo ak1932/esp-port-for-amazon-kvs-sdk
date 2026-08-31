@@ -62,6 +62,11 @@ if(IDF_VERSION_MAJOR GREATER_EQUAL 6)
     target_compile_definitions(${COMPONENT_LIB} INTERFACE LWS_HAVE_MBEDTLS_V4=1)
 endif()
 
+# Same reason for spi_flash: lws romfs.c includes esp_flash.h, whose v6 header
+# chain (esp_hal_mspi, esp_blockdev) the subproject can not see. cmake/idf6_compat.cmake
+# makes those common, which does not reach an add_subdirectory target.
+target_link_libraries(websockets PRIVATE idf::spi_flash)
+
 # Supply our own dependency-free UTC timegm() (picolibc's symbol isn't linkable here)
 # so lws's date.c resolves it under LWS_HAVE_TIMEGM.
 target_sources(websockets PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/lws_timegm.c)

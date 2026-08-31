@@ -335,6 +335,31 @@ static void requeue_used_buffers(v4l2_src_t *v4l2)
     }
 }
 
+/* Capture-buffer size for a compressed format.
+ *
+ * esp_video_config_buffer() honours sizeimage for JPEG/H264 and otherwise falls back to
+ * width * height * bpp / 8 with bpp = 8, i.e. one byte per pixel - far too small.
+ *
+#ifndef CONFIG_MEDIA_STREAM_UVC_COMPRESSED_FRAME_MAX_KB
+#define CONFIG_MEDIA_STREAM_UVC_COMPRESSED_FRAME_MAX_KB 1024
+#endif
+
+static uint32_t compressed_buffer_size(uint32_t width, uint32_t height)
+{
+    /* uvc_host.c uses advanced.frame_size directly as the
+     * allocation size (dwMaxVideoFrameSize is only the fallback when it is 0) and never
+     * compares the two - the only check is frame_size > 0. The real requirement is that
+     * the buffer hold the largest *actual* frame, which for H.264 is a keyframe.
+     */
+    uint64_t declared = (uint64_t) width * height * 2;
+    uint64_t cap = (uint64_t) CONFIG_MEDIA_STREAM_UVC_COMPRESSED_FRAME_MAX_KB * 1024;
+
+    if (cap == 0 || declared <= cap) {
+        return (uint32_t) declared;
+    }
+    return (uint32_t) cap;
+}
+
 static esp_err_t queue_all_buffers(v4l2_src_t *v4l2)
 {
     if (!v4l2) {
@@ -411,6 +436,14 @@ static video_fb_t *video_fb_get_cb(void *cb_ctx)
                     ESP_LOGE(TAG, "failed to receive video frame: %s (errno %d, count=%" PRIu32 ")",
                              errno == EPERM ? "timed out waiting for the driver" : "ioctl error",
                              errno, dqbuf_fail_count);
+                    if (dqbuf_fail_count == 1) {
+                        ESP_LOGW(TAG, "if this persists with no frames at all, the capture buffer may be "
+                                      "too small for a keyframe - raise "
+                                      "CONFIG_MEDIA_STREAM_UVC_COMPRESSED_FRAME_MAX_KB (currently %d KB) "
+                                      "or enable DEBUG on tag \"usb_uvc_device\" to see "
+                                      "\"Frame buffer overflow\"",
+                                 CONFIG_MEDIA_STREAM_UVC_COMPRESSED_FRAME_MAX_KB);
+                    }
                 }
                 return NULL;
             }
@@ -594,6 +627,9 @@ static esp_err_t reopen_camera_for_userptr(v4l2_src_t *v4l2)
     format.fmt.pix.width = g_current_resolution.width;
     format.fmt.pix.height = g_current_resolution.height;
     format.fmt.pix.pixelformat = V4L2_PIX_FMT_H264;
+    /* Same reasoning as the initial S_FMT above: without sizeimage the capture buffer is
+     * sized at one byte per pixel and every camera frame overflows it. */
+    format.fmt.pix.sizeimage = compressed_buffer_size(format.fmt.pix.width, format.fmt.pix.height);
     if (ioctl(v4l2->cap_fd, VIDIOC_S_FMT, &format) != 0) {
         ESP_LOGE(TAG, "Failed to set format on reopen");
         return ESP_FAIL;
@@ -825,6 +861,15 @@ static esp_err_t configure_camera_format(v4l2_src_t *v4l2, uint32_t pixelformat)
         format.fmt.pix.width = fallback_resolutions[i].width;
         format.fmt.pix.height = fallback_resolutions[i].height;
         format.fmt.pix.pixelformat = pixelformat;
+        /* Compressed formats MUST carry sizeimage.
+         *
+         * esp_video_config_buffer() honours sizeimage for JPEG/H264 and otherwise falls
+         * back to width * height * bpp / 8, and its bpp for H264 is 8 - i.e. one byte per
+         * pixel, 307200 at 640x480.
+         */
+        if (pixelformat == V4L2_PIX_FMT_H264 || pixelformat == V4L2_PIX_FMT_JPEG) {
+            format.fmt.pix.sizeimage = compressed_buffer_size(format.fmt.pix.width, format.fmt.pix.height);
+        }
 
         if (i == 0) {
             ESP_LOGD(TAG, "Attempting to set format: %dx%d", (int)format.fmt.pix.width, (int)format.fmt.pix.height);

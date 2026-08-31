@@ -279,6 +279,22 @@ menu "Media Stream Configuration"
                 one to arrive intact. 1000 ms keeps join and recovery latency bounded at a
                 modest bitrate cost.
 
+        config MEDIA_STREAM_UVC_COMPRESSED_FRAME_MAX_KB
+            int "Max compressed capture frame (KB)"
+            depends on MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR
+            default 1024
+            help
+                Upper bound on each H.264/MJPEG capture buffer, in KB. There are three
+                of them, so this caps capture memory at 3x this value.
+
+                Without a cap the buffer is sized at width*height*2 - the camera's own
+                declared dwMaxVideoFrameSize, i.e. an *uncompressed* frame - which costs
+                11.9 MB at 1080p to carry H.264 frames of a few tens of KB. Nothing in
+                usb_host_uvc requires that: advanced.frame_size is used directly as the
+                allocation size and is never checked against dwMaxVideoFrameSize.
+
+                1 MB carries a 1080p keyframe with room to spare.
+
         config MEDIA_STREAM_UVC_CAPTURE_WIDTH
             int "UVC capture width"
             depends on MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR

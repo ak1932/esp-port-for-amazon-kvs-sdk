@@ -2390,7 +2390,7 @@ static VOID kvs_senderBandwidthEstimationHandler(UINT64 customData, UINT32 txByt
     /* Feed the network estimate to the TX video rate controller as a ceiling.
      * The controller caps its target at min(configured max, this); the local
      * send-latency loop continues to handle the on-device bottleneck within it. */
-    video_rate_ctrl_set_network_ceiling_bps((uint32_t) videoBitrate);
+    video_rate_ctrl_set_network_ceiling_bps(kvs_media_get_video_rate_ctrl(), (uint32_t) videoBitrate);
 
     ESP_LOGD(TAG, "TWCC adjustment for peer %s: loss=%.2f%%, video=%lluKbps, audio=%lluKbps",
              session->peer_id, session->twcc_metadata.average_packet_loss,

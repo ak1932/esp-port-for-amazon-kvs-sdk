@@ -177,6 +177,53 @@ the camera owns bitrate and GOP, so `CONFIG_ESP_VIDEO_UVC_H264_BITRATE_BPS`,
 `_IFRAME_PERIOD_MS` and the capture resolution are static choices. Details:
 [`components/media_stream/README.md`](../../components/media_stream/README.md).
 
+## Rate control when both sides run
+
+Each sink runs its **own** congestion controller. They measure different things,
+because they congest differently:
+
+| Sink | Signal | State | Why |
+|---|---|---|---|
+| `putmedia` | upload-queue occupancy | **adapting** | Store-and-forward. Individual chunk writes rarely stall; the backlog grows instead. |
+| `webrtc` | per-frame send duration | **off** — see below | Real-time, *in principle*. In practice this signal does not work here. |
+
+Both drive the same fps/bitrate ladder, and both feed one arbiter — because there
+is only one H.264 encoder, and an encoded frame cannot be dropped for one sink
+and kept for another (every P-frame references the ones before it). The arbiter
+takes the **strict minimum**:
+
+```
+encoder fps     = min(target fps of every adapting sink)
+encoder bitrate = min(target bitrate of every adapting sink)
+```
+
+**Worst sink wins, and that is deliberate** — overshooting the slower consumer
+corrupts its stream rather than merely degrading it.
+
+Two details keep the PutMedia side honest:
+
+- Queue depth is a *level* signal, so it is evaluated on a slow cadence with a
+  trend term. Reacting per frame would walk the ladder to the floor on a
+  transient, seconds before the queue could possibly respond.
+- While PutMedia is refusing buffers (session reopening, or skipping to the next
+  cluster after a loss) the queue **drains to empty** even though the stream is
+  broken. Reporting is suppressed in that state, and an actual dropped buffer is
+  reported as an overflow instead.
+
+Read it live with `sink-stats`, which prints each controller's rung alongside the
+arbitrated result:
+
+```
+controller     state     rung   fps    bitrate  load%    netceil   reports
+webrtc         off          0    30    1048576      0    1000000         0
+putmedia       adapting     3    20     524288     31          0      1902
+encoder (strict min of adapting rows): 20 fps / 524288 bps
+```
+
+Only rows marked `adapting` enter the minimum. A controller that stops reporting
+is marked `stale` and dropped from it after 5 s, so a wedged sender cannot pin the
+encoder at its last rung.
+
 ## Next Steps
 
 - **[components/putmedia/README.md](../../components/putmedia/README.md)** — the PutMedia

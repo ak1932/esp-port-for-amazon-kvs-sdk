@@ -31,6 +31,27 @@ Consumers would reference these as `${KVS_SDK_PATH}/components/putmedia/<name>`.
 > with WebRTC. It is not in the CI example matrix, so these components are not built by
 > CI.
 
+## Configuration
+
+`kvs_putmedia` exposes one Kconfig option, under **Component config → AWS KVS PutMedia**:
+
+| Option | Default | |
+|---|---|---|
+| `CONFIG_PUT_MEDIA_UPLOAD_QUEUE_DEPTH` | 128, **1024 on ESP32-S31** | Depth of the queue between `put_media_enqueue()` and the upload task, in *buffers* — the muxer emits two per frame. |
+
+Two things make the depth worth thinking about rather than defaulting blindly. A buffer
+dropped for want of a slot corrupts the whole cluster it belonged to, so overflow costs
+every frame up to the next key frame. And `xQueueCreate()` allocates from internal RAM, so
+the depth costs `depth * 24` bytes up front — about 24 KB at 1024 — before any payload.
+
+ESP32-S31 gets the larger default because it runs the camera's H.264 through untouched: the
+sensor owns bitrate and GOP length there, so nothing can throttle the producer when the
+uplink slows, and the queue is the only slack in the system. Targets that own the encoder
+shed load upstream instead.
+
+`put_media_config_t.uUploadQueueDepth` overrides it per instance; zero selects the Kconfig
+value.
+
 ## Provenance
 
 `kvs_putmedia` and `kvs_producer` are derived from

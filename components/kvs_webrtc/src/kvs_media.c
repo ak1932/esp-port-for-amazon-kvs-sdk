@@ -75,6 +75,10 @@ typedef struct {
 static QueueHandle_t      s_video_q;
 static video_sink_handle_t s_video_sink;
 static uint32_t           s_video_sink_drops;
+/* This transport's rate controller. Created and enabled alongside the sink,
+ * because it is the sink's congestion that it steers. kvs_webrtc.c reaches it
+ * through kvs_media_get_video_rate_ctrl() to feed in the TWCC ceiling. */
+static video_rate_ctrl_handle_t s_vrate;
 
 static void kvs_video_sink_on_frame(const video_frame_t *frame, void *user)
 {
@@ -305,7 +309,6 @@ static PVOID kvs_global_video_sender_thread(PVOID args)
         ESP_LOGI(TAG, "Video frame rate control: %" PRIu32 " fps (frame interval: %" PRIu64 " us)",
                  target_fps, frame_interval_us);
 
-        video_rate_ctrl_enable(true);
 
 #if KVS_MEDIA_ENABLE_ADAPTIVE_BITRATE
         /* Get initial bitrate if get_bitrate is available */
@@ -494,7 +497,7 @@ static PVOID kvs_global_video_sender_thread(PVOID args)
              * duration is the congestion signal. The controller adjusts
              * target fps (grabber skips frames) and, at the fps floor,
              * encoder bitrate. Supersedes the old fixed-fps send pacing. */
-            video_rate_ctrl_report_send_ms((uint32_t)(sendDuration / HUNDREDS_OF_NANOS_IN_A_MILLISECOND));
+            video_rate_ctrl_report_send_ms(s_vrate, (uint32_t)(sendDuration / HUNDREDS_OF_NANOS_IN_A_MILLISECOND));
 
 #if KVS_MEDIA_ENABLE_ADAPTIVE_BITRATE
             /* Adaptive bitrate control based on send performance */
@@ -557,7 +560,7 @@ static PVOID kvs_global_video_sender_thread(PVOID args)
     }
 
 CleanupVideo:
-    video_rate_ctrl_enable(false);
+    video_rate_ctrl_enable(s_vrate, false);
 
     /* Release a frame dequeued but not sent (e.g. terminated mid-loop). The rest
      * of the queue is drained by kvs_media_stop_global_transmission() once the
@@ -1009,6 +1012,11 @@ STATUS kvs_media_start_global_transmission(void* client_data, kvs_media_config_t
          * session sends is an I-frame and the viewer's decoder can lock on. */
         video_sink_set_enabled(s_video_sink, true);
 
+        /* Rate-control handle for this sink. */
+        if (s_vrate == NULL) {
+            video_rate_ctrl_create("webrtc", &s_vrate);
+        }
+
         /* Explicit prio 5 (pthread default) so the relationship with kvsGlobalAudio is
          * obvious: audio is one slot above so its frames reach the wire first when both
          * are runnable. Keep below connListener (6) and i2s_read (9). */
@@ -1132,6 +1140,10 @@ STATUS kvs_media_stop_global_transmission(void* client_data)
     if (s_video_sink != NULL) {
         video_sink_unregister(s_video_sink);
         s_video_sink = NULL;
+    }
+    if (s_vrate != NULL) {
+        video_rate_ctrl_destroy(s_vrate);
+        s_vrate = NULL;
     }
     if (s_video_q != NULL) {
         vQueueDelete(s_video_q);
@@ -1468,4 +1480,9 @@ void kvs_media_print_stats(kvs_pc_session_t* session)
     }
 
     ESP_LOGI(TAG, "  Session Duration: %" PRIu64 " seconds", sessionDuration);
+}
+
+video_rate_ctrl_handle_t kvs_media_get_video_rate_ctrl(void)
+{
+    return s_vrate;
 }

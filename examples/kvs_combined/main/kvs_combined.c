@@ -45,6 +45,7 @@
 #include "esp_webrtc_time.h"
 #include "esp_work_queue.h"
 #include "video_sink.h"
+#include "video_rate_ctrl.h"
 
 #include "esp_console.h"
 
@@ -126,6 +127,36 @@ static int sink_stats_cli(int argc, char **argv)
                stats[i].enabled ? "enabled" : "off",
                stats[i].calls, stats[i].gate_held, stats[i].max_us, stats[i].avg_us);
     }
+
+    /* Rate control, read right here because the two tables answer one question
+     * together: who is asking the shared encoder to slow down, and what did the
+     * encoder actually end up running at. Each sink adapts independently; the
+     * grabber applies the strict minimum, so enc= should track the worst row. */
+    video_rate_ctrl_stats_t rc[8];
+    size_t rc_count = 0;
+    uint32_t enc_fps = 0, enc_bps = 0;
+
+    if (video_rate_ctrl_get_stats(rc, sizeof(rc) / sizeof(rc[0]), &rc_count,
+                                  &enc_fps, &enc_bps) != ESP_OK) {
+        printf("failed to read rate-control stats\n");
+        return -1;
+    }
+    if (rc_count == 0) {
+        printf("\nno rate controllers\n");
+        return 0;
+    }
+
+    printf("\n%-14s %-8s %5s %5s %10s %6s %10s %9s\n",
+           "controller", "state", "rung", "fps", "bitrate", "load%", "netceil", "reports");
+    for (size_t i = 0; i < rc_count; i++) {
+        printf("%-14s %-8s %5" PRIu32 " %5" PRIu32 " %10" PRIu32 " %6" PRIu32 " %10" PRIu32 " %9" PRIu32 "\n",
+               rc[i].name,
+               rc[i].stale ? "stale" : (rc[i].enabled ? "adapting" : "off"),
+               rc[i].level, rc[i].target_fps, rc[i].target_bitrate_bps,
+               rc[i].load_pct, rc[i].net_ceiling_bps, rc[i].reports);
+    }
+    printf("encoder (strict min of adapting rows): %" PRIu32 " fps / %" PRIu32 " bps\n",
+           enc_fps, enc_bps);
     return 0;
 }
 

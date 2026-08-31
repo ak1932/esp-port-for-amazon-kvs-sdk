@@ -91,31 +91,55 @@ Because the contract is timing-sensitive, it is measured rather than assumed:
   in a rate-limited warning.
 - The grabber's 1 s `enc_fps:` line carries `sink_ms=<spent>/<window>`.
 
-### The pull API (`video_capture_get_frame`) — removed for H.264
+### Adaptive rate control (`video_rate_ctrl.h`)
 
-There used to be a second way in: `video_capture_get_frame()`, backed inside this
-component by a built-in sink named `legacy-pull` that copied every frame into a
-FreeRTOS queue. It is gone. It existed so one consumer would not have to change,
-and every other consumer paid for its queue and its per-frame copy regardless.
+Opt-in, and **one controller per sink** rather than one per system:
 
-For H.264, `video_capture_get_frame()` now returns `ESP_ERR_NOT_SUPPORTED` and
-logs the replacement once. It still works for MJPEG, which is a separate grabber
-with its own queue; that path is expected to move to sinks too, at which point
-the function goes away.
+```c
+video_rate_ctrl_handle_t rc;
+video_rate_ctrl_create("myapp", &rc);
+video_rate_ctrl_enable(rc, true);          /* only from a path that also reports */
 
-**A consumer that must do slow work owns its own buffering.** That is the trade
-sinks make explicit rather than hiding: a callback that sends over the network
-cannot run on the encoder task, so it copies into a queue of its own choosing and
-does the slow part on its own thread. `components/kvs_webrtc/src/kvs_media.c` is
-the worked example — its callback copies and enqueues, and `writeFrame()` stays
-on the `kvsGlobalVideo` thread. The depth and the drop policy are then that
-consumer's decision, made where the requirements are known, instead of one global
-default serving nobody well.
+/* whichever of these matches how your transport congests */
+video_rate_ctrl_report_send_ms(rc, ms);            /* real-time: a slow send   */
+video_rate_ctrl_report_queue(rc, used, capacity);  /* buffered: a filling queue */
+```
 
-Note for encoded video: frames cannot be dropped individually, because every
-P-frame references the ones before it. Whatever a consumer discards leaves the
-decoder broken until the next keyframe, so the useful recovery is to ask for one
-— `video_capture_request_keyframe()`.
+Each controller walks its own 8-rung ladder of (fps, bitrate) pairs — congestion
+steps down, sustained health steps back up one rung. Tying the two together means
+an operating point is always a combination someone chose, instead of two counters
+drifting apart.
+
+```
+encoder fps = min(target fps),  encoder bitrate = min(target bitrate)
+```
+
+Worst sink wins. Overshooting the slower consumer corrupts its stream rather than
+just degrading it, so the arbiter cannot do better than the most constrained sink.
+
+Two signal shapes, one ladder, because they are not interchangeable:
+
+- **Send duration** is a *rate* signal and self-normalising — dropping fps widens
+  the per-frame budget, so the same send time reads as less congested and the
+  descent arrests itself.
+- **Queue occupancy** is a *level* signal and does not self-normalise. Lowering
+  fps slows the fill, but the existing backlog still has to drain. It is therefore
+  evaluated on a fixed slow cadence with a trend term, and only counts as healthy
+  when the queue is both shallow *and* not growing.
+
+Enabling a controller without a *working* signal is worse than not enabling it.
+The reports are the only thing that lets a controller climb back up, so a signal
+that always reads healthy produces a controller that only ever climbs — it will
+ratchet to the top rung and stay there, whatever the link is doing. Check that the
+signal actually moves before turning a controller on; the WebRTC sink in
+`kvs_combined` is currently disabled for exactly this reason. A controller that goes silent for 5 s is marked
+stale and dropped from the minimum — it keeps its rung, so it resumes where it
+left off — which is what stops a wedged sender from pinning the encoder.
+
+On UVC H.264 passthrough none of this applies: the camera owns bitrate and
+keyframes, so `video_rate_ctrl_init()` is never called and every controller stays
+inert. `video_rate_ctrl_get_stats()` reports every controller plus the arbitrated
+result; the `kvs_combined` example prints it from `sink-stats`.
 
 ### Lifecycle
 

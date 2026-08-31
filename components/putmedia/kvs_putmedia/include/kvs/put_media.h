@@ -147,7 +147,8 @@ typedef struct {
 
     /**
      * Depth of the queue between put_media_enqueue() and the upload task, in
-     * buffers. Zero selects the default.
+     * buffers. Zero selects CONFIG_PUT_MEDIA_UPLOAD_QUEUE_DEPTH, which is the
+     * right way to set this for most applications.
      *
      * The muxer emits two buffers per frame, so this is roughly
      * 2 * frames_buffered. It has to span a whole cluster (one GOP) plus margin:

@@ -38,8 +38,11 @@
 #define DEFAULT_PUT_MEDIA_HTTP_TIMEOUT_MS (10 * 1000)
 #define DEFAULT_PUT_MEDIA_STACK_SIZE      (6 * 1024)
 /*
- * Upload queue between the muxer callback and put_media_task.
- * The muxer emits two buffers per frame (header + block)
+ * Upload queue between the muxer callback and put_media_task, in buffers: the
+ * muxer emits two per frame (header + block). Tune with
+ * CONFIG_PUT_MEDIA_UPLOAD_QUEUE_DEPTH - see this component's Kconfig for the
+ * sizing argument and what the depth costs in internal RAM. The fallback keeps
+ * the component buildable if it is vendored somewhere its Kconfig is not.
  */
 #define DEFAULT_PUT_MEDIA_QUEUE_DEPTH     (CONFIG_PUT_MEDIA_UPLOAD_QUEUE_DEPTH)
 /* How long put_media_enqueue() waits for room before giving up on a buffer. */
@@ -814,9 +817,15 @@ static void prvReportStageMetrics(int64_t xWindowUs, size_t uTotalSent)
         uWindowMs = 1;
     }
 
-    ESP_LOGD(TAG,
-             "stage/%llums: sent=%" PRIu32 " buf %llu KB (total %zu KB) | wait=%llums update=%llums (send=%llums) maintain=%llums (dowork=%llums) enqueue=%llums",
+    /* INFO, not DEBUG. This one line is what separates "the uplink stalled and
+     * the task is stuck in a write" from "nothing is reaching the muxer" when
+     * the stream goes quiet - send= climbs toward the window while queued= fills
+     * in the first case, and sent=0 with queued=0 in the second. At DEBUG the
+     * whole window was invisible, which is precisely when it is needed. */
+    ESP_LOGI(TAG,
+             "stage/%llums: sent=%" PRIu32 " buf %llu KB (total %zu KB) queued=%u | wait=%llums update=%llums (send=%llums) maintain=%llums (dowork=%llums) enqueue=%llums",
              (unsigned long long)uWindowMs, xStageMetrics.uSentBufs, (unsigned long long)(xStageMetrics.uSentBytes / 1024), uTotalSent / 1024,
+             put_media_get_pending_count(),
              (unsigned long long)(xStageMetrics.uDequeueWaitUs / 1000), (unsigned long long)(xStageMetrics.uUpdateUs / 1000), (unsigned long long)(xStageMetrics.uSendUs / 1000),
              (unsigned long long)(xStageMetrics.uMaintainUs / 1000), (unsigned long long)(xStageMetrics.uDoWorkUs / 1000), (unsigned long long)(xStageMetrics.uEnqueueUs / 1000));
 

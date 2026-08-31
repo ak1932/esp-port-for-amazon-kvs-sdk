@@ -25,6 +25,7 @@
 #include <string.h>
 #include <inttypes.h>
 #include <stdbool.h>
+#include "sdkconfig.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -32,6 +33,7 @@
 #include "media_stream.h"
 #include "video_capture.h"
 #include "video_sink.h"
+#include "video_rate_ctrl.h"
 
 #include "kvs/mkvapp.h"
 #include "kvs/put_media.h"
@@ -73,6 +75,8 @@ static const char *TAG = "putmedia";
  * unit. 64 bytes covers far more NAL units than a single frame ever carries. */
 #define ANNEXB_TO_AVCC_HEADROOM 64
 
+#define PUTMEDIA_UPLOAD_QUEUE_DEPTH CONFIG_PUT_MEDIA_UPLOAD_QUEUE_DEPTH
+
 /* -------------------------------- State ---------------------------------- */
 
 static mkv_app_handle                s_mkv;
@@ -80,6 +84,22 @@ static media_stream_video_capture_t *s_video_if;
 static video_capture_handle_t        s_video_handle;
 static video_sink_handle_t           s_video_sink;
 static volatile bool                 s_running;
+
+/* Congestion-adaptive rate control for this sink.
+ *
+ * PutMedia is store-and-forward, so its congestion does not look like WebRTC's.
+ * A single chunk write rarely takes long - the uplink backs up as a QUEUE that
+ * fills, and the first visible symptom is a dropped buffer, which costs a whole
+ * cluster. So this sink reports upload-queue occupancy, and reports an outright
+ * overflow separately when a buffer is actually lost.
+ *
+ * s_upload_stalled is what keeps that honest. While PutMedia is refusing buffers
+ * (session reopening, or waiting out a cluster after a loss) it does not queue
+ * them at all, so the queue DRAINS TO EMPTY while the stream is broken. Reporting
+ * occupancy in that state would read as perfect health and ramp the ladder up
+ * mid-fault, so reporting is suppressed until buffers are flowing again. */
+static video_rate_ctrl_handle_t      s_vrate;
+static volatile bool                 s_upload_stalled;
 
 /* Upload accounting, reported once a second from the muxer callback.
  * "lost" and "skipped" are different failures and must not be added together.
@@ -181,12 +201,17 @@ static mkv_err_t on_mkv_generated(mkv_app_handle handle, mkv_buf_info_t mkv_buf_
     if (err == PUT_MEDIA_ERRNO_NONE) {
         s_n_sent++;
         s_bytes_sent += mkv_buf_info.uDataLen;
+        /* Buffers are flowing, so the queue reading means something again. */
+        s_upload_stalled = false;
     } else if (err == PUT_MEDIA_ERROR_AWAITING_RESYNC) {
         /* Deliberately refused: the session is reopening, or a previous loss left
          * PutMedia waiting for the next cluster boundary. Whatever caused that was
          * already counted, so this is not new loss. */
         s_n_skipped++;
         s_bytes_skipped += mkv_buf_info.uDataLen;
+        /* Refused buffers never reach the queue, so it drains while we are still
+         * in trouble. Stop reporting occupancy until they flow again. */
+        s_upload_stalled = true;
     } else {
         /* Real loss. TIMEOUT means the upload queue is full, i.e. PutMedia drains
          * slower than the encoder produces; OUT_OF_MEMORY means no PSRAM for the
@@ -194,6 +219,11 @@ static mkv_err_t on_mkv_generated(mkv_app_handle handle, mkv_buf_info_t mkv_buf_
         s_n_lost++;
         s_bytes_lost += mkv_buf_info.uDataLen;
         s_last_err = err;
+        /* The unambiguous congestion signal: not "the queue looks deep" but "we
+         * just destroyed a cluster". Step down now rather than waiting for the
+         * occupancy sampler, which is about to see an emptying queue. */
+        s_upload_stalled = true;
+        video_rate_ctrl_report_overflow(s_vrate);
     }
 
     int64_t now = esp_timer_get_time();
@@ -205,7 +235,10 @@ static mkv_err_t on_mkv_generated(mkv_app_handle handle, mkv_buf_info_t mkv_buf_
                      s_n_sent, s_bytes_sent, s_n_lost, s_bytes_lost, s_last_err,
                      s_n_skipped, s_bytes_skipped, put_media_get_pending_count());
         } else {
-            ESP_LOGD(TAG, "upload: sent %" PRIu32 " buf/%" PRIu32 " B | queued %u",
+            /* INFO: a healthy second and a stalled second look identical from
+             * the outside otherwise - the stall shows up here as sent=0 with a
+             * rising queue, and there is no other line that says so. */
+            ESP_LOGI(TAG, "upload: sent %" PRIu32 " buf/%" PRIu32 " B | queued %u",
                      s_n_sent, s_bytes_sent, put_media_get_pending_count());
         }
         s_n_sent = s_n_lost = s_n_skipped = 0;
@@ -293,6 +326,17 @@ static void video_sink_on_frame(const video_frame_t *frame, void *user)
         s_gate_skipped = 0;
     }
 
+    /* Congestion feedback, sampled once this frame is genuinely going to be
+     * uploaded - past the session gate and the keyframe gate, and only while
+     * PutMedia is actually accepting buffers (see s_upload_stalled). Cheap to
+     * call per frame: the controller stores the sample and only re-evaluates on
+     * its own slow cadence, because a queue this deep cannot respond to a rung
+     * change for seconds. */
+    if (!s_upload_stalled) {
+        video_rate_ctrl_report_queue(s_vrate, put_media_get_pending_count(),
+                                     PUTMEDIA_UPLOAD_QUEUE_DEPTH);
+    }
+
     /* The frame is borrowed and dies when this returns, and mkv_app_add_frame()
      * takes ownership of what it is given and rewrites it in place. So hand over
      * a private copy with headroom; the muxer frees it, error path included. */
@@ -357,7 +401,13 @@ esp_err_t putmedia_start(void)
         return ret;
     }
 
-    /* No video_rate_ctrl_enable() here */
+    /* Rate control is created here but stays disabled until the upload session
+     * is actually open - an enabled controller that never reports would be
+     * treated as a live constraint on the shared encoder. */
+    if (s_vrate == NULL) {
+        video_rate_ctrl_create("putmedia", &s_vrate);
+    }
+    s_upload_stalled = false;
 
     /* STREAM_POLICY_RING_BUFFER is a last-resort memory bound, NOT the working
      * buffer - the PutMedia upload queue is. Eviction here is destructive:
@@ -393,6 +443,7 @@ esp_err_t putmedia_start(void)
         .uDataRetentionHours     = AWS_KVS_RETENTION_HOURS,
         .event_handler           = put_media_event_handler,
         .event_handler_user_ctx  = NULL,
+        .uUploadQueueDepth       = PUTMEDIA_UPLOAD_QUEUE_DEPTH,
     };
     if (put_media_init(put_media_config) != PUT_MEDIA_ERRNO_NONE) {
         ESP_LOGE(TAG, "PutMedia init failed");
@@ -454,6 +505,9 @@ esp_err_t putmedia_start(void)
         goto err_sink;
     }
 
+    /* Opt in only now that the upload path is up and will report. */
+    video_rate_ctrl_enable(s_vrate, true);
+
     ESP_LOGI(TAG, "Streaming to KVS stream '%s' in %s", AWS_KVS_STREAM_NAME, AWS_REGION);
     return ESP_OK;
 
@@ -464,6 +518,7 @@ err_sink:
     if (s_retry_timer != NULL) {
         esp_timer_stop(s_retry_timer);
     }
+    video_rate_ctrl_enable(s_vrate, false);
     video_sink_set_enabled(s_video_sink, false);
 err_capture:
     s_video_if->stop(s_video_handle);
@@ -491,6 +546,9 @@ esp_err_t putmedia_stop(void)
      * the sink is synchronous with respect to the dispatcher: it will not be
      * inside our callback once this returns. */
     s_running = false;
+    /* Withdraw from arbitration before the sink goes quiet, so the shared encoder
+     * is not left pinned at whatever rung this sink last asked for. */
+    video_rate_ctrl_enable(s_vrate, false);
     video_sink_set_enabled(s_video_sink, false);
 
     /* Reference counted - the camera keeps running if WebRTC still holds it. */

@@ -24,6 +24,7 @@
 #include <com/amazonaws/kinesis/video/webrtcclient/Include.h>
 #include "esp_log.h"
 #include "media_stream.h"
+#include "video_rate_ctrl.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -216,6 +217,15 @@ bool kvs_media_adjust_video_bitrate(
     uint32_t max_bitrate_kbps,
     const char *reason,
     uint32_t *current_bitrate);
+
+/**
+ * @brief This component's video rate controller, or NULL before media is started
+ *
+ * Exposed so the TWCC bandwidth-estimation handler in kvs_webrtc.c can feed the
+ * network ceiling to the WebRTC sink's controller specifically, rather than to a
+ * process-global one that PutMedia also shares.
+ */
+video_rate_ctrl_handle_t kvs_media_get_video_rate_ctrl(void);
 
 #ifdef __cplusplus
 }

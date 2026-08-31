@@ -2,12 +2,25 @@
 # Apply local patches to managed (registry) components.
 #
 # Managed components live in <example>/managed_components/, which is generated and
-# git-ignored, so a fix that lives only there is lost on a clean checkout. Run this
-# after the first `idf.py build` of an example (which is what materialises them).
+# git-ignored, so a fix that lives only there is lost on a clean checkout - and the
+# component manager restores a component from its checksum whenever it decides the
+# on-disk copy has drifted, which silently throws these patches away mid-configure.
+# media_stream's CMakeLists therefore runs this at configure time under
+# CONFIG_KVS_AUTO_APPLY_PATCHES; see the exit codes below for how it reports back.
 #
 #   ./patches/managed_components/apply_managed_component_patches.sh examples/streaming_only
 #
-# Idempotent: a patch that is already applied is skipped.
+# The argument may be relative to the repo root or absolute.
+#
+# Idempotent: a patch that is already applied is skipped. Exit codes:
+#   0   nothing to do - every patch was already applied, or there is no
+#       managed_components/ yet (a fresh configure, before the component manager has
+#       materialised anything)
+#   10  at least one patch was applied just now. The caller must treat this as
+#       "re-configure required": two of these patches add Kconfig options, and Kconfig
+#       has already been read by the time any component CMakeLists runs, so this
+#       configure is working from a sdkconfig that predates them.
+#   1   a patch failed to apply
 #
 # Each patch here is a stop-gap for an upstream fix that has not been released yet;
 # drop it once the component version that carries the fix is published and pinned.
@@ -16,13 +29,19 @@ set -e
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 EXAMPLE_DIR="${1:-examples/streaming_only}"
-MC="$REPO_ROOT/$EXAMPLE_DIR/managed_components"
+case "$EXAMPLE_DIR" in
+    /*) MC="$EXAMPLE_DIR/managed_components" ;;
+    *)  MC="$REPO_ROOT/$EXAMPLE_DIR/managed_components" ;;
+esac
 PATCH_DIR="$REPO_ROOT/patches/managed_components"
 
+# Tracks whether this run changed anything, which is what turns into exit 10.
+APPLIED_ANY=0
+
 if [ ! -d "$MC" ]; then
-    echo "error: $MC does not exist. Build the example once so the component manager"
-    echo "       materialises its managed components, then re-run this script."
-    exit 1
+    echo "note: $MC does not exist yet - nothing to patch. The component manager"
+    echo "      materialises it during the build; this script runs again then."
+    exit 0
 fi
 
 apply_one() {
@@ -47,7 +66,8 @@ apply_one() {
     fi
 
     echo "applying: $(basename "$patch") -> $component ($have)"
-    patch -p1 -d "$target_dir" < "$patch"
+    patch -p1 -d "$target_dir" --fuzz=0 < "$patch"
+    APPLIED_ANY=1
 }
 
 # usb_host_uvc: cameras that never set the EoF payload flag (observed on a Logitech H.264
@@ -68,4 +88,9 @@ apply_one "$PATCH_DIR/0002-usb_host_uvc-h264-extension-unit-rate-control.patch" 
 apply_one "$PATCH_DIR/0003-esp_video-apply-uvc-h264-config-before-stream-start.patch" \
           "$MC/espressif__esp_video" "2.0.1" "esp_video"
 
-echo "done"
+if [ "$APPLIED_ANY" -eq 1 ]; then
+    echo "done (patches applied - a re-configure is required, see exit codes above)"
+    exit 10
+fi
+
+echo "done (all patches were already applied)"

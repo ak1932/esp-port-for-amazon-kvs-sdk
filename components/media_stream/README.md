@@ -244,8 +244,51 @@ webrtc_config.video_capture = my_custom_camera_if_get();
 
 - **ESP32-S3** with camera modules (OV2640, OV3660, etc.)
 - **ESP32-P4** with advanced camera and audio capabilities
+- **ESP32-S31** with a USB-UVC camera that emits H.264 itself
 - **ESP32** with external camera/audio via I2S/SPI
 - **Custom hardware** via interface implementation
+
+### Target capabilities
+
+Capture and encoding are separate capabilities, spelled as separate macros in
+`src/media_stream_caps.h`:
+
+| | esp_video V4L2 capture | H.264 hardware encoder | esp_image_effects |
+|---|---|---|---|
+| **ESP32-P4** | yes (MIPI-CSI, DVP, SPI, USB-UVC) | yes | yes |
+| **ESP32-S31** | yes (USB-UVC only) | **no** | **no** |
+
+The S31 has no H.264 encoder and no ISP, so `espressif/esp_h264` is not a dependency
+there: the camera does the encoding and frames are forwarded untouched
+(`CONFIG_MEDIA_STREAM_UVC_PASSTHROUGH_H264`, on by default).
+
+On such a passthrough target the encoder-backed APIs are unavailable:
+
+- **`video_rate_ctrl` does nothing.** The camera owns bitrate and GOP, and dropping
+  frames from a compressed stream breaks the reference chain, so both congestion
+  stages are skipped rather than applied badly.
+- **`video_capture_set_bitrate()` / `_get_bitrate()` return `ESP_ERR_NOT_SUPPORTED`.**
+- **A viewer's PLI cannot force a key frame.** esp_video exposes no V4L2 control for
+  it, so recovery latency is bounded by the camera's own GOP — set it with
+  `CONFIG_ESP_VIDEO_UVC_H264_IFRAME_PERIOD_MS`.
+- **`video_capture_get_snapshot*()` return `ESP_ERR_NOT_SUPPORTED`** — the JPEG
+  snapshot path is built on `esp_image_effects`.
+
+What still works: SPS/PPS caching and prepending onto every IDR that lacks them,
+IDR resync gating after a drop, and the sink registry.
+
+### Capture resolution on UVC
+
+Ask for a resolution with `CONFIG_MEDIA_STREAM_UVC_CAPTURE_WIDTH/HEIGHT`, or by setting
+one on the capture interface before `init`. `configure_camera_format()` requests that
+size first and only falls through a list of fixed fallbacks if the camera rejects it.
+
+Resolution is not free, so ask for the smallest one that meets your needs: capture
+buffers are sized from it (`compressed_buffer_size()`, capped at 1 MB, `BUFFER_COUNT`
+of them), and the USB isochronous transfer buffers scale with the negotiated
+per-microframe payload and come out of **internal DMA RAM** — `3 × 12240 B` at 1080p
+against roughly 6 KB at 640x480. An over-large capture starves unrelated allocations
+long before it starves the camera; TLS handshake failures are the usual first symptom.
 
 ### A target with no BSP of its own
 
@@ -274,6 +317,32 @@ The c-series is a third case and is still spelled out separately where it matter
 `bsp_selector` is not a dependency there at all (`target not in [esp32c5, esp32c6]` in
 `idf_component.yml`), so `bsp/esp-bsp.h` does not exist and no `BSP_SELECT_*` symbol is
 defined — `!CONFIG_BSP_SELECT_ESP_BSP_DEVKIT` alone would wrongly read as "has a board".
+
+### A UVC camera does not survive being cut off mid-stream
+
+A soft reset does not drop VBUS, so the camera keeps streaming into a host that has
+vanished, and comes back wedged: it either answers control transfers with a dead
+pipeline (every frame times out) or stops answering EP0 at all. Nothing on the host
+recovers it — only a physical replug does.
+
+`media_stream` therefore registers a shutdown handler that issues `VIDIOC_STREAMOFF` on
+the way out, putting the streaming interface back to alternate setting 0 — the stop the
+camera would otherwise never get. That covers every restart which runs shutdown
+handlers: `esp_restart()`, an OTA reboot, the `reboot` console command.
+
+It does **not** cover the EN pin or power loss, because nothing tells us in time. A
+camera killed that way still needs its cable pulled, and no software change will alter
+that.
+
+### `USBH: Dev N EP 0 STALL` on every boot
+
+Harmless, and worth knowing before chasing it. The camera does not implement the UVC
+on-demand key-frame control (`UVC_VS_GENERATE_KEY_FRAME_CONTROL`), so the `SET_CUR` that
+probes it STALLs and USBH prints that at ERROR. The answer is cached — one line per boot,
+never again — and key-frame spacing falls back to
+`CONFIG_ESP_VIDEO_UVC_H264_IFRAME_PERIOD_MS`. The probe cannot be skipped: `GET_INFO` on
+an unsupported control STALLs too, so support cannot be discovered without provoking it
+once.
 
 ## Video Player (receive path)
 

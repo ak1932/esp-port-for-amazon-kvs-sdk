@@ -305,7 +305,7 @@ static PVOID kvs_global_video_sender_thread(PVOID args)
         ESP_LOGI(TAG, "Video frame rate control: %" PRIu32 " fps (frame interval: %" PRIu64 " us)",
                  target_fps, frame_interval_us);
 
-        // video_rate_ctrl_enable(true);
+        video_rate_ctrl_enable(true);
 
 #if KVS_MEDIA_ENABLE_ADAPTIVE_BITRATE
         /* Get initial bitrate if get_bitrate is available */

@@ -38,6 +38,7 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include "esp_cache.h"
 #include "esp_heap_caps.h"
 #include "driver/i2c_master.h"
@@ -339,7 +340,7 @@ static void requeue_used_buffers(v4l2_src_t *v4l2)
  *
  * esp_video_config_buffer() honours sizeimage for JPEG/H264 and otherwise falls back to
  * width * height * bpp / 8 with bpp = 8, i.e. one byte per pixel - far too small.
- *
+ */
 #ifndef CONFIG_MEDIA_STREAM_UVC_COMPRESSED_FRAME_MAX_KB
 #define CONFIG_MEDIA_STREAM_UVC_COMPRESSED_FRAME_MAX_KB 1024
 #endif
@@ -464,9 +465,6 @@ static video_fb_t *video_fb_get_cb(void *cb_ctx)
             v4l2->fb.height = g_current_resolution.height;
             v4l2->v4l2_buf[buf.index] = buf;
 
-            /* Compressed frames have arbitrary lengths; esp_cache_msync() requires a
-             * cache-line-aligned size and floods the log (and starves the system into
-             * an interrupt WDT) when given a raw frame length. */
             /* Compressed frames have arbitrary lengths and esp_cache_msync() requires a
              * cache-line-aligned size, but the rounded-up length must not run past the
              * buffer or the sync covers memory that is not ours. */
@@ -474,7 +472,14 @@ static video_fb_t *video_fb_get_cb(void *cb_ctx)
             if (sync_len > v4l2->buffer_size[buf.index]) {
                 sync_len = v4l2->buffer_size[buf.index] & ~63U;
             }
+#if MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR
+            /* No invalidate on the USB-UVC path - it would destroy the frame. */
+            (void) sync_len;
+#else
+            /* v4l2->fb.buf, not fb->buf: there is no `fb` in scope here. This branch is
+             * only compiled for CSI/DVP */
             esp_cache_msync(v4l2->fb.buf, sync_len, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
+#endif
 
             us = esp_timer_get_time();
             v4l2->fb.timestamp.tv_sec = us / 1000000UL;
@@ -1451,6 +1456,23 @@ static void enable_verbose_driver_logs(void)
 }
 #endif /* CONFIG_ESP_VIDEO_IF_VERBOSE_DRIVER_LOGS */
 
+#if MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR
+/* Leave the camera stopped when the SoC restarts.
+ *
+ * A UVC camera interrupted mid-stream does not recover. A soft reset does not drop VBUS,
+ * so the camera keeps running while the host that was draining it disappears, and it comes
+ * back in an unrecoverable states. So always shut it down on shutdown
+ */
+static void video_if_shutdown_stop_camera(void)
+{
+    if (g_v4l2 && g_v4l2->cap_fd >= 0) {
+        ESP_LOGI(TAG, "Shutdown camera...");
+        int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        ioctl(g_v4l2->cap_fd, VIDIOC_STREAMOFF, &type);
+    }
+}
+#endif
+
 esp_err_t esp_video_if_init(void)
 {
 #if CONFIG_ESP_VIDEO_IF_VERBOSE_DRIVER_LOGS
@@ -1459,7 +1481,14 @@ esp_err_t esp_video_if_init(void)
 
     if (g_v4l2) {
         ESP_LOGD(TAG, "video interface already initialized, restarting streaming");
-        return esp_video_if_start();
+        esp_err_t restart_ret = esp_video_if_start();
+        if (restart_ret != ESP_OK) {
+            /* Do not leave g_v4l2 pointing at a half-built device. */
+            ESP_LOGE(TAG, "restart failed (%s); tearing the video interface down",
+                     esp_err_to_name(restart_ret));
+            esp_video_if_cleanup();
+        }
+        return restart_ret;
     }
 
 #if CONFIG_CODEC_I2C_BACKWARD_COMPATIBLE
@@ -1492,6 +1521,19 @@ esp_err_t esp_video_if_init(void)
         return ESP_FAIL;
     }
     g_v4l2 = v4l2;
+
+#if MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR
+    /* Once per process; esp_register_shutdown_handler() rejects a duplicate. */
+    static bool s_shutdown_handler_registered;
+    if (!s_shutdown_handler_registered) {
+        if (esp_register_shutdown_handler(video_if_shutdown_stop_camera) == ESP_OK) {
+            s_shutdown_handler_registered = true;
+        } else {
+            ESP_LOGW(TAG, "could not register the shutdown handler; a restart while streaming "
+                          "will leave the UVC camera needing a replug");
+        }
+    }
+#endif
 
     if (esp_video_if_start() != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start video");

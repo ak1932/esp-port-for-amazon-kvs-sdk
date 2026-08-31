@@ -1,6 +1,6 @@
 --- a/uvc_control.c
 +++ b/uvc_control.c
-@@ -103,6 +103,171 @@
+@@ -104,6 +104,222 @@
      return ret;
  }
  
@@ -16,6 +16,13 @@
 +
 +#define UVCX_HINT_BITRATE         0x0002
 +#define UVCX_HINT_IFRAME_PERIOD   0x2000
++
++/* The configured bitrate is a budget for this reference resolution.
++ * uvc_host_stream_h264_set_rate() scales it to whatever the stream actually negotiated, so a
++ * change of capture resolution carries its own budget with it. */
++#define UVCX_H264_BITRATE_REF_W      1280u
++#define UVCX_H264_BITRATE_REF_H      720u
++#define UVCX_H264_BITRATE_REF_PIXELS (UVCX_H264_BITRATE_REF_W * UVCX_H264_BITRATE_REF_H)
 +
 +typedef struct __attribute__((packed)) {
 +    uint32_t dwFrameInterval;
@@ -126,7 +133,46 @@
 +    ESP_LOGI(TAG, "camera H.264 config: %ux%u, %" PRIu32 " bps, IFramePeriod %u ms, rc_mode %u",
 +             cfg.wWidth, cfg.wHeight, cfg.dwBitRate, cfg.wIFramePeriod, cfg.bRateControlMode);
 +
++    /* The H.264 config carries its own resolution, and per the UVC H.264 payload spec it
++     * must match the frame descriptor the stream was committed to. A camera whose encoder
++     * still says 1920x1080 while the stream negotiated 640x480 rejects the whole probe -
++     * silently, by returning its current values from the read-back - and then produces no
++     * payloads at all. So make the resolution follow whatever the stream actually
++     * negotiated rather than leaving the camera's default in place. */
++    uvc_host_stream_format_t stream_fmt = {0};
++    if (uvc_host_stream_format_get(stream_hdl, &stream_fmt) == ESP_OK &&
++            stream_fmt.h_res && stream_fmt.v_res) {
++        if (cfg.wWidth != stream_fmt.h_res || cfg.wHeight != stream_fmt.v_res) {
++            ESP_LOGI(TAG, "H.264 XU resolution %ux%u -> %ux%u (matching the negotiated stream)",
++                     cfg.wWidth, cfg.wHeight, stream_fmt.h_res, stream_fmt.v_res);
++        }
++        cfg.wWidth  = stream_fmt.h_res;
++        cfg.wHeight = stream_fmt.v_res;
++    }
++
++    /* Scale the budget to the resolution negotiated just above.
++     *
++     * Resolution and bitrate used to be set independently here: wWidth/wHeight followed the
++     * stream, dwBitRate did not. A 1080p stream then ran on a budget chosen for 720p, and a
++     * camera's rate controller holds bits-per-pixel roughly constant - so it sheds frame rate
++     * instead, 30 fps becoming ~13. That surfaces as a frame-rate fault a long way from its
++     * cause, which is why the scaling belongs next to the resolution it depends on.
++     *
++     * Linear in pixel count only. It deliberately does not model frame rate: what the camera
++     * actually delivers is not reliably ours to know, and a wrong fps term would only be a
++     * second silent scaling error of the same shape. */
 +    if (bitrate_bps) {
++        const uint32_t pixels = (uint32_t) cfg.wWidth * (uint32_t) cfg.wHeight;
++
++        if (pixels && pixels != UVCX_H264_BITRATE_REF_PIXELS) {
++            const uint32_t scaled =
++                (uint32_t) (((uint64_t) bitrate_bps * pixels) / UVCX_H264_BITRATE_REF_PIXELS);
++            ESP_LOGI(TAG, "H.264 bitrate %" PRIu32 " -> %" PRIu32 " bps for %ux%u "
++                          "(configured value is the budget at %ux%u)",
++                     bitrate_bps, scaled, cfg.wWidth, cfg.wHeight,
++                     UVCX_H264_BITRATE_REF_W, UVCX_H264_BITRATE_REF_H);
++            bitrate_bps = scaled;   /* also what the clamp check below compares against */
++        }
 +        cfg.dwBitRate = bitrate_bps;
 +        cfg.bmHints |= UVCX_HINT_BITRATE;
 +    }
@@ -145,8 +191,13 @@
 +                                  UVC_SET_CUR, &cfg, sizeof(cfg)),
 +                        TAG, "H.264 XU commit rejected");
 +
-+    ESP_LOGI(TAG, "camera H.264 committed: %" PRIu32 " bps, IFramePeriod %u ms",
-+             cfg.dwBitRate, cfg.wIFramePeriod);
++    ESP_LOGI(TAG, "camera H.264 committed: %ux%u, %" PRIu32 " bps, IFramePeriod %u ms",
++             cfg.wWidth, cfg.wHeight, cfg.dwBitRate, cfg.wIFramePeriod);
++    if ((bitrate_bps && cfg.dwBitRate != bitrate_bps) ||
++            (iframe_period_ms && cfg.wIFramePeriod != iframe_period_ms)) {
++        ESP_LOGW(TAG, "camera kept its own values (asked %" PRIu32 " bps / %u ms) - it clamped or "
++                      "rejected the request", bitrate_bps, iframe_period_ms);
++    }
 +    return ESP_OK;
 +}
 +
@@ -174,10 +225,11 @@
      return uvc_host_stream_control(stream_hdl, vs_control, (uvc_host_stream_format_t *)vs_format, UVC_SET_CUR, false);
 --- a/include/usb/uvc_host.h
 +++ b/include/usb/uvc_host.h
-@@ -305,6 +305,39 @@
-  *     - ESP_ERR_INVALID_ARG: stream_hdl is NULL
-  *     - Else: USB lib error
-  */
+@@ -325,7 +325,40 @@
+  *      - ESP_OK on success
+  *      - ESP_ERR_INVALID_ARG if stream_hdl is NULL
+  *      - Other error codes from the USB Host library
++ */
 +/**
 + * @brief Ask the camera to emit a key frame now
 + *
@@ -190,7 +242,7 @@
 + *     - ESP_OK: key frame requested
 + *     - ESP_ERR_INVALID_ARG: invalid handle
 + *     - ESP_ERR_NOT_SUPPORTED / ESP_ERR_INVALID_RESPONSE: camera rejected the control
-+ */
+  */
 +/**
 + * @brief Set bitrate and key-frame period on a camera's own H.264 encoder
 + *

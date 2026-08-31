@@ -98,15 +98,6 @@ CONFIG_MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR=y
 CONFIG_MEDIA_STREAM_UVC_CAPTURE_WIDTH=1280
 CONFIG_MEDIA_STREAM_UVC_CAPTURE_HEIGHT=720
 
-# A soft reset (EN pin, esp_restart(), debugger) restarts the SoC without dropping
-# VBUS, so a UVC camera comes back holding its previous session: its first control
-# request STALLs and the frames that follow are stale. esp_video now installs the
-# USB host with the root port unpowered and powers it on after this delay, so every
-# boot enumerates the camera from a cold start. Raise it if a camera still comes up
-# holding its old session.
-#
-CONFIG_ESP_VIDEO_UVC_PORT_POWER_OFF_MS=1500
-
 CONFIG_ESP_VIDEO_UVC_H264_BITRATE_BPS=800000
 CONFIG_ESP_VIDEO_UVC_H264_IFRAME_PERIOD_MS=1000
 

@@ -94,6 +94,18 @@ esp_err_t esp_video_if_get_resolution(video_resolution_t *resolution);
 esp_err_t esp_video_if_get_pixel_format(uint32_t *pixelformat);
 
 /**
+ * @brief Request an immediate key frame from a UVC camera that encodes for us.
+ *
+ * Defined by esp_video's UVC device (managed-component patch 0003), which does not
+ * export a declaration of its own - hence this one.
+ *
+ * @return ESP_OK if the camera was asked, ESP_ERR_INVALID_STATE if no stream is
+ *         running, or an error if the camera rejected the control (the caller then
+ *         stops asking).
+ */
+esp_err_t esp_video_uvc_request_key_frame(void);
+
+/**
  * @brief Set desired resolution before init (called by video_capture_adapter)
  *
  * @param resolution Desired resolution (width, height, fps). Use 0 for width/height to use defaults.

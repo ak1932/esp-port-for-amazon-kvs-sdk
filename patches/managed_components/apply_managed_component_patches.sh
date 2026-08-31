@@ -60,7 +60,12 @@ apply_one() {
         return 0
     fi
 
-    if patch -p1 -d "$target_dir" --dry-run --reverse --force < "$patch" >/dev/null 2>&1; then
+    # --fuzz=0 throughout: a hunk that only matches with fuzz is a hunk whose context has
+    # drifted, and patch will happily land it somewhere plausible but wrong. That is how
+    # 0003's Kconfig hunk once got applied against the wrong anchor, silently dropping the
+    # config it was supposed to add - the build then failed on an undeclared CONFIG_ symbol
+    # a long way from the cause. Fail loudly and rebase the patch instead.
+    if patch -p1 -d "$target_dir" --dry-run --reverse --force --fuzz=0 < "$patch" >/dev/null 2>&1; then
         echo "already applied: $(basename "$patch")"
         return 0
     fi
@@ -70,23 +75,38 @@ apply_one() {
     APPLIED_ANY=1
 }
 
-# usb_host_uvc: cameras that never set the EoF payload flag (observed on a Logitech H.264
-# stream) lose every frame, because the isoc path only completes a frame on EoF and resets
-# the buffer at the frame-ID toggle. Upstream fixed the equivalent bulk case in 2.5.1; the
-# isoc path is still affected as of 2.5.1.
+# usb_host_uvc: two upstream isoc fixes that are merged in esp-usb but unreleased as of
+# 2.5.1, taken verbatim from that tree:
+#   - 23ad9ed "complete an isoc frame on the frame-ID toggle when EOF is absent" - cameras
+#     that never set EoF otherwise lose every frame at the frame-ID toggle.
+#   - c04d1c7 "handle payload errors and buffer sizing" - an EMPTY isoc packet fails
+#     payload-header validation and used to set skip_current_frame, poisoning the frame in
+#     progress. A low-bitrate stream (H.264) is mostly empty packets, so every frame is
+#     discarded; a high-bitrate one (YUYV) has few and survives. Also makes the ERR-bit
+#     check configurable via CONFIG_UVC_CHECK_PAYLOAD_HEADER_ERR.
+# Drop this patch once a release above 2.5.1 carries both.
 apply_one "$PATCH_DIR/0001-usb_host_uvc-complete-frame-on-frame-id-toggle.patch" \
-          "$MC/espressif__usb_host_uvc" "2.4.2" "usb_host_uvc"
+          "$MC/espressif__usb_host_uvc" "2.5.1" "usb_host_uvc"
 
 # usb_host_uvc: reach the camera's own H.264 encoder (bitrate, key-frame period) through the
 # H.264 extension unit, and ask for a key frame on demand. Without this the camera streams at
 # whatever rate it likes with a multi-second GOP.
 apply_one "$PATCH_DIR/0002-usb_host_uvc-h264-extension-unit-rate-control.patch" \
-          "$MC/espressif__usb_host_uvc" "2.4.2" "usb_host_uvc"
+          "$MC/espressif__usb_host_uvc" "2.5.1" "usb_host_uvc"
+
+# usb_host_uvc: pick the alternate setting that matches the payload size the camera
+# negotiated. uvc_claim_interface() has to run before the probe, so it caps on MAX_MPS_IN
+# and takes the largest endpoint the target supports (alt 11, 3 x 1020 = 3060 on the test
+# camera) while the probe then negotiates dwMaxPayloadTransferSize = 512 for H.264. Every
+# isoc packet comes back COMPLETED with zero bytes. Re-selecting after the probe picks
+# alt 3 (512) for H.264, alt 10 (2688) for YUYV, alt 11 at 1080p.
+apply_one "$PATCH_DIR/0004-usb_host_uvc-match-alt-setting-to-negotiated-payload.patch" \
+          "$MC/espressif__usb_host_uvc" "2.5.1" "usb_host_uvc"
 
 # esp_video: apply that configuration between format_select() and stream_start(), which is the
 # only point the camera accepts it.
 apply_one "$PATCH_DIR/0003-esp_video-apply-uvc-h264-config-before-stream-start.patch" \
-          "$MC/espressif__esp_video" "2.0.1" "esp_video"
+          "$MC/espressif__esp_video" "2.4.1" "esp_video"
 
 if [ "$APPLIED_ANY" -eq 1 ]; then
     echo "done (patches applied - a re-configure is required, see exit codes above)"

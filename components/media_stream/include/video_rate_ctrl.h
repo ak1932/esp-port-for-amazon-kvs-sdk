@@ -73,9 +73,12 @@ typedef struct video_rate_ctrl_s *video_rate_ctrl_handle_t;
  *                        no controller ever asks for more
  * @param width           Encoded width, for logs and diagnostics
  * @param height          Encoded height, for logs and diagnostics
+ * @param fps_actuable    Whether frame rate is ours to lower. True when we own the
+ *                        encoder and can drop a RAW frame before encode. False on
+ *                        UVC H.264 passthrough
  */
 void video_rate_ctrl_init(uint32_t camera_fps, uint32_t max_bitrate_bps,
-                          uint32_t width, uint32_t height);
+                          uint32_t width, uint32_t height, bool fps_actuable);
 
 /**
  * @brief Create a controller for one sink
@@ -192,10 +195,14 @@ bool video_rate_ctrl_should_encode(void);
 /**
  * @brief Fetch a new encoder bitrate to apply, or 0 if unchanged
  *
- * Reflects the strict minimum across all eligible controllers. The grabber
- * applies it with esp_h264_hw_enc_set_bitrate().
+ * Reflects the strict minimum across all eligible controllers. The grabber applies it
+ * with esp_h264_hw_enc_set_bitrate(), or - on UVC H.264 passthrough, where this is the
+ * only lever - to the camera's own encoder.
  *
- * Lock-free; call from the encoder task only.
+ * Also where controller staleness is noticed, so a path that does not call
+ * should_encode() still drops a silent sink from arbitration. Call from the encoder task
+ * only. Declining to call it is safe: the pending target is held until taken, so a
+ * caller that rate limits itself delays a change rather than losing it.
  */
 uint32_t video_rate_ctrl_pull_bitrate_bps(void);
 

@@ -136,10 +136,36 @@ signal actually moves before turning a controller on; the WebRTC sink in
 stale and dropped from the minimum — it keeps its rung, so it resumes where it
 left off — which is what stops a wedged sender from pinning the encoder.
 
-On UVC H.264 passthrough none of this applies: the camera owns bitrate and
-keyframes, so `video_rate_ctrl_init()` is never called and every controller stays
-inert. `video_rate_ctrl_get_stats()` reports every controller plus the arbitrated
-result; the `kvs_combined` example prints it from `sink-stats`.
+**On UVC H.264 passthrough, half of this applies.** The two columns of the ladder are
+not equally available once the camera is the encoder:
+
+| | Raw capture (we encode) | UVC H.264 passthrough |
+|---|---|---|
+| fps | `video_rate_ctrl_should_encode()` drops a **raw** frame before encode | **never** — see below |
+| bitrate | `esp_h264_hw_enc_set_bitrate()` | the camera's H.264 extension unit |
+
+fps is not a lever there and cannot be made into one. Lowering fps works upstream of
+an encoder we own; a passthrough frame is already encoded, and dropping one corrupts
+everything up to the next IDR. So `video_rate_ctrl_init()` is told `fps_actuable =
+false`, every rung then reports the native rate, and `sink-stats` shows no fps
+reduction — because there is none.
+
+Bitrate *is* a lever, through `esp_video_uvc_ctrl.h` (added by
+`patches/managed_components/0002` and `0003`). The ladder's L0 is seeded from the
+bitrate the camera **committed** at stream start, not from what we asked for, since a
+camera clamps freely and no controller may ask for more than it already agreed to.
+Commits are rate limited to one per 2 s: each is three synchronous EP0 control
+transfers on the task that also dispatches to every sink. Nothing is lost to the
+limit — the pending target is held until pulled, so a rung change is delayed, not
+dropped.
+
+A camera with **no usable extension unit has no lever at all**. Then
+`video_rate_ctrl_init()` is not called, every controller stays inert exactly as
+before, and PutMedia's deep upload queue is the only slack in the system. The log
+says so once at stream start; do not read an inert controller as a working one.
+
+`video_rate_ctrl_get_stats()` reports every controller plus the arbitrated result;
+the `kvs_combined` example prints it from `sink-stats`.
 
 ### Lifecycle
 

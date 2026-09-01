@@ -30,12 +30,10 @@ static const char *TAG __attribute__((unused)) = "H264FrameGrabber";
 #if CONFIG_IDF_TARGET_ESP32S3
 #include "app_camera_esp.h"
 #include "esp_h264_enc_single_sw.h"
-#include "esp_h264_enc_single.h"
 #else
 #include "esp_h264_hw_enc.h"
-#if MEDIA_STREAM_HAS_HW_H264_ENC
-#include "esp_h264_enc_single.h"
-#endif
+#include "esp_video_if_cam_sel.h"   /* MEDIA_STREAM_ENABLE_*_CAM_SENSOR selection */
+#include "esp_video_uvc_ctrl.h"
 extern esp_err_t esp32p4_frame_grabber_init(video_frame_preprocess_fn_t);
 extern esp_err_t esp32p4_frame_grabber_start(void);
 extern esp_err_t esp32p4_frame_grabber_stop(void);
@@ -433,13 +431,12 @@ esp_h264_out_buf_t *get_h264_encoded_frame(void)
 esp_err_t video_capture_set_bitrate(video_capture_handle_t handle, uint32_t bitrate_kbps)
 {
     (void) handle;
-#if MEDIA_STREAM_HAS_HW_H264_ENC
-    return esp_h264_hw_enc_set_bitrate(bitrate_kbps * 1000);
+#if MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR && CONFIG_MEDIA_STREAM_UVC_PASSTHROUGH_H264
+    /* Three synchronous EP0 control transfers and it runs concurrently with the encoder task's own
+     * commits. Fine for an occasional caller; not for anything per frame. */
+    return esp_video_uvc_set_h264_bitrate(bitrate_kbps * 1000, NULL);
 #else
-    /* The camera encodes and owns its own bitrate; the UVC host driver exposes no
-     * encoding-unit control to change it. */
-    (void) bitrate_kbps;
-    return ESP_ERR_NOT_SUPPORTED;
+    return esp_h264_hw_enc_set_bitrate(bitrate_kbps * 1000);
 #endif
 }
 
@@ -449,12 +446,18 @@ esp_err_t video_capture_get_bitrate(video_capture_handle_t handle, uint32_t *bit
     if (bitrate_kbps == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
-#if MEDIA_STREAM_HAS_HW_H264_ENC
-    *bitrate_kbps = esp_h264_hw_enc_get_bitrate() / 1000;
+#if MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR && CONFIG_MEDIA_STREAM_UVC_PASSTHROUGH_H264
+    /* What the camera committed, which is the only bitrate anyone here knows. */
+    uint32_t bps = 0;
+    esp_err_t err = esp_video_uvc_get_h264_committed_bitrate(&bps);
+    if (err != ESP_OK) {
+        return err;
+    }
+    *bitrate_kbps = bps / 1000;
     return ESP_OK;
 #else
-    *bitrate_kbps = 0;
-    return ESP_ERR_NOT_SUPPORTED;
+    *bitrate_kbps = esp_h264_hw_enc_get_bitrate() / 1000;
+    return ESP_OK;
 #endif
 }
 

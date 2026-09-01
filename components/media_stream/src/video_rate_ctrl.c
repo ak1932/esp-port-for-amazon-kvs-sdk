@@ -152,6 +152,11 @@ static SemaphoreHandle_t        s_lock;
 /* Encoder-wide state. Written under s_lock. */
 static struct {
     bool     inited;
+    /* False when the frame rate is not ours to change: the camera hands us
+     * already-encoded H.264, so the only way to drop fps would be to discard
+     * encoded frames, which breaks the reference chain. The ladder's fps column
+     * is then pinned to the native rate and only its bitrate column moves. */
+    bool     fps_actuable;
     uint32_t camera_fps;
     uint32_t width;
     uint32_t height;
@@ -197,6 +202,14 @@ static uint32_t vrate_rung_bitrate(uint32_t level)
 
 static uint32_t vrate_rung_fps(uint32_t level)
 {
+    if (!s_agg.fps_actuable) {
+        /* Every rung reports the native rate, so arbitration's minimum equals
+         * camera_fps and video_rate_ctrl_should_encode() takes its target >= cam
+         * short circuit - no skipping, and get_stats() shows no fps reduction
+         * that is not happening. */
+        return s_agg.camera_fps;
+    }
+
     uint32_t f = LADDER[level].fps;
     if (f == 0) {
         f = s_agg.camera_fps;   /* L0 sentinel: run at whatever the sensor delivers */
@@ -384,7 +397,7 @@ static void vrate_reset_healthy(struct video_rate_ctrl_s *h)
 /* ------------------------------------------------------------------------- */
 
 void video_rate_ctrl_init(uint32_t camera_fps, uint32_t max_bitrate_bps,
-                          uint32_t width, uint32_t height)
+                          uint32_t width, uint32_t height, bool fps_actuable)
 {
     if (vrate_lock_init() != ESP_OK) {
         return;
@@ -393,6 +406,7 @@ void video_rate_ctrl_init(uint32_t camera_fps, uint32_t max_bitrate_bps,
 
     vrate_lock();
     s_agg.camera_fps      = camera_fps ? camera_fps : 25;
+    s_agg.fps_actuable    = fps_actuable;
     s_agg.width           = width;
     s_agg.height          = height;
     s_agg.max_bitrate_bps = max_bitrate_bps;
@@ -426,9 +440,10 @@ void video_rate_ctrl_init(uint32_t camera_fps, uint32_t max_bitrate_bps,
     uint32_t flr = s_agg.min_bitrate_bps;
     vrate_unlock();
 
-    ESP_LOGI(TAG, "init: cam_fps=%" PRIu32 " res=%" PRIu32 "x%" PRIu32
+    ESP_LOGI(TAG, "init: cam_fps=%" PRIu32 "%s res=%" PRIu32 "x%" PRIu32
              " max=%" PRIu32 "bps floor=%" PRIu32 "bps, %" PRIu32 " controller(s) adapting",
-             cam, width, height, max_bitrate_bps, flr, seeded);
+             cam, fps_actuable ? "" : " (fixed - bitrate only)",
+             width, height, max_bitrate_bps, flr, seeded);
 }
 
 esp_err_t video_rate_ctrl_create(const char *name, video_rate_ctrl_handle_t *out)
@@ -827,6 +842,13 @@ bool video_rate_ctrl_should_encode(void)
 
 uint32_t video_rate_ctrl_pull_bitrate_bps(void)
 {
+    /* Staleness is checked here as well as in should_encode(), because the UVC
+     * passthrough path never calls should_encode() - it has no fps lever - and this pull
+     * is its only per-frame touchpoint. Without this a sink that stopped reporting would
+     * keep the camera pinned at its last rung forever. Idempotent and near-free: the
+     * deadline compare is one atomic load in the common case. */
+    vrate_expire_if_due(esp_timer_get_time());
+
     return atomic_exchange(&s_pending_bitrate, 0);
 }
 

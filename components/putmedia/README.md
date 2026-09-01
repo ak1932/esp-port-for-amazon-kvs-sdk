@@ -44,10 +44,13 @@ dropped for want of a slot corrupts the whole cluster it belonged to, so overflo
 every frame up to the next key frame. And `xQueueCreate()` allocates from internal RAM, so
 the depth costs `depth * 24` bytes up front — about 24 KB at 1024 — before any payload.
 
-ESP32-S31 gets the larger default because it runs the camera's H.264 through untouched: the
-sensor owns bitrate and GOP length there, so nothing can throttle the producer when the
-uplink slows, and the queue is the only slack in the system. Targets that own the encoder
-shed load upstream instead.
+ESP32-S31 gets the larger default because it runs the camera's H.264 through untouched, and
+on that path how much can be throttled depends on the camera. Frame rate never can — a
+passthrough frame is already encoded, so dropping one corrupts the stream to the next IDR.
+Bitrate can, *if* the camera exposes a usable UVC H.264 extension unit; `media_stream`
+drives it there (see `components/media_stream/README.md`). On a camera without one nothing
+can be throttled at all and this queue is the only slack in the system, which is the case
+the large default is sized for. Targets that own the encoder shed load upstream instead.
 
 `put_media_config_t.uUploadQueueDepth` overrides it per instance; zero selects the Kconfig
 value.

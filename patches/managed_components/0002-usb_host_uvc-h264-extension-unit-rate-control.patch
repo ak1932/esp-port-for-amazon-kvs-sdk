@@ -1,9 +1,11 @@
 --- a/uvc_control.c
 +++ b/uvc_control.c
-@@ -104,6 +104,222 @@
+@@ -101,8 +101,176 @@
+         vs_format->fps    = UVC_DESC_DWFRAMEINTERVAL_TO_FPS(vs_control->dwFrameInterval);
+     }
      return ret;
- }
- 
++}
++
 +/* UVC H.264 Extension Unit (GUID A29E7641-DE04-47E3-8B2B-F4341AFF003B), as defined by
 + * the USB Video Class H.264 payload spec and implemented by H.264-capable UVC cameras.
 + * It is the only way to reach the camera's own encoder settings: bitrate and key-frame
@@ -107,10 +109,10 @@
 +        }
 +    }
 +    return ESP_ERR_NOT_FOUND;
-+}
-+
+ }
+ 
 +esp_err_t uvc_host_stream_h264_set_rate(uvc_host_stream_hdl_t stream_hdl, uint32_t bitrate_bps,
-+                                        uint16_t iframe_period_ms)
++                                        uint16_t iframe_period_ms, uint32_t *committed_bps)
 +{
 +    UVC_CHECK(stream_hdl != NULL, ESP_ERR_INVALID_ARG);
 +    uvc_stream_t *uvc_stream = (uvc_stream_t *) stream_hdl;
@@ -191,12 +193,10 @@
 +                                  UVC_SET_CUR, &cfg, sizeof(cfg)),
 +                        TAG, "H.264 XU commit rejected");
 +
-+    ESP_LOGI(TAG, "camera H.264 committed: %ux%u, %" PRIu32 " bps, IFramePeriod %u ms",
-+             cfg.wWidth, cfg.wHeight, cfg.dwBitRate, cfg.wIFramePeriod);
-+    if ((bitrate_bps && cfg.dwBitRate != bitrate_bps) ||
-+            (iframe_period_ms && cfg.wIFramePeriod != iframe_period_ms)) {
-+        ESP_LOGW(TAG, "camera kept its own values (asked %" PRIu32 " bps / %u ms) - it clamped or "
-+                      "rejected the request", bitrate_bps, iframe_period_ms);
++    ESP_LOGI(TAG, "camera H.264 committed: %" PRIu32 " bps, IFramePeriod %u ms",
++             cfg.dwBitRate, cfg.wIFramePeriod);
++    if (committed_bps != NULL) {
++        *committed_bps = cfg.dwBitRate;
 +    }
 +    return ESP_OK;
 +}
@@ -225,10 +225,10 @@
      return uvc_host_stream_control(stream_hdl, vs_control, (uvc_host_stream_format_t *)vs_format, UVC_SET_CUR, false);
 --- a/include/usb/uvc_host.h
 +++ b/include/usb/uvc_host.h
-@@ -325,7 +325,40 @@
-  *      - ESP_OK on success
-  *      - ESP_ERR_INVALID_ARG if stream_hdl is NULL
-  *      - Other error codes from the USB Host library
+@@ -304,7 +304,49 @@
+  *     - ESP_OK: Success - streaming stopped
+  *     - ESP_ERR_INVALID_ARG: stream_hdl is NULL
+  *     - Else: USB lib error
 + */
 +/**
 + * @brief Ask the camera to emit a key frame now
@@ -253,13 +253,22 @@
 + *
 + * The unit is located by its GUID, so no per-camera configuration is needed.
 + *
-+ * @param[in] stream_hdl       UVC handle obtained from uvc_host_stream_open()
-+ * @param[in] bitrate_bps      Target bitrate, 0 to leave unchanged
-+ * @param[in] iframe_period_ms Key-frame period in ms, 0 to leave unchanged
++ * Safe to call again while streaming, which is what makes closed-loop rate control
++ * possible: pass 0 for the values you do not want to disturb. Each call is a
++ * PROBE/PROBE/COMMIT round trip on the control endpoint, so it is not something to do
++ * at frame rate - the caller is expected to rate limit.
++ *
++ * @param[in]  stream_hdl       UVC handle obtained from uvc_host_stream_open()
++ * @param[in]  bitrate_bps      Target bitrate, 0 to leave unchanged
++ * @param[in]  iframe_period_ms Key-frame period in ms, 0 to leave unchanged
++ * @param[out] committed_bps    If non-NULL, receives the bitrate the camera actually
++ *                              agreed to, which may be clamped well away from the
++ *                              request. Treat it as a report, not a guarantee: a camera
++ *                              whose pipeline has died accepts these writes silently.
 + * @return ESP_OK if the camera committed the configuration
-+ */
+  */
 +esp_err_t uvc_host_stream_h264_set_rate(uvc_host_stream_hdl_t stream_hdl, uint32_t bitrate_bps,
-+                                        uint16_t iframe_period_ms);
++                                        uint16_t iframe_period_ms, uint32_t *committed_bps);
 +
 +esp_err_t uvc_host_stream_request_key_frame(uvc_host_stream_hdl_t stream_hdl);
 +

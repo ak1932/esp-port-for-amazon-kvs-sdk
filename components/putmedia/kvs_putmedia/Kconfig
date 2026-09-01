@@ -27,11 +27,14 @@ menu "AWS KVS PutMedia"
               which is memory and latency both.
 
             The larger default on ESP32-S31 follows from that target's UVC H.264
-            passthrough path: the camera owns bitrate, GOP length and key-frame
-            placement there, so video_rate_ctrl cannot throttle the producer when
-            the uplink slows down, and the queue is the only thing left to absorb
-            a stall. Targets that own the encoder shed load upstream instead, and
-            do not need the depth.
+            passthrough path, where how much can be throttled depends on the
+            camera. Frame rate never can: a passthrough frame is already encoded,
+            so dropping one corrupts the stream to the next IDR. Bitrate can, but
+            only if the camera exposes a usable UVC H.264 extension unit. On a
+            camera without one, nothing throttles the producer when the uplink
+            slows down and this queue is the only thing left to absorb a stall -
+            which is the case this default is sized for. Targets that own the
+            encoder shed load upstream instead, and do not need the depth.
 
             put_media_config_t.uUploadQueueDepth overrides this at runtime; this
             value is what a zero in that field selects.

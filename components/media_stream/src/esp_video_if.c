@@ -1024,14 +1024,7 @@ esp_err_t esp_video_if_start(void)
 #if MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR
 #if CONFIG_MEDIA_STREAM_UVC_PASSTHROUGH_H264
     /* Pass the camera's own H.264 through untouched: no ISP, no hardware encoder, and
-     * PSRAM traffic drops by orders of magnitude versus raw capture.
-     *
-     * Only usable when the uplink can carry whatever bitrate the camera decides on. A
-     * UVC camera picks its own rate and the host driver exposes no encoding-unit control
-     * to change it - the camera measured here holds ~3 Mbps at every resolution from
-     * 320x240 to 1080p - so on a constrained link most frames lose a packet and the
-     * viewer's jitter buffer discards them. Prefer the raw path below unless the link is
-     * known to be fat. */
+     * PSRAM traffic drops by orders of magnitude versus raw capture. */
     uint32_t capture_fmt = V4L2_PIX_FMT_H264;
 #else
     /* Capture raw and encode locally, so bitrate, GOP length and PLI-driven keyframes

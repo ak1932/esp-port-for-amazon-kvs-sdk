@@ -34,6 +34,7 @@
 #include "esp_dma_utils.h"
 #include "video_rate_ctrl.h"
 #include "esp_video_if_cam_sel.h"   /* MEDIA_STREAM_ENABLE_*_CAM_SENSOR selection */
+#include "esp_video_uvc_ctrl.h"      /* camera-side encoder controls (patches 0002/0003) */
 
 #if !CONFIG_BSP_SELECT_ESP_BSP_DEVKIT
 /* Only the legacy (non-esp_video) camera path and the SDCARD_SAVE debug hook call
@@ -129,6 +130,20 @@ static size_t s_conv_buf_len;
 #if MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR && CONFIG_MEDIA_STREAM_UVC_PASSTHROUGH_H264
 static int64_t s_last_key_frame_us;
 static bool s_key_frame_ctrl_supported = true;
+
+/* Camera-side rate control. s_xu_rate_ctrl_supported latches false on the first refusal,
+ * the same one-shot discipline as s_key_frame_ctrl_supported: a camera without the
+ * extension unit answers every attempt with an EP0 STALL, and hammering the control
+ * endpoint of a UVC camera is how it gets into a state only a replug fixes. */
+static bool s_xu_rate_ctrl_supported;
+static int64_t s_last_xu_commit_us;
+
+/* Minimum spacing between bitrate commits. Each one is a PROBE/PROBE/COMMIT - three
+ * synchronous EP0 control transfers - on the very task that dispatches frames to every
+ * sink, so this is not something to do per rung change at frame rate. Coalescing costs
+ * nothing: video_rate_ctrl_pull_bitrate_bps() hands back the LATEST target, so skipping
+ * an intermediate rung just means arriving at the current one slightly later. */
+#define XU_COMMIT_MIN_INTERVAL_US   (2 * 1000 * 1000)
 #endif
 
 /* Camera bring-up can miss a transient window (USB enumeration in particular). */
@@ -893,6 +908,39 @@ static void video_encoder_task(void *arg)
                 s_last_key_frame_us = esp_timer_get_time();
             }
         }
+
+        /* Apply the arbitrated bitrate to the camera's own encoder. This is the entire
+         * actuation surface on this path - there is no fps half, so nothing here calls
+         * video_rate_ctrl_should_encode(): dropping an already-encoded frame would corrupt
+         * the stream to the next IDR, which is why video_rate_ctrl_init() was told
+         * fps_actuable = false and every rung reports the native rate.
+         *
+         * Deliberately rate limited: three EP0 control transfers on the task that also
+         * feeds every sink is not a per-frame cost. The check is on the PULL, not on what
+         * comes out of it, because the pending target is held until someone takes it - so
+         * declining to pull leaves the latest value waiting rather than discarding it, and
+         * a rung change is delayed, never lost. */
+        if (s_xu_rate_ctrl_supported &&
+            (esp_timer_get_time() - s_last_xu_commit_us) >= XU_COMMIT_MIN_INTERVAL_US) {
+            const uint32_t new_bps = video_rate_ctrl_pull_bitrate_bps();
+            if (new_bps != 0) {
+                s_last_xu_commit_us = esp_timer_get_time();
+                uint32_t committed = 0;
+                const esp_err_t rc_ret = esp_video_uvc_set_h264_bitrate(new_bps, &committed);
+                if (rc_ret == ESP_OK) {
+                    /* Logged, not fed back into the ladder. A camera whose pipeline has
+                     * died accepts these writes silently, so the committed value is a
+                     * report and the controller's own rung stays authoritative. */
+                    ESP_LOGD(TAG, "camera bitrate -> %" PRIu32 " bps (committed %" PRIu32 ")",
+                             new_bps, committed);
+                } else {
+                    ESP_LOGW(TAG, "camera refused a bitrate change (%s); camera-side rate "
+                                  "control disabled for this session",
+                             esp_err_to_name(rc_ret));
+                    s_xu_rate_ctrl_supported = false;
+                }
+            }
+        }
 #endif
 
         /* A P-frame that references a frame the viewer never got decodes to garbage,
@@ -1067,16 +1115,39 @@ esp_err_t esp32p4_frame_grabber_init(video_frame_preprocess_fn_t frame_preproces
 #endif
 
 #if MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR && CONFIG_MEDIA_STREAM_UVC_PASSTHROUGH_H264
-    /* The camera encodes for us, so neither the hardware encoder nor the rate
-     * controller has anything to do: setting the encoder up would open the H.264
-     * hardware and reserve a w*h*1.5 PSRAM output buffer (~3 MB at 1080p) that is never
-     * written, and the controller can only throttle by dropping frames, which breaks a
-     * compressed stream's reference chain.
+    /* The camera encodes for us, so the hardware encoder has nothing to do: setting it up
+     * would open the H.264 hardware and reserve a w*h*1.5 PSRAM output buffer (~3 MB at
+     * 1080p) that is never written.
      *
-     * Consequence worth knowing: the PLI -> force-IDR path lives in that encoder, so a
-     * viewer's PLI cannot shorten the wait for a key frame here - recovery is bounded by
-     * the camera's own GOP until the driver exposes UVC encoding-unit controls. */
-    ESP_LOGI(TAG, "UVC passthrough: hardware encoder and rate control stay idle");
+     * Rate control is a different question, and the answer is half yes. The FPS half is
+     * permanently unavailable: throttling by dropping frames works upstream of an encoder
+     * we own, but these frames are already encoded, and dropping one corrupts the stream
+     * up to the next IDR. The BITRATE half is available through the camera's own H.264
+     * extension unit - which is also where the bitrate committed at stream start came
+     * from, and no controller may ask for more than that.
+     *
+     * A camera without a usable extension unit has no lever at all, so the controller is
+     * left uninitialised exactly as before and PutMedia's deep upload queue stays the only
+     * slack in the system.
+     *
+     * Consequence worth knowing either way: the PLI -> force-IDR path lives in the
+     * hardware encoder, so a viewer's PLI cannot shorten the wait for a key frame here.
+     * Recovery is bounded by the periodic request below, or by the camera's own GOP. */
+    uint32_t xu_bps = 0;
+    if (esp_video_uvc_get_h264_committed_bitrate(&xu_bps) == ESP_OK && xu_bps > 0) {
+        s_xu_rate_ctrl_supported = true;
+        s_last_xu_commit_us = esp_timer_get_time();
+        video_rate_ctrl_init(cfg.enc_cfg.fps, xu_bps,
+                             cfg.enc_cfg.res.width, cfg.enc_cfg.res.height,
+                             /* fps_actuable = */ false);
+        ESP_LOGI(TAG, "UVC passthrough: hardware encoder idle, camera-side rate control "
+                      "active from %" PRIu32 " bps (bitrate only, fps fixed)", xu_bps);
+    } else {
+        s_xu_rate_ctrl_supported = false;
+        ESP_LOGW(TAG, "UVC passthrough: no usable H.264 extension unit, so nothing can be "
+                      "throttled - rate control stays idle and the upload queue is the "
+                      "only slack");
+    }
 #else
     esp_h264_setup_encoder(&cfg);
 
@@ -1084,7 +1155,8 @@ esp_err_t esp32p4_frame_grabber_init(video_frame_preprocess_fn_t frame_preproces
      * bitrate as stage 2, with recovery. Driven by send-latency reports
      * from kvs_media. */
     video_rate_ctrl_init(cfg.enc_cfg.fps, cfg.enc_cfg.rc.bitrate,
-                         cfg.enc_cfg.res.width, cfg.enc_cfg.res.height);
+                         cfg.enc_cfg.res.width, cfg.enc_cfg.res.height,
+                         /* fps_actuable = */ true);
 #endif
 
 #define ENC_TASK_STACK_SIZE     (5 * 1024)

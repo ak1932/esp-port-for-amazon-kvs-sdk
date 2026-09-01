@@ -1,6 +1,6 @@
 --- a/src/device/esp_video_usb_uvc_device.c
 +++ b/src/device/esp_video_usb_uvc_device.c
-@@ -348,6 +348,58 @@
+@@ -348,8 +348,56 @@
  fail0:
      xSemaphoreGive(device->ready_sem);
      return ret;
@@ -43,7 +43,28 @@
 +    }
 +    *bps = s_h264_committed_bps;
 +    return ESP_OK;
+ }
+ 
++esp_err_t esp_video_uvc_set_h264_bitrate(uint32_t bitrate_bps, uint32_t *committed_bps)
++{
++    if (s_active_stream_hdl == NULL) {
++        return ESP_ERR_INVALID_STATE;
++    }
++    if (s_h264_committed_bps == 0) {
++        return ESP_ERR_NOT_SUPPORTED;
++    }
++    /* iframe_period_ms = 0 leaves the key-frame period alone, so the short period
++     * committed at stream start survives every later bitrate change. */
++    return uvc_host_stream_h264_set_rate(s_active_stream_hdl, bitrate_bps, 0, committed_bps);
 +}
++
+ static esp_err_t uvc_video_start(struct esp_video *video, uint32_t type)
+ {
+     esp_err_t ret = ESP_OK;
+@@ -365,6 +413,23 @@
+         buffer->element[i].priv_data = NULL;
+         buffer_array[i] = buffer->element[i].buffer;
+     }
 +
 +esp_err_t esp_video_uvc_set_h264_bitrate(uint32_t bitrate_bps, uint32_t *committed_bps)
 +{
@@ -58,20 +79,42 @@
 +    return uvc_host_stream_h264_set_rate(s_active_stream_hdl, bitrate_bps, 0, committed_bps);
  }
  
- static esp_err_t uvc_video_start(struct esp_video *video, uint32_t type)
-@@ -402,11 +454,40 @@
-         .format = device->uvc_stream_format,
-     };
+     uvc_host_stream_config_t stream_config = {
+         .event_cb = uvc_event_callback,
+@@ -376,12 +441,7 @@
+             .pid = UVC_HOST_ANY_PID,
+             .uvc_stream_index = device->stream_index,
+         },
+-        .vs_format = {
+-            .h_res = device->frame_info[0].h_res,
+-            .v_res = device->frame_info[0].v_res,
+-            .fps = (float)UVC_INTERVAL_DENOMINATOR / (float)device->frame_info[0].default_interval,
+-            .format = device->frame_info[0].format,
+-        },
++        .vs_format = vs_format_selected,
+         .advanced = {
+             .number_of_frame_buffers = info->count,
+             .frame_size = info->size,
+@@ -395,18 +455,45 @@
+     device->stream_hdl = NULL;
+     ESP_GOTO_ON_ERROR(uvc_host_stream_open(&stream_config, 0, &device->stream_hdl), fail0, TAG, "Failed to open UVC stream");
+ 
+-    uvc_host_stream_format_t uvc_format = {
+-        .h_res = CAPTURE_VIDEO_GET_FORMAT_WIDTH(video),
+-        .v_res = CAPTURE_VIDEO_GET_FORMAT_HEIGHT(video),
+-        .fps = (float)UVC_INTERVAL_DENOMINATOR / (float)device->interval,
+-        .format = device->uvc_stream_format,
+-    };
++    uvc_host_stream_format_t uvc_format = vs_format_selected;
      ESP_GOTO_ON_ERROR(uvc_host_stream_format_select(device->stream_hdl, &uvc_format), fail1, TAG, "Failed to set UVC format");
 +    s_h264_committed_bps = 0;
 +#if CONFIG_ESP_VIDEO_UVC_H264_BITRATE_BPS > 0
 +    /* Bring the camera's own encoder into a range the uplink can carry, with a short
 +     * key-frame period so a joining viewer gets something decodable quickly. Both live in
-+     * the H.264 extension unit; cameras without it simply refuse and keep their defaults.
-+     *
-+     * The committed value is kept: it is what the camera agreed to, which may be clamped
-+     * well away from the request, and a rate controller must not later ask for more than
-+     * that. Leaving it 0 is how "this camera has no rate-control lever" is reported. */
++     * the H.264 extension unit; cameras without it simply refuse and keep their defaults. */
++    /* The committed value is kept, not the requested one: the camera clamps freely, and a
++     * rate controller must not later ask for more than it already agreed to. Leaving it 0
++     * is how "this camera has no rate-control lever" is reported. */
 +    uint32_t committed = 0;
 +    if (uvc_host_stream_h264_set_rate(device->stream_hdl,
 +                                      CONFIG_ESP_VIDEO_UVC_H264_BITRATE_BPS,
@@ -100,21 +143,21 @@
      uvc_host_stream_close(device->stream_hdl);
      device->stream_hdl = NULL;
  fail0:
-@@ -429,6 +510,11 @@
+@@ -430,6 +517,11 @@
+     while ((element = esp_video_get_done_element(video, V4L2_BUF_TYPE_VIDEO_CAPTURE)) != NULL) {
          uvc_host_frame_return(device->stream_hdl, (uvc_host_frame_t *)element->priv_data);
      }
- 
++
 +    /* Before the close, not after: the handle must stop being reachable from
 +     * esp_video_uvc_*() the moment it is no longer valid. */
 +    s_active_stream_hdl = NULL;
 +    s_h264_committed_bps = 0;
-+
+ 
      ESP_RETURN_ON_ERROR(uvc_host_stream_close(device->stream_hdl), TAG, "Failed to close UVC stream");
  
-     return ESP_OK;
 --- a/Kconfig
 +++ b/Kconfig
-@@ -178,6 +178,22 @@
+@@ -182,7 +182,31 @@
  
  
      if ESP_VIDEO_ENABLE_USB_UVC_VIDEO_DEVICE
@@ -133,7 +176,7 @@
 +                Holding the bitrate fixed while the resolution changed is how a 1080p stream
 +                ended up on a 720p budget, where the camera keeps bits-per-pixel constant and
 +                drops frame rate instead - 30 fps became 13.
-+
+ 
 +        config ESP_VIDEO_UVC_H264_IFRAME_PERIOD_MS
 +            int "Key-frame period to request from the camera (ms, 0 = leave alone)"
 +            default 1000
@@ -141,6 +184,8 @@
 +                Every key frame carries the parameter sets a decoder needs to start, so a
 +                multi-second default leaves joining viewers blank and makes loss recovery
 +                unbounded.
- 
++
++
          config USB_UVC_VIDEO_DEVICE_URB_SIZE
              int "USB UVC Video Device URB Size"
+             default 10240

@@ -84,7 +84,7 @@ Traps that only show up on a fresh `managed_components/`:
 ## UVC H.264 capture on ESP32-S31 (investigation log, 2026-08-21)
 
 Goal: a USB-UVC camera that encodes H.264 itself, forwarded untouched, at 640x480 then
-1280x720 then 1920x1080. **Not yet achieved** - see "Where it stands".
+1280x720 then 1920x1080. **Achieved** with the four patches below - see "Where it stands".
 
 The camera advertises JPEG, YUYV and H264, each at 640x480 up to 1920x1080, and exposes an
 H.264 extension unit (bUnitID 12 on VideoControl interface 0).
@@ -140,22 +140,34 @@ assembly was never involved. Re-add that counter first if this recurs.
 
 ### Where it stands
 
-Fix 3 (alt setting) is the strongest remaining candidate and is **unvalidated**: the camera
-stopped enumerating before it could be tested. `esp_video_if.c` now reports the USB device
-list on open failure, which proves the point rather than inferring it from a UVC-level
-timeout:
+**H.264 capture streams.** Fix 3 (alt setting) - the strongest remaining
+candidate when this log was first written, and untestable at the time because the camera had
+stopped enumerating - is validated. With all four patches applied the camera streams H.264
+at the configured resolution, and `examples/kvs_combined` runs PutMedia and WebRTC off it
+concurrently. The most recent measurement: five chained soft reboots, streaming every time, zero
+`Failed to get frame`, against 4 failures in 6 before the shutdown handler was added. Not yet
+done: soak, a second camera model, a second board revision.
+
+Two things from the failed sessions are still worth keeping.
+
+**A camera that stopped enumerating needs a replug, and the log says so plainly.**
+`esp_video_if.c` reports the USB device list on open failure, which proves the point rather
+than inferring it from a UVC-level timeout:
 
     esp_video_if: Failed to open camera device /dev/video40, errno: 19
     esp_video_if: USB bus: 0 device(s) enumerated
 
 The host stack is installed and answering, and there is nothing on the bus - the camera is
-not presenting itself at all. It
-had streamed YUYV earlier in the same session, so this is a device state that a USB bus
-reset does not clear. There is no software VBUS control on this board - the camera must be
-physically unplugged and replugged.
+not presenting itself at all. It had streamed YUYV earlier in the same session, so this is a
+device state that a USB bus reset does not clear. There is no software VBUS control on this
+board - the camera must be physically unplugged and replugged. `media_stream` prevents it
+where it can, by stopping the stream from a shutdown handler; nothing on the host recovers a
+camera that was cut off without one.
 
-Next step after a replug: run at 640x480 and check for `Alternate setting 11 -> 3 to match
-negotiated payload 512 B`, then walk 640x480 -> 1280x720 -> 1920x1080. A frame larger than
-the capture buffer now warns (`frame buffer overflow ... raise sizeimage`) instead of
-failing silently; `compressed_buffer_size()` caps at 1 MB, which is ample for H.264 but is
-the first thing to raise if that warning appears.
+**What to check when bringing up a different camera.** Run at 640x480 first and look for
+`Alternate setting 11 -> 3 to match negotiated payload 512 B`, then walk
+640x480 -> 1280x720 -> 1920x1080. A frame larger than the capture buffer warns
+(`frame buffer overflow ... raise sizeimage`) instead of failing silently;
+`compressed_buffer_size()` caps at `CONFIG_MEDIA_STREAM_UVC_COMPRESSED_FRAME_MAX_KB`
+(1 MB by default), which is ample for H.264 but is the first thing to raise if that warning
+appears.

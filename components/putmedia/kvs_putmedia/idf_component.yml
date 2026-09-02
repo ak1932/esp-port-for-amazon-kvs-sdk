@@ -2,7 +2,7 @@
 ##
 ## NOTE: this component needs esp_http_client_chunk_write_begin() /
 ## esp_http_client_chunk_write_end(), which are not in any released IDF yet -
-## see KNOWN_ISSUES.md. The idf constraint below is therefore a floor, not a
+## The idf constraint below is therefore a floor, not a
 ## statement that 5.4 is sufficient.
 description: "AWS KVS PutMedia client - streams MKV fragments to a KVS video stream over chunked HTTPS"
 dependencies:

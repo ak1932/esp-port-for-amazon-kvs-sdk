@@ -74,7 +74,6 @@ the component never fetches them itself. See `include/kvs/put_media.h` for the f
 
 This component predates its move into the KVS port and still carries its own SigV4
 implementation (`source/restful/aws_signer_v4.c`), which duplicates
-[`components/credential`](../../credential/). Consolidating the two is tracked in
-[KNOWN_ISSUES.md](KNOWN_ISSUES.md); it is a refactor rather than a rename, because the
-two trees use incompatible type systems (`STRING_HANDLE`/`BUFFER_HANDLE` here versus
+[`components/credential`](../../credential/). Consolidating the two is open work; it is a
+refactor rather than a rename, because the two trees use incompatible type systems (`STRING_HANDLE`/`BUFFER_HANDLE` here versus
 `PCHAR`/`STATUS` in `credential`/`kvs_utils`).

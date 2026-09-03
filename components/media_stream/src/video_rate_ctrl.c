@@ -57,6 +57,19 @@ static const vrate_rung_t LADDER[] = {
  * congestion collapse. Begin gentle, recover upward only if the link earns it. */
 #define START_LEVEL          3
 
+/* Where a controller starts when fps is NOT ours to lower (UVC H.264
+ * passthrough). START_LEVEL's reasoning inverts there.
+ *
+ * Mid-ladder exists to avoid slamming full bitrate into a link that has not
+ * settled. But on a camera we do not own, L0 is not "full quality we might not
+ * afford" - it is the rate the camera is ALREADY streaming at when init() reads
+ * its committed value. Starting at L0 changes nothing about the link; starting
+ * at L3 is itself the intervention, a 50% bitrate cut applied before any
+ * congestion has been observed. And a camera holding bits-per-pixel roughly
+ * constant answers a bitrate cut by shedding frame rate, so that opening move
+ * costs frames for nothing. Descend on evidence instead. */
+#define START_LEVEL_FPS_FIXED 0
+
 /* fps adaptation floor. 12 (not 15): on the contended 2.4 GHz uplink a single
  * frame can take ~70 ms to send, and a 15-fps budget (67 ms) stays under water,
  * so the controller can't actually catch up. 12 fps = ~83 ms budget gives the
@@ -162,7 +175,22 @@ static struct {
     uint32_t height;
     uint32_t max_bitrate_bps;
     uint32_t min_bitrate_bps;
-    uint32_t applied_bitrate;      /* what the encoder was last told */
+    /* What the encoder was last TOLD. Named for the request, not the result,
+     * because on UVC passthrough the two differ: see committed_bitrate. This is
+     * what drives change detection on the pull path. */
+    uint32_t requested_bitrate;
+    /* What the encoder said it actually took, 0 until something reports one.
+     * Never feeds change detection - a camera that answers every request with
+     * the same number would otherwise look like a permanent pending change. */
+    uint32_t committed_bitrate;
+    /* Cleared when a bitrate change is discovered not to reach the encoder at
+     * all. With fps_actuable false as well, no controller has a lever and the
+     * ladder is frozen rather than left issuing decisions that reach nothing. */
+    bool     bitrate_actuable;
+    /* How long a change takes to reach the encoder. The level front-ends must not
+     * re-evaluate faster than this or they step down repeatedly on a signal that
+     * cannot have responded yet. 0 = the encoder is driven directly. */
+    uint32_t actuation_period_ms;
 } s_agg;
 
 /* Published to the encoder task. Written under s_lock, read lock-free - which is
@@ -193,6 +221,23 @@ static esp_err_t vrate_lock_init(void)
 
 static inline void vrate_lock(void)   { xSemaphoreTake(s_lock, portMAX_DELAY); }
 static inline void vrate_unlock(void) { xSemaphoreGive(s_lock); }
+
+/* The starting rung depends on whether fps is a lever; see the two constants. */
+/* Cadence for the level (queue) front-end: never faster than the encoder can
+ * actually respond. See video_rate_ctrl_set_actuation_period_ms(). */
+static int64_t vrate_level_eval_period_us(void)
+{
+    uint32_t ms = QUEUE_EVAL_MS;
+    if (s_agg.actuation_period_ms > ms) {
+        ms = s_agg.actuation_period_ms;
+    }
+    return (int64_t) ms * 1000;
+}
+
+static uint32_t vrate_start_level(void)
+{
+    return s_agg.fps_actuable ? START_LEVEL : START_LEVEL_FPS_FIXED;
+}
 
 static uint32_t vrate_rung_bitrate(uint32_t level)
 {
@@ -294,6 +339,13 @@ static inline bool vrate_eligible(const struct video_rate_ctrl_s *h, int64_t now
  * anything that could change a controller's target or eligibility. */
 static void vrate_rearbitrate(int64_t now)
 {
+    /* Nothing to steer: neither column reaches the encoder, so publishing a new
+     * operating point would only misreport one. Freeze at whatever is in force
+     * and let get_stats() say why. */
+    if (s_agg.inited && !s_agg.fps_actuable && !s_agg.bitrate_actuable) {
+        return;
+    }
+
     uint32_t min_fps = 0;
     uint32_t min_bps = 0;
     bool     any     = false;
@@ -334,8 +386,8 @@ static void vrate_rearbitrate(int64_t now)
         /* Back to native. Unlike init, the encoder may be mid-run at a degraded
          * bitrate here, so it has to be told to go back up. */
         atomic_store(&s_pub_target_fps, 0);
-        if (s_agg.applied_bitrate != s_agg.max_bitrate_bps) {
-            s_agg.applied_bitrate = s_agg.max_bitrate_bps;
+        if (s_agg.requested_bitrate != s_agg.max_bitrate_bps) {
+            s_agg.requested_bitrate = s_agg.max_bitrate_bps;
             atomic_store(&s_pending_bitrate, s_agg.max_bitrate_bps);
         }
         atomic_store(&s_stale_check_us, INT64_MAX);
@@ -343,8 +395,8 @@ static void vrate_rearbitrate(int64_t now)
     }
 
     atomic_store(&s_pub_target_fps, min_fps);
-    if (min_bps != s_agg.applied_bitrate) {
-        s_agg.applied_bitrate = min_bps;
+    if (min_bps != s_agg.requested_bitrate) {
+        s_agg.requested_bitrate = min_bps;
         atomic_store(&s_pending_bitrate, min_bps);
     }
     atomic_store(&s_stale_check_us, soonest);
@@ -356,6 +408,14 @@ static bool vrate_step_down(struct video_rate_ctrl_s *h, uint32_t jump)
 {
     h->healthy_since_us = 0;
     h->healthy_reports  = 0;
+    /* Nothing this controller decides can reach the encoder, so moving its rung
+     * would only print a descent that is not happening - which is how
+     * `sink-stats` came to show rung 7 / 102400 bps beside an encoder still
+     * running at 304000. Hold position instead. */
+    if (s_agg.inited && !s_agg.fps_actuable && !s_agg.bitrate_actuable) {
+        return false;
+    }
+
     if (h->level >= LADDER_N - 1) {
         return false;
     }
@@ -369,12 +429,20 @@ static bool vrate_mark_healthy(struct video_rate_ctrl_s *h, int64_t now)
 {
     if (h->healthy_since_us == 0) {
         h->healthy_since_us = now;
-        h->healthy_reports  = 0;
+        /* A SNAPSHOT of the report counter, not a counter of its own. The gate is
+         * meant to stop a controller that observed nothing from claiming a rung, so
+         * it has to count actual reports - and this function is called once per
+         * ladder EVALUATION, which is a completely different rate. The level
+         * front-end evaluates on a cadence that now tracks how long actuation takes
+         * (seconds, or tens of seconds on a camera where a stream restart is the
+         * only lever), so counting calls here made recovery need
+         * RECOVER_MIN_REPORTS whole cadences per rung: measured at 8 x 30 s = 240 s
+         * for one step, ~28 min from the floor back to the top, i.e. never. */
+        h->healthy_reports  = h->reports;
     }
-    h->healthy_reports++;
 
     if (now - h->healthy_since_us < (int64_t)RECOVER_DWELL_MS * 1000 ||
-        h->healthy_reports < RECOVER_MIN_REPORTS) {
+        (h->reports - h->healthy_reports) < RECOVER_MIN_REPORTS) {
         return false;
     }
     h->healthy_since_us = 0;
@@ -383,6 +451,7 @@ static bool vrate_mark_healthy(struct video_rate_ctrl_s *h, int64_t now)
     if (h->level == 0) {
         return false;
     }
+
     uint32_t prev = h->level;
     vrate_apply_level(h, h->level - 1);
     return h->level != prev;
@@ -413,7 +482,13 @@ void video_rate_ctrl_init(uint32_t camera_fps, uint32_t max_bitrate_bps,
     s_agg.min_bitrate_bps = (max_bitrate_bps > MIN_BITRATE_BPS) ? MIN_BITRATE_BPS
                                                                 : max_bitrate_bps;
     /* The encoder was just configured at this bitrate, so nothing is pending. */
-    s_agg.applied_bitrate = max_bitrate_bps;
+    s_agg.requested_bitrate = max_bitrate_bps;
+    /* Assumed until proven otherwise: the refusal is only observable at runtime,
+     * on the first commit that comes back with a different number. */
+    s_agg.bitrate_actuable  = true;
+    s_agg.committed_bitrate = 0;
+    /* Set by the grabber right after this, if the encoder is one that needs it. */
+    s_agg.actuation_period_ms = 0;
     s_agg.inited          = true;
     atomic_store(&s_pub_camera_fps, s_agg.camera_fps);
     atomic_store(&s_pending_bitrate, 0);
@@ -431,7 +506,7 @@ void video_rate_ctrl_init(uint32_t camera_fps, uint32_t max_bitrate_bps,
         h->last_report_us = now;
         h->stale          = false;
         if (h->enabled) {
-            vrate_apply_level(h, START_LEVEL);
+            vrate_apply_level(h, vrate_start_level());
             seeded++;
         }
     }
@@ -469,7 +544,7 @@ esp_err_t video_rate_ctrl_create(const char *name, video_rate_ctrl_handle_t *out
         h->last_report_us = esp_timer_get_time();
         strlcpy(h->name, name, sizeof(h->name));
         if (s_agg.inited) {
-            vrate_apply_level(h, START_LEVEL);
+            vrate_apply_level(h, vrate_start_level());
         }
         *out = h;
         vrate_unlock();
@@ -526,7 +601,7 @@ void video_rate_ctrl_enable(video_rate_ctrl_handle_t h, bool enable)
     h->stale          = false;
 
     if (enable && inited) {
-        vrate_apply_level(h, START_LEVEL);
+        vrate_apply_level(h, vrate_start_level());
     }
     vrate_rearbitrate(now);
     lvl = h->level; fps = h->target_fps; bps = h->target_bitrate_bps;
@@ -645,7 +720,7 @@ void video_rate_ctrl_report_queue(video_rate_ctrl_handle_t h,
         vrate_unlock();
         return;
     }
-    h->q_next_eval_us = now + (int64_t)QUEUE_EVAL_MS * 1000;
+    h->q_next_eval_us = now + vrate_level_eval_period_us();
 
     uint32_t occ = (used * 100u) / capacity;
     if (!h->q_primed) {
@@ -725,7 +800,7 @@ void video_rate_ctrl_report_overflow(video_rate_ctrl_handle_t h)
     h->q_ema_pct      = 100;
     h->q_delta        = 0;
     h->load_pct       = (100u * 100u) / QUEUE_CONGEST_PCT;
-    h->q_next_eval_us = now + (int64_t)QUEUE_EVAL_MS * 1000;
+    h->q_next_eval_us = now + vrate_level_eval_period_us();
 
     moved = vrate_step_down(h, 2);
     if (moved || was_stale) {
@@ -739,6 +814,100 @@ void video_rate_ctrl_report_overflow(video_rate_ctrl_handle_t h)
         ESP_LOGW(TAG, "'%s' overflow, data lost: L%" PRIu32 " (%" PRIu32 "fps/%" PRIu32 "bps)",
                  name, lvl, fps, bps);
     }
+}
+
+void video_rate_ctrl_set_min_bitrate_bps(uint32_t bps)
+{
+    if (s_lock == NULL) {
+        return;
+    }
+    vrate_lock();
+    uint32_t flr = (bps > MIN_BITRATE_BPS) ? bps : MIN_BITRATE_BPS;
+    if (s_agg.max_bitrate_bps && flr > s_agg.max_bitrate_bps) {
+        flr = s_agg.max_bitrate_bps;
+    }
+    const bool changed = (s_agg.min_bitrate_bps != flr);
+    s_agg.min_bitrate_bps = flr;
+    /* Re-apply every enabled controller's level so a rung that now sits below the
+     * floor reports the floor instead of a target nothing will honour. */
+    if (changed) {
+        const int64_t now = esp_timer_get_time();
+        for (int i = 0; i < CONFIG_VIDEO_RATE_CTRL_MAX; i++) {
+            if (s_ctrl[i].in_use) {
+                vrate_apply_level(&s_ctrl[i], s_ctrl[i].level);
+            }
+        }
+        vrate_rearbitrate(now);
+    }
+    vrate_unlock();
+
+    if (changed) {
+        ESP_LOGI(TAG, "bitrate floor raised to %" PRIu32 " bps (the encoder refuses lower)", flr);
+    }
+}
+
+void video_rate_ctrl_set_actuation_period_ms(uint32_t ms)
+{
+    if (s_lock == NULL) {
+        return;
+    }
+    vrate_lock();
+    const bool changed = (s_agg.actuation_period_ms != ms);
+    s_agg.actuation_period_ms = ms;
+    vrate_unlock();
+    if (changed) {
+        ESP_LOGI(TAG, "actuation period %" PRIu32 " ms: the level front-end will not "
+                      "step more often than that", ms);
+    }
+}
+
+void video_rate_ctrl_report_committed_bitrate_bps(uint32_t bps)
+{
+    if (s_lock == NULL) {
+        return;
+    }
+    vrate_lock();
+    s_agg.committed_bitrate = bps;
+    vrate_unlock();
+}
+
+void video_rate_ctrl_set_bitrate_actuable(bool actuable)
+{
+    if (s_lock == NULL) {
+        return;
+    }
+    vrate_lock();
+    const bool changed = (s_agg.bitrate_actuable != actuable);
+    s_agg.bitrate_actuable = actuable;
+    const bool inert = s_agg.inited && !s_agg.fps_actuable && !actuable;
+    vrate_unlock();
+
+    /* Logged outside the lock: ESP_LOG can block on stdout, and this is called
+     * from the encoder task that also dispatches to every sink. */
+    if (changed && inert) {
+        ESP_LOGW(TAG, "no lever left on this encoder (fps fixed, bitrate not actuable) "
+                      "- controllers frozen, rate control is inert");
+    } else if (changed && actuable) {
+        ESP_LOGI(TAG, "bitrate is actuable again");
+    }
+}
+
+esp_err_t video_rate_ctrl_get_encoder_stats(video_rate_ctrl_encoder_stats_t *out)
+{
+    if (out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_lock == NULL) {
+        memset(out, 0, sizeof(*out));
+        return ESP_OK;
+    }
+    vrate_lock();
+    out->requested_bps    = s_agg.inited ? s_agg.requested_bitrate : 0;
+    out->committed_bps    = s_agg.committed_bitrate;
+    out->fps_actuable     = s_agg.fps_actuable;
+    out->bitrate_actuable = s_agg.bitrate_actuable;
+    vrate_unlock();
+    return ESP_OK;
 }
 
 void video_rate_ctrl_set_network_ceiling_bps(video_rate_ctrl_handle_t h, uint32_t bps)
@@ -888,7 +1057,7 @@ esp_err_t video_rate_ctrl_get_stats(video_rate_ctrl_stats_t *out, size_t max, si
         *enc_fps = t ? t : s_agg.camera_fps;
     }
     if (enc_bps) {
-        *enc_bps = s_agg.inited ? s_agg.applied_bitrate : 0;
+        *enc_bps = s_agg.inited ? s_agg.requested_bitrate : 0;
     }
     vrate_unlock();
     return ESP_OK;

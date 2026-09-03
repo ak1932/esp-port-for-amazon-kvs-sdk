@@ -170,6 +170,70 @@ void video_rate_ctrl_report_queue(video_rate_ctrl_handle_t h,
 void video_rate_ctrl_report_overflow(video_rate_ctrl_handle_t h);
 
 /**
+ * @brief Report what the encoder actually agreed to (UVC passthrough)
+ *
+ * The camera clamps freely - and on some cameras refuses outright - so the
+ * bitrate it COMMITTED and the bitrate we asked for are different numbers, and
+ * only one of them is true.
+ *
+ * Global rather than per controller: there is one encoder, so there is one
+ * committed bitrate, whoever asked for it.
+ *
+ * @param bps What the encoder reported committing, or 0 to forget
+ */
+void video_rate_ctrl_report_committed_bitrate_bps(uint32_t bps);
+
+/**
+ * @brief Raise the floor the ladder may descend to
+ *
+ * An encoder that refuses to go below some rate makes every rung under it a lie: the
+ * controller keeps asking, the encoder keeps answering with its own number.
+ *
+ * Absolute bps for the CURRENT resolution, in the same terms as
+ * video_rate_ctrl_init()'s max_bitrate_bps. Ignored if it is not above the built-in
+ * floor, and clamped so it can never exceed the maximum.
+ *
+ * @param bps Lowest rate the encoder will actually honour, or 0 to reset
+ */
+void video_rate_ctrl_set_min_bitrate_bps(uint32_t bps);
+
+/**
+ * @brief Declare how long an actuation takes to reach the encoder
+ *
+ * The queue front-end rate-limits itself on a fixed cadence chosen so a step-down has
+ * had time to show up in the signal before the next one is considered. That assumes the
+ * encoder responds when told. It does not always: on UVC H.264 passthrough the bitrate
+ * reaches the camera over a rate-limited control transfer, or - where even that is
+ * ignored - over a stream restart that is deliberately minutes apart.
+ *
+ * Measured consequence of not declaring it: the ladder walked all eight rungs in three
+ * seconds (queue 33% -> 39%) because the cadence let it re-evaluate every 500 ms while
+ * the first step-down had not yet reached the camera at all. It then applied its floor
+ * rather than a measured step.
+ *
+ * @param ms Round-trip actuation period, or 0 for an encoder driven directly
+ */
+void video_rate_ctrl_set_actuation_period_ms(uint32_t ms);
+
+/**
+ * @brief Declare whether the bitrate column can actually be actuated
+ *
+ * Companion to video_rate_ctrl_init()'s @c fps_actuable. Some UVC cameras
+ * accept an H.264 bitrate only while the stream is being set up: at runtime the
+ * extension-unit probe and commit both succeed and the value is then ignored.
+ * Such a camera leaves a passthrough target with NO lever at all - fps is not
+ * ours to drop and bitrate is not ours to change - and a controller that keeps
+ * walking its ladder is then reporting decisions that reach nothing.
+ *
+ * Pass false on discovering that, and every controller is frozen at its current
+ * rung and reported as inert, so `sink-stats` stops describing a control loop
+ * that does not exist. Discovered at runtime, so this is separate from init().
+ *
+ * @param actuable Whether a bitrate change reaches the encoder
+ */
+void video_rate_ctrl_set_bitrate_actuable(bool actuable);
+
+/**
  * @brief Cap how far this controller may recover, from a network estimate
  *
  * WebRTC TWCC sender BWE (viewer feedback), in bps. This controller caps its
@@ -225,6 +289,28 @@ typedef struct {
     uint32_t    net_ceiling_bps;    /* 0 = no network limit */
     uint32_t    reports;
 } video_rate_ctrl_stats_t;
+
+/**
+ * @brief What the one shared encoder is actually doing
+ *
+ * Separate from the per-controller rows because it is a property of the encoder,
+ * not of any sink. @c committed_bps against @c requested_bps is the diagnostic
+ * that says whether the ladder's decisions are reaching the hardware at all.
+ */
+typedef struct {
+    uint32_t requested_bps;    /* Last value pushed toward the encoder */
+    uint32_t committed_bps;    /* What the encoder said it took; 0 = never reported */
+    bool     fps_actuable;     /* Can we drop frames before encode */
+    bool     bitrate_actuable; /* Does a bitrate change reach the encoder */
+} video_rate_ctrl_encoder_stats_t;
+
+/**
+ * @brief Snapshot the shared encoder's side of the story
+ *
+ * @param out Receives the encoder stats
+ * @return ESP_OK or ESP_ERR_INVALID_ARG
+ */
+esp_err_t video_rate_ctrl_get_encoder_stats(video_rate_ctrl_encoder_stats_t *out);
 
 /**
  * @brief Snapshot every controller, plus the arbitrated result

@@ -1,6 +1,6 @@
 --- a/uvc_control.c
 +++ b/uvc_control.c
-@@ -104,6 +104,225 @@
+@@ -104,6 +104,439 @@
      return ret;
 +}
 +
@@ -14,8 +14,47 @@
 +#define UVCX_VIDEO_CONFIG_COMMIT  0x02
 +#define UVCX_PICTURE_TYPE_CONTROL 0x09
 +
-+#define UVCX_HINT_BITRATE         0x0002
-+#define UVCX_HINT_IFRAME_PERIOD   0x2000
++/* bmHints tells the camera which fields the host is asserting and it must therefore keep
++ * fixed; every field NOT hinted is one it is free to trade away to meet the rest.
++ *
++ * These values are not sequential bit positions - they are the specific assignments the
++ * USB Video Class H.264 payload spec makes - and getting one wrong is silent, because a
++ * wrong bit is still a valid hint for some other field. Measured on ESP32-S31 with
++ * FRAME_INTERVAL wrongly defined as 0x0001 (which is RESOLUTION): asking for a pinned
++ * 30 fps hinted resolution, profile and bitrate but not the frame interval, so the frame
++ * interval was precisely the one field the camera had been invited to sacrifice. It
++ * halved, 30 -> 15 fps, at an unchanged bitrate - the exact opposite of the request.
++ * Keep the whole table here rather than only the bits in use, so the next field to be
++ * asserted is read off a list instead of re-derived. */
++#define UVCX_HINT_RESOLUTION      0x0001
++#define UVCX_HINT_PROFILE         0x0002
++#define UVCX_HINT_RATECONTROL     0x0004
++#define UVCX_HINT_USAGE           0x0008
++#define UVCX_HINT_SLICEMODE       0x0010
++#define UVCX_HINT_SLICEUNITS      0x0020
++#define UVCX_HINT_MVCVIEW         0x0040
++#define UVCX_HINT_TEMPORAL        0x0080
++#define UVCX_HINT_SNR             0x0100
++#define UVCX_HINT_SPATIAL         0x0200
++#define UVCX_HINT_SPATIAL_RATIO   0x0400
++#define UVCX_HINT_FRAME_INTERVAL  0x0800
++#define UVCX_HINT_LEAKY_BKT_SIZE  0x1000
++#define UVCX_HINT_BITRATE         0x2000
++#define UVCX_HINT_ENTROPY         0x4000
++#define UVCX_HINT_IFRAME_PERIOD   0x8000
++
++/* bRateControlMode carries a mode in the low nibble plus a flag: FIXED_FRAME_RATE means
++ * "do not drop frames to stay inside the bitrate". That is the second, independent half of
++ * pinning the frame rate - hinting dwFrameInterval says "do not change this number", this
++ * says "do not miss it" - and a camera may honour either one alone. */
++#define UVCX_RC_MODE_MASK         0x0f
++#define UVCX_RC_CBR               0x01
++#define UVCX_RC_VBR               0x02
++#define UVCX_RC_CONST_QP          0x03
++#define UVCX_RC_FIXED_FRAME_RATE  0x10
++
++/* dwFrameInterval is in 100 ns units, so this is the numerator of "interval for N fps". */
++#define UVCX_INTERVAL_UNITS_PER_S 10000000.0f
 +
 +/* The configured bitrate is a budget for this reference resolution.
 + * uvc_host_stream_h264_set_rate() scales it to whatever the stream actually negotiated, so a
@@ -110,7 +149,8 @@
  }
  
 +esp_err_t uvc_host_stream_h264_set_rate(uvc_host_stream_hdl_t stream_hdl, uint32_t bitrate_bps,
-+                                        uint16_t iframe_period_ms, uint32_t *committed_bps)
++                                        uint16_t iframe_period_ms, uint32_t frame_interval_100ns,
++                                        uint32_t *committed_bps)
 +{
 +    UVC_CHECK(stream_hdl != NULL, ESP_ERR_INVALID_ARG);
 +    uvc_stream_t *uvc_stream = (uvc_stream_t *) stream_hdl;
@@ -130,8 +170,17 @@
 +                                  UVC_GET_CUR, &cfg, sizeof(cfg)),
 +                        TAG, "H.264 XU not readable (camera may not implement it)");
 +
-+    ESP_LOGI(TAG, "camera H.264 config: %ux%u, %" PRIu32 " bps, IFramePeriod %u ms, rc_mode %u",
-+             cfg.wWidth, cfg.wHeight, cfg.dwBitRate, cfg.wIFramePeriod, cfg.bRateControlMode);
++    ESP_LOGI(TAG, "camera H.264 config: %ux%u, %" PRIu32 " bps, IFramePeriod %u ms, "
++                  "interval %" PRIu32 ", rc_mode 0x%02x, hints 0x%04x",
++             cfg.wWidth, cfg.wHeight, cfg.dwBitRate, cfg.wIFramePeriod,
++             cfg.dwFrameInterval, cfg.bRateControlMode, cfg.bmHints);
++
++    /* Build bmHints from nothing rather than adding to what the read-back returned. It is a
++     * host-to-device directive for THIS transaction, not device state, and the read-back
++     * merely echoes it - so accumulating would make a hint permanent once set: the frame-rate
++     * pin could be turned on but never off again, which is exactly what the mid-stream and
++     * restart actuation paths need to be able to do. */
++    cfg.bmHints = 0;
 +
 +    /* The H.264 config carries its own resolution, and per the UVC H.264 payload spec it
 +     * must match the frame descriptor the stream was committed to. A camera whose encoder
@@ -149,6 +198,10 @@
 +        cfg.wWidth  = stream_fmt.h_res;
 +        cfg.wHeight = stream_fmt.v_res;
 +    }
++    /* Asserted, not merely written: a camera that moved the encoder off the negotiated
++     * resolution to meet some other constraint would produce payloads the stream cannot
++     * carry. */
++    cfg.bmHints |= UVCX_HINT_RESOLUTION;
 +
 +    /* Scale the budget to the resolution negotiated just above.
 +     *
@@ -181,6 +234,47 @@
 +        cfg.bmHints |= UVCX_HINT_IFRAME_PERIOD;
 +    }
 +
++    /* Pinning the frame interval is what decides HOW the camera spends a bitrate it
++     * cannot meet at full quality.
++     *
++     * Left alone (0), the camera's own rate controller holds bits-per-pixel roughly
++     * constant and sheds frame rate instead - measured on ESP32-S31: 1080p at 256 kbps
++     * delivered 4 fps, and 30 -> 20 fps at a fixed 800 kbps left the bitrate unchanged
++     * while doubling per-frame size. Quality is preserved, smoothness is not.
++     *
++     * Hinting dwFrameInterval tells it the frame rate is not negotiable, so the only
++     * variable left is quality: it must fit each frame into bitrate/fps bits and raise
++     * QP to get there. Smoothness is preserved, sharpness is not.
++     *
++     * Neither is universally right - a security camera wants the frames, a
++     * detail-inspection view wants the pixels - so the caller chooses. */
++    cfg.bRateControlMode &= (uint8_t) ~UVCX_RC_FIXED_FRAME_RATE;
++    if (frame_interval_100ns) {
++        /* The XU's frame interval has to agree with the one the VideoStreaming commit
++         * negotiated - the same rule as wWidth/wHeight above, and the isochronous geometry
++         * was provisioned for that rate. A caller asking to pin a rate the stream is not
++         * running at would be asking the camera to hold two different frame rates fixed at
++         * once, and the caller cannot know the negotiated rate anyway: this configuration is
++         * applied during stream setup, before V4L2 can read it back. */
++        if (stream_fmt.fps > 0.0f) {
++            const uint32_t negotiated =
++                (uint32_t) (UVCX_INTERVAL_UNITS_PER_S / stream_fmt.fps + 0.5f);
++            if (negotiated != 0 && negotiated != frame_interval_100ns) {
++                ESP_LOGI(TAG, "H.264 XU frame interval %" PRIu32 " -> %" PRIu32
++                              " (matching the negotiated %.0f fps)",
++                         frame_interval_100ns, negotiated, stream_fmt.fps);
++                frame_interval_100ns = negotiated;
++            }
++        }
++        cfg.dwFrameInterval = frame_interval_100ns;
++        cfg.bmHints |= UVCX_HINT_FRAME_INTERVAL;
++        cfg.bRateControlMode |= UVCX_RC_FIXED_FRAME_RATE;
++    }
++    /* Either way the rate-control byte is now ours to assert - with the flag set when the
++     * frame rate is pinned and cleared when it is not. Leaving it unhinted is what lets a
++     * camera keep frame dropping enabled while agreeing to the interval. */
++    cfg.bmHints |= UVCX_HINT_RATECONTROL;
++
 +    ESP_RETURN_ON_ERROR(uvcx_xfer(stream_hdl, unit_id, vc_intf, UVCX_VIDEO_CONFIG_PROBE,
 +                                  UVC_SET_CUR, &cfg, sizeof(cfg)),
 +                        TAG, "H.264 XU probe rejected");
@@ -191,13 +285,135 @@
 +                                  UVC_SET_CUR, &cfg, sizeof(cfg)),
 +                        TAG, "H.264 XU commit rejected");
 +
-+    ESP_LOGI(TAG, "camera H.264 committed: %" PRIu32 " bps, IFramePeriod %u ms",
-+             cfg.dwBitRate, cfg.wIFramePeriod);
-+    if (committed_bps != NULL) {
-+        *committed_bps = cfg.dwBitRate;
++    ESP_LOGI(TAG, "camera H.264 committed: %ux%u, %" PRIu32 " bps, IFramePeriod %u ms, "
++                  "interval %" PRIu32 ", rc_mode 0x%02x (%s)",
++             cfg.wWidth, cfg.wHeight, cfg.dwBitRate, cfg.wIFramePeriod, cfg.dwFrameInterval,
++             cfg.bRateControlMode,
++             frame_interval_100ns ? "frame rate pinned - quality gives way"
++                                  : "frame rate free - the camera may shed fps");
++    /* The frame interval belongs in this check as much as the bitrate does: a camera that
++     * takes the bitrate and quietly returns a different interval has accepted the budget and
++     * refused the terms, which reads as a frame-rate fault a long way from here. */
++    if ((bitrate_bps && cfg.dwBitRate != bitrate_bps) ||
++            (iframe_period_ms && cfg.wIFramePeriod != iframe_period_ms) ||
++            (frame_interval_100ns && cfg.dwFrameInterval != frame_interval_100ns)) {
++        ESP_LOGW(TAG, "camera kept its own values (asked %" PRIu32 " bps / %u ms / interval "
++                      "%" PRIu32 ") - it clamped or rejected the request",
++                 bitrate_bps, iframe_period_ms, frame_interval_100ns);
++    }
++    if (frame_interval_100ns && !(cfg.bRateControlMode & UVCX_RC_FIXED_FRAME_RATE)) {
++        ESP_LOGW(TAG, "camera cleared the fixed-frame-rate flag - it may still drop frames to "
++                      "stay inside %" PRIu32 " bps", cfg.dwBitRate);
 +    }
 +    if (committed_bps != NULL) {
 +        *committed_bps = cfg.dwBitRate;
++    }
++    return ESP_OK;
++}
++
++/* Camera Terminal, UVC 1.5 section 4.2.2.1. Auto-Exposure Priority is the ONLY control
++ * that decides frame rate versus exposure, and that trade is upstream of the encoder:
++ *
++ *   0 = constant frame rate. Auto-exposure may not lengthen exposure past the frame
++ *       interval, so a dim scene comes back dark and noisy at full rate.
++ *   1 = frame rate may vary. Auto-exposure lengthens exposure for a correct picture and
++ *       the sensor rate falls to suit - the UVC default, and why a camera indoors after
++ *       dark quietly delivers half its nominal fps.
++ *
++ * Measured on ESP32-S31 at 720p: 14-15 fps whatever the H.264 extension unit was told.
++ * Raising the bitrate 800 kbps -> 2.4 Mbps tripled the average frame (6.5 -> 20.2 KB) and
++ * produced no extra frames, which is what proves the ceiling is the sensor and not the
++ * encoder. No encoder setting can create a frame that was never captured, so the H.264
++ * bitrate hints cannot reach this and the frame-rate/quality choice has to be made here
++ * as well as there. */
++#define UVC_CT_AE_MODE_CONTROL       0x02
++#define UVC_CT_AE_PRIORITY_CONTROL   0x03
++
++#define UVC_ITT_CAMERA               0x0201
++/* Camera Terminal bmControls, UVC 1.5 table 3-6. D2 is Auto-Exposure Priority. */
++#define UVC_CT_BMCONTROL_AE_PRIORITY 0x04
++
++/* Locate the Camera Terminal and report whether it claims the AE Priority control.
++ * Checking bmControls first is not defensive noise: a camera that does not implement a
++ * control STALLs EP0, and USBH logs that at ERROR, so an unconditional write would put an
++ * error in the log of every boot on cameras that simply do not have it. */
++static esp_err_t uvc_find_camera_terminal(const usb_config_desc_t *cfg_desc, uint8_t *terminal_id,
++                                          uint8_t *vc_intf, bool *has_ae_priority)
++{
++    int offset = 0;
++    const usb_standard_desc_t *desc = (const usb_standard_desc_t *) cfg_desc;
++    uint8_t current_vc_intf = 0;
++
++    while ((desc = usb_parse_next_descriptor(desc, cfg_desc->wTotalLength, &offset)) != NULL) {
++        if (desc->bDescriptorType == USB_B_DESCRIPTOR_TYPE_INTERFACE) {
++            const usb_intf_desc_t *intf = (const usb_intf_desc_t *) desc;
++            if (intf->bInterfaceSubClass == UVC_SC_VIDEOCONTROL) {
++                current_vc_intf = intf->bInterfaceNumber;
++            }
++            continue;
++        }
++        if (desc->bDescriptorType != UVC_CS_INTERFACE || desc->bLength < 15) {
++            continue;
++        }
++        const uint8_t *raw = (const uint8_t *) desc;
++        if (raw[2] != UVC_VC_DESC_SUBTYPE_INPUT_TERMINAL) {
++            continue;
++        }
++        /* Layout: bLength, bDescriptorType, bDescriptorSubType, bTerminalID,
++         * wTerminalType (LE), bAssocTerminal, iTerminal, wObjectiveFocalLengthMin,
++         * wObjectiveFocalLengthMax, wOcularFocalLength, bControlSize, bmControls... */
++        if ((uint16_t) (raw[4] | (raw[5] << 8)) != UVC_ITT_CAMERA) {
++            continue;
++        }
++        *terminal_id = raw[3];
++        *vc_intf     = current_vc_intf;
++        const uint8_t control_size = raw[14];
++        *has_ae_priority = (control_size >= 1) && ((raw[15] & UVC_CT_BMCONTROL_AE_PRIORITY) != 0);
++        return ESP_OK;
++    }
++    return ESP_ERR_NOT_FOUND;
++}
++
++esp_err_t uvc_host_stream_set_ae_priority(uvc_host_stream_hdl_t stream_hdl, uint8_t priority,
++                                          uint8_t *committed)
++{
++    UVC_CHECK(stream_hdl != NULL, ESP_ERR_INVALID_ARG);
++    UVC_CHECK(priority <= 1, ESP_ERR_INVALID_ARG);
++    uvc_stream_t *uvc_stream = (uvc_stream_t *) stream_hdl;
++    const usb_config_desc_t *cfg_desc;
++    uint8_t terminal_id = 0, vc_intf = 0;
++    bool has_ae_priority = false;
++
++    ESP_RETURN_ON_ERROR(usb_host_get_active_config_descriptor(uvc_stream->constant.dev_hdl, &cfg_desc),
++                        TAG, "Could not read the configuration descriptor");
++    ESP_RETURN_ON_ERROR(uvc_find_camera_terminal(cfg_desc, &terminal_id, &vc_intf, &has_ae_priority),
++                        TAG, "No Camera Terminal on this camera");
++    if (!has_ae_priority) {
++        ESP_LOGW(TAG, "Camera Terminal %u does not implement AE Priority - the sensor frame "
++                      "rate is not controllable on this camera", terminal_id);
++        return ESP_ERR_NOT_SUPPORTED;
++    }
++
++    uint8_t value = priority;
++    ESP_RETURN_ON_ERROR(uvcx_xfer(stream_hdl, terminal_id, vc_intf, UVC_CT_AE_PRIORITY_CONTROL,
++                                  UVC_SET_CUR, &value, sizeof(value)),
++                        TAG, "AE Priority write rejected");
++    /* Read back rather than trust the write: this is the same class of control as the H.264
++     * extension unit, where a SET_CUR succeeded and the value was quietly ignored. */
++    value = 0xff;
++    ESP_RETURN_ON_ERROR(uvcx_xfer(stream_hdl, terminal_id, vc_intf, UVC_CT_AE_PRIORITY_CONTROL,
++                                  UVC_GET_CUR, &value, sizeof(value)),
++                        TAG, "AE Priority read-back failed");
++
++    ESP_LOGI(TAG, "AE Priority on Camera Terminal %u: asked %u, committed %u (%s)",
++             terminal_id, priority, value,
++             value == 0 ? "constant frame rate - exposure gives way"
++                        : "frame rate may vary - exposure wins");
++    if (value != priority) {
++        ESP_LOGW(TAG, "camera kept AE Priority %u - it refused the request", value);
++    }
++    if (committed != NULL) {
++        *committed = value;
 +    }
 +    return ESP_OK;
 +}
@@ -226,7 +442,7 @@
      return uvc_host_stream_control(stream_hdl, vs_control, (uvc_host_stream_format_t *)vs_format, UVC_SET_CUR, false);
 --- a/include/usb/uvc_host.h
 +++ b/include/usb/uvc_host.h
-@@ -325,7 +325,47 @@
+@@ -325,7 +325,88 @@
   *      - ESP_OK on success
   *      - ESP_ERR_INVALID_ARG if stream_hdl is NULL
   *      - Other error codes from the USB Host library
@@ -243,7 +459,7 @@
 + *     - ESP_OK: key frame requested
 + *     - ESP_ERR_INVALID_ARG: invalid handle
 + *     - ESP_ERR_NOT_SUPPORTED / ESP_ERR_INVALID_RESPONSE: camera rejected the control
-+ */
+  */
 +/**
 + * @brief Set bitrate and key-frame period on a camera's own H.264 encoder
 + *
@@ -257,19 +473,60 @@
 + * @param[in] stream_hdl       UVC handle obtained from uvc_host_stream_open()
 + * @param[in] bitrate_bps      Target bitrate, 0 to leave unchanged
 + * @param[in] iframe_period_ms Key-frame period in ms, 0 to leave unchanged
++ * @param[in] frame_interval_100ns
++ *                             Frame interval to PIN, in 100 ns units, or 0 to leave the
++ *                             frame rate at the camera's discretion. This chooses what
++ *                             gives way when the bitrate is too small for the picture:
++ *                             0 lets the camera hold quality and shed frame rate (its
++ *                             default behaviour - 1080p at 256 kbps measured 4 fps),
++ *                             while a non-zero value says the frame rate is fixed and
++ *                             quality must absorb the shortfall instead.
++ *
++ *                             Any non-zero value is snapped to the interval the stream
++ *                             actually negotiated, so it is really a boolean: the caller
++ *                             cannot know that rate at the point this runs (stream setup,
++ *                             before V4L2 can read it back), and pinning a rate the
++ *                             transport was not provisioned for would assert two different
++ *                             frame rates at once.
 + * @param[out] committed_bps   If non-NULL, receives the bitrate the camera actually
 + *                             agreed to, which may be clamped well away from the
 + *                             request. A report, not a guarantee.
 + *
 + * Safe to call again while streaming - that is what makes closed-loop rate control
 + * possible - but each call is a PROBE/PROBE/COMMIT round trip on the control endpoint,
-+ * so the caller must rate limit.
++ * so the caller must rate limit. Note that some cameras honour the transaction and
++ * ignore the values unless the stream is being set up; compare committed_bps against
++ * the request rather than assuming it took.
 + * @return ESP_OK if the camera committed the configuration
-  */
++ */
 +esp_err_t uvc_host_stream_h264_set_rate(uvc_host_stream_hdl_t stream_hdl, uint32_t bitrate_bps,
-+                                        uint16_t iframe_period_ms, uint32_t *committed_bps);
++                                        uint16_t iframe_period_ms, uint32_t frame_interval_100ns,
++                                        uint32_t *committed_bps);
 +
 +esp_err_t uvc_host_stream_request_key_frame(uvc_host_stream_hdl_t stream_hdl);
++
++/**
++ * @brief Choose whether auto-exposure may lower the sensor frame rate
++ *
++ * The UVC Camera Terminal's Auto-Exposure Priority control, and the only place the frame
++ * rate versus picture trade can be made for the SENSOR - which is upstream of the encoder
++ * and therefore out of reach of uvc_host_stream_h264_set_rate(). Measured on ESP32-S31 in
++ * indoor evening light at 720p: 14-15 fps regardless of any encoder setting, and tripling
++ * the bitrate to 2.4 Mbps tripled the frame size while producing no extra frames.
++ *
++ * @param[in]  priority  0 to hold the frame rate constant and accept a darker, noisier
++ *                       picture; 1 to let auto-exposure win and the frame rate fall (the
++ *                       UVC default)
++ * @param[out] committed If non-NULL, the value read back afterwards. A camera may accept
++ *                       the write and keep its own value, so compare rather than assume.
++ * @return
++ *     - ESP_OK: written and read back
++ *     - ESP_ERR_NOT_SUPPORTED: the Camera Terminal does not claim the control in its
++ *       bmControls, so the sensor frame rate is not controllable here
++ *     - ESP_ERR_NOT_FOUND: no Camera Terminal at all
++ */
++esp_err_t uvc_host_stream_set_ae_priority(uvc_host_stream_hdl_t stream_hdl, uint8_t priority,
++                                          uint8_t *committed);
 +
  esp_err_t uvc_host_stream_stop(uvc_host_stream_hdl_t stream_hdl);
  

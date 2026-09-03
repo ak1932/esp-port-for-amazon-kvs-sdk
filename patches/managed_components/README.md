@@ -50,6 +50,7 @@ referenced by number from here and from `components/media_stream/KNOWN_ISSUES.md
 | `0002-usb_host_uvc-h264-extension-unit-rate-control.patch` | `espressif/usb_host_uvc` 2.5.2 | No way to reach the camera's own H.264 encoder. Adds `uvc_host_stream_h264_set_rate()` / `uvc_host_stream_request_key_frame()` over the H.264 extension unit (GUID-located `UVCX_VIDEO_CONFIG_PROBE/COMMIT`), and fills `wWidth`/`wHeight` from the negotiated format so the commit is not rejected. Also pins the frame rate on request (`bmHints` frame-interval bit plus the `FIXED_FRAME_RATE` flag in `bRateControlMode`), which is what chooses whether a too-small bitrate costs frames or sharpness. Adds `uvc_host_stream_set_ae_priority()` over the Camera Terminal's Auto-Exposure Priority control - the SENSOR half of that same choice, and the half that actually dominates indoors. | `usb_host_uvc` exposes encoding-unit controls of its own. |
 | `0004-usb_host_uvc-match-alt-setting-to-negotiated-payload.patch` | `espressif/usb_host_uvc` 2.5.2 | Alternate setting is chosen before the probe, so it does not match `dwMaxPayloadTransferSize`; every isoc packet then returns `COMPLETED` with zero bytes. Also makes `uvc_host_usb_ctrl()` survive a transaction error: USBH clears EP0 from the host-library task, not inline, so a resubmit has to yield first - without that a single `Dev 1 EP 0 Error` after a soft reset turned every later control transfer into `ESP_ERR_INVALID_STATE` and the stream never opened. A STALL is deliberately *not* retried (it is the device's definitive answer, and USBH re-arms EP0 itself), and the `usb_host_endpoint_clear(dev_hdl, 0)` this patch used to do is gone - EP0 is not claimable, so it only ever printed two error lines. | Upstream re-selects the alt setting after the probe. |
 | `0003-esp_video-apply-uvc-h264-config-before-stream-start.patch` | `espressif/esp_video` 2.4.1 | Opens the UVC stream with the V4L2-selected format instead of `frame_info[0]`, applies the H.264 extension-unit config between `format_select()` and `stream_start()`, and defines `esp_video_uvc_request_key_frame()`. It no longer asks for a key frame at stream start: a camera without that control STALLs it and USBH logs `Dev N EP 0 STALL` at ERROR on every boot for nothing. The root-port-power workaround it once carried is gone — `PRTPWR` does not gate the camera's VBUS, so it never did anything; see `components/media_stream/README.md`. | `esp_video` opens with the selected format and exposes UVC encoder controls. |
+| (same patch, added later) | | It also carries `esp_video_uvc_set_h264_start_bitrate()`: the rate asked for at stream start was a compile-time constant, so restarting the stream re-applied the same value. Measured on ESP32-S31, the camera honours the extension-unit PROBE and COMMIT at runtime and then **ignores** the bitrate, keeping what it committed at stream start - and frame rate is no substitute, since it is CBR (30 -> 20 fps left the rate unchanged and doubled per-frame size). A stream restart is therefore the only actuation left, and this is the setter it needs. Folded into 0003 rather than added as its own patch: a separate patch editing lines 0003 *adds* breaks 0003's reverse-dry-run "already applied" check, so the second configure re-applies it and every hunk fails. | |
 
 ## Regression: 0003 lost its `.vs_format` change once
 
@@ -72,6 +73,60 @@ and each one cost a full GOP while the grabber waited for the next IDR - long en
 KVS to reject the fragment and force a session restart.
 
 If `frame_info[0]` ever appears in the `stream_config` again, this is the bug.
+
+### The frame-rate/quality trade lives in two places, and the encoder is the lesser one
+
+The H.264 extension unit decides how the encoder spends a bitrate. It cannot decide how
+many frames the sensor produces - and in dim light that is the binding constraint, because
+auto-exposure lengthens exposure past the frame interval and the sensor rate falls to suit.
+
+Measured on ESP32-S31 at 720p in indoor evening light, with the extension unit alone:
+14-15 fps at every bitrate from 800 kbps to 2.4 Mbps. Average frame grew 6.5 -> 20.2 KB and
+the frame count never moved. Tripling the bitrate bought only quality, because no encoder
+setting can create a frame that was never captured.
+
+The control that does decide it is the Camera Terminal's **Auto-Exposure Priority**
+(`CT_AE_PRIORITY_CONTROL`, selector 0x03): 0 holds the frame rate constant and lets the
+picture go dark, 1 lets exposure win and the rate fall. Setting it to 0 took the same
+camera at the same 800 kbps from 14-15 fps to 29-30.
+
+`bmControls` D2 is checked before writing: a camera that does not implement a control
+STALLs EP0 and USBH logs that at ERROR, which would put an error in the log of every boot
+on cameras that lack it - the same trap 0003 documents for the key-frame control.
+
+Worth knowing: this camera **clears** the encoder's `FIXED_FRAME_RATE` flag
+(`rc_mode 0x01`, never 0x11), so the encoder half of the trade is inert on it and the
+sensor half carries the whole result. A camera could plausibly be the other way round,
+which is why both are set.
+
+### `bmHints` values are assignments, not bit positions
+
+The H.264 payload spec's `bmHints` bits are not in field order, and 0002 originally guessed
+them: `FRAME_INTERVAL` as `0x0001`, `BITRATE` as `0x0002`, `IFRAME_PERIOD` as `0x2000`. The
+real values are `0x0800`, `0x2000` and `0x8000`. Nothing failed, because a wrong bit is
+still a valid hint for some *other* field - so the guesses quietly asserted `RESOLUTION`,
+`PROFILE` and `BITRATE` instead.
+
+The bitrate lever therefore worked only by accident: the value written for the key-frame
+period's hint happened to be the bitrate's real bit, and
+`CONFIG_ESP_VIDEO_UVC_H264_IFRAME_PERIOD_MS` is non-zero by default, so it was always OR'd
+in. Set that option to 0 and the camera would have stopped honouring the bitrate.
+
+`bmHints` says which fields the camera must hold fixed, so every field left unhinted is one
+it may trade away. Pinning the frame rate hinted resolution, profile and bitrate and *not*
+the frame interval - naming the frame interval as the one thing the camera was free to
+sacrifice. It obliged: 30 fps became 15 at an unchanged bitrate, the exact inverse of the
+request, and the option read as "the camera ignores the hint". It was doing as it was told.
+
+Two consequences worth keeping:
+
+- `bmHints` is rebuilt from zero on every transaction rather than OR'd into the read-back.
+  It is a host-to-device directive, not device state, and accumulating made a hint permanent
+  once set - the frame-rate pin could be switched on but never off, which both the
+  mid-stream and restart actuation paths need to do.
+- Pinning asserts *two* things: the frame-interval hint ("do not change this number") and
+  `UVCX_RC_FIXED_FRAME_RATE` in `bRateControlMode` ("do not drop frames to meet the
+  bitrate"). A camera may honour either alone, and the second is not implied by the first.
 
 ## Clean-rebuild notes
 

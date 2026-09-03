@@ -181,6 +181,44 @@ esp_err_t video_capture_get_bitrate(video_capture_handle_t handle, uint32_t *bit
 esp_err_t video_capture_request_keyframe(void);
 
 /**
+ * @brief Choose what gives way when the camera's bitrate is too small: frames or sharpness
+ *
+ * Runtime equivalent of the CONFIG_MEDIA_STREAM_UVC_RATE_TRADEOFF choice, for the UVC
+ * H.264 passthrough path. The camera reads its encoder configuration only while the
+ * stream is being set up, so this restarts the stream - about a second of lost video and
+ * a fresh IDR - and takes effect on the next frame after that.
+ *
+ * @param[in] pin_frame_rate true to fix the frame rate and let quality absorb the
+ *                           shortfall, false to let the camera hold quality and shed
+ *                           frames
+ * @return ESP_OK once the request is queued, ESP_ERR_NOT_SUPPORTED on a build that owns
+ *         its encoder - there fps and quality are separate knobs, not two ways of
+ *         spending one bitrate, so there is nothing to trade
+ */
+esp_err_t video_capture_set_rate_tradeoff(bool pin_frame_rate);
+
+/**
+ * @brief Set the camera's own H.264 bitrate budget at runtime, by restarting the stream
+ *
+ * A measurement lever, and the companion to video_capture_set_rate_tradeoff(): the
+ * frame-rate-versus-quality trade only has anything to trade where the bitrate leaves the
+ * camera a choice.
+ *
+ * Takes effect the same way as the trade-off switch: the capture task restarts the UVC
+ * stream, which is when the camera re-reads its encoder configuration. The board is not
+ * reset, so the camera keeps its power and a whole sweep costs no replugs.
+ *
+ * Rate-control actuation is switched OFF as a side effect.
+ *
+ * @param[in] ref_bitrate_bps Budget at the 1280x720 reference, scaled by pixel count to
+ *                            the negotiated resolution - the same terms as
+ *                            CONFIG_ESP_VIDEO_UVC_H264_BITRATE_BPS. 0 restores the
+ *                            configured default.
+ * @return ESP_OK once queued, ESP_ERR_NOT_SUPPORTED where we own the encoder
+ */
+esp_err_t video_capture_set_camera_bitrate(uint32_t ref_bitrate_bps);
+
+/**
  * @brief Release a video frame when no longer needed (MJPEG only - deprecated)
  *
  * @deprecated Counterpart to video_capture_get_frame(); see its note.

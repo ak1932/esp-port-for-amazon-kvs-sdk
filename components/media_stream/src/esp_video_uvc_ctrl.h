@@ -29,6 +29,26 @@
 esp_err_t esp_video_uvc_request_key_frame(void);
 
 /**
+ * @brief Choose whether auto-exposure may lower the SENSOR frame rate
+ *
+ * The other half of the frame-rate/quality trade, and the half the H.264 extension unit
+ * cannot reach. The XU decides how the encoder spends a bitrate; this decides how many
+ * frames the sensor produces in the first place. Measured on ESP32-S31 at 720p in indoor
+ * evening light: 14-15 fps at every bitrate from 800 kbps to 2.4 Mbps, with average frame
+ * size tripling and the frame count flat - the sensor, not the encoder.
+ *
+ * Takes effect mid-stream, no restart needed, and is re-applied at each stream start.
+ *
+ * @param[in]  priority  0 = constant frame rate (dark and noisy in dim light),
+ *                       1 = exposure wins and the frame rate falls (the UVC default)
+ * @param[out] committed If non-NULL, the value read back from the camera
+ * @return ESP_OK; ESP_ERR_NOT_SUPPORTED when the Camera Terminal does not implement it;
+ *         ESP_ERR_INVALID_STATE when no stream is running, in which case the value is
+ *         still recorded and applied at the next stream start
+ */
+esp_err_t esp_video_uvc_set_ae_priority(uint8_t priority, uint8_t *committed);
+
+/**
  * @brief Bitrate the camera committed at stream start
  *
  * This, not the configured request, is the ceiling a rate controller may work down
@@ -54,6 +74,30 @@ esp_err_t esp_video_uvc_get_h264_committed_bitrate(uint32_t *bps);
  * @return ESP_OK, ESP_ERR_NOT_SUPPORTED, or ESP_ERR_INVALID_STATE as above
  */
 esp_err_t esp_video_uvc_set_h264_bitrate(uint32_t bitrate_bps, uint32_t *committed_bps);
+
+/**
+ * @brief Choose the bitrate the NEXT stream start will ask for
+ *
+ * Added by patches/managed_components/0003 (folded in, see its README row). Records a
+ * value and performs no I/O; it
+ * takes effect when the stream is next started, so the caller stops and restarts the
+ * stream to apply it.
+ *
+ * This exists because esp_video_uvc_set_h264_bitrate() is not universally honoured:
+ * a camera measured on ESP32-S31 completes the extension-unit PROBE and COMMIT and
+ * then keeps the bitrate it committed at stream start, so mid-stream actuation is
+ * simply unavailable and restarting the stream is the only way to change the rate.
+ *
+ * The value is a budget at the **1280x720 reference**, exactly like
+ * CONFIG_ESP_VIDEO_UVC_H264_BITRATE_BPS, because it goes through the same pixel-count
+ * scaling. Passing an absolute rate for the current resolution would be scaled again -
+ * at 1080p that is a factor of 2.25 too high. Use
+ * MEDIA_STREAM_UVC_BITRATE_REF_PIXELS to convert.
+ *
+ * @param ref_bitrate_bps Budget at 1280x720, or 0 to fall back to the Kconfig value
+ * @return ESP_OK
+ */
+esp_err_t esp_video_uvc_set_h264_start_bitrate(uint32_t ref_bitrate_bps);
 
 /**
  * @brief Choose what gives way when the bitrate is too low: frame rate or quality

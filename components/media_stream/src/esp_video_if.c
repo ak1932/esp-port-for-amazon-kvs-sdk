@@ -171,6 +171,16 @@ static void print_video_device_info(const struct v4l2_capability *capability)
  * enumerate densely, so sweeping a few extra indices costs nothing there. */
 #define ENUM_FMT_PROBE_COUNT    8
 
+static bool fps_seen(const uint32_t *seen, int n, uint32_t fps)
+{
+    for (int i = 0; i < n; i++) {
+        if (seen[i] == fps) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Log what the device actually offers. Diagnostic only — a mismatch between
  * this and the format we request is the difference between "S_FMT failed" and
  * "streaming starts but no frame ever arrives". */
@@ -207,8 +217,44 @@ static void log_supported_formats(int fd)
             }
 
             if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
-                ESP_LOGI(TAG, "        %" PRIu32 "x%" PRIu32,
-                         frmsize.discrete.width, frmsize.discrete.height);
+                /* Frame intervals too, on one line with the size. Which rates a
+                 * camera advertises decides whether frame rate is a rate-control
+                 * lever at all: uvc_video_set_parm() validates a VIDIOC_S_PARM
+                 * request against exactly this list and returns EINVAL when the
+                 * asked-for interval is not in it */
+                char fps_list[96];
+                size_t off = 0;
+                uint32_t seen[16];
+                int n_seen = 0;
+                fps_list[0] = '\0';
+                for (uint32_t k = 0; off < sizeof(fps_list) - 12; k++) {
+                    struct v4l2_frmivalenum fival = {
+                        .index        = k,
+                        .pixel_format = fmtdesc.pixelformat,
+                        .width        = frmsize.discrete.width,
+                        .height       = frmsize.discrete.height,
+                        /* Same input-`type` quirk as VIDIOC_ENUM_FRAMESIZES above. */
+                        .type         = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+                    };
+                    if (ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &fival) != 0) {
+                        break;
+                    }
+                    if (fival.type == V4L2_FRMIVAL_TYPE_DISCRETE &&
+                            fival.discrete.numerator > 0) {
+                        const uint32_t fps = fival.discrete.denominator / fival.discrete.numerator;
+                        if (fps >= 1 && fps <= 120 && !fps_seen(seen, n_seen, fps)) {
+                            if (n_seen < (int)(sizeof(seen) / sizeof(seen[0]))) {
+                                seen[n_seen++] = fps;
+                            }
+                            off += snprintf(fps_list + off, sizeof(fps_list) - off, "%s%" PRIu32,
+                                            off ? "," : "", fps);
+                        }
+                    }
+                }
+                ESP_LOGI(TAG, "        %" PRIu32 "x%" PRIu32 "%s%s%s",
+                         frmsize.discrete.width, frmsize.discrete.height,
+                         fps_list[0] ? " @ " : "", fps_list,
+                         fps_list[0] ? " fps" : " (no frame intervals advertised)");
             } else {
                 ESP_LOGI(TAG, "        %" PRIu32 "x%" PRIu32 " .. %" PRIu32 "x%" PRIu32,
                          frmsize.stepwise.min_width, frmsize.stepwise.min_height,
@@ -260,7 +306,7 @@ static esp_err_t init_camera(v4l2_src_t *v4l2)
         ESP_LOGW(TAG, "DQBUF timeout disabled by configuration; DQBUF will block indefinitely");
     }
 
-    log_supported_formats(fd);
+    // log_supported_formats(fd);
 
     /* Query sensor chip ID via esp_cam_sensor ioctl to detect OV2710 (PID 0x2710) */
     esp_cam_sensor_id_t chip_id = {0};

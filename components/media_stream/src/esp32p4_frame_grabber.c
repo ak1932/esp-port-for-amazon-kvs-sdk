@@ -136,7 +136,19 @@ static bool s_key_frame_ctrl_supported = true;
  * extension unit answers every attempt with an EP0 STALL, and hammering the control
  * endpoint of a UVC camera is how it gets into a state only a replug fixes. */
 static bool s_xu_rate_ctrl_supported;
+/* Consecutive commits whose transaction the camera honoured while ignoring the
+ * value. Distinct from the STALL case above: nothing fails, so only comparing
+ * committed against requested reveals it. */
+static uint32_t s_xu_refusals;
 static int64_t s_last_xu_commit_us;
+#if MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR && CONFIG_MEDIA_STREAM_UVC_PASSTHROUGH_H264 && \
+    CONFIG_MEDIA_STREAM_UVC_BITRATE_VIA_RESTART
+/* Set once the mid-stream lever is known not to work, when restarting the stream
+ * is available as the fallback actuation. Mutually exclusive with declaring the
+ * bitrate not actuable: in this mode it IS actuable, just expensive. */
+static bool    s_xu_restart_mode;
+static int64_t s_last_restart_us;
+#endif
 
 /* Minimum spacing between bitrate commits. Each one is a PROBE/PROBE/COMMIT - three
  * synchronous EP0 control transfers - on the very task that dispatches frames to every
@@ -583,7 +595,17 @@ static void publish_encoded_frame(uint8_t *buffer, uint32_t len, esp_h264_frame_
 
     static uint64_t enc_fps_window_start_us;
     static uint32_t enc_fps_window_out;
+    /* Counted here rather than in video_sink_dispatch(): that returns early when
+     * no sink is enabled, so the achieved bitrate would read zero exactly when
+     * the camera is running with no consumer attached - which is the baseline
+     * measurement. This is encoder output, not dispatch. */
+    static uint64_t enc_window_bytes;
+    static uint32_t enc_window_max_len;
     enc_fps_window_out++;
+    enc_window_bytes += len;
+    if (len > enc_window_max_len) {
+        enc_window_max_len = len;
+    }
     uint64_t enc_now_us = esp_timer_get_time();
     if (enc_fps_window_start_us == 0) {
         enc_fps_window_start_us = enc_now_us;
@@ -591,10 +613,21 @@ static void publish_encoded_frame(uint8_t *buffer, uint32_t len, esp_h264_frame_
         uint64_t enc_window_us = enc_now_us - enc_fps_window_start_us;
         uint32_t enc_fps = (uint32_t)((uint64_t)enc_fps_window_out * 1000000ULL / enc_window_us);
         uint32_t sink_us = video_sink_take_window_us();
-        ESP_LOGI(TAG, "enc_fps: out=%" PRIu32 " (sink_ms=%" PRIu32 "/%" PRIu32 ")",
-                 enc_fps, sink_us / 1000, (uint32_t)(enc_window_us / 1000));
+        /* kbps is what the encoder PRODUCED, not what the radio carried: each
+         * transport adds its own framing, and with two sinks live the same video
+         * leaves the device twice. max= is the largest frame in the window, i.e.
+         * the keyframe size - the number that should size
+         * CONFIG_MEDIA_STREAM_UVC_COMPRESSED_FRAME_MAX_KB rather than a guess. */
+        uint32_t kbps = (enc_window_us >= 1000)
+                        ? (uint32_t)((enc_window_bytes * 8ULL) / (enc_window_us / 1000)) : 0;
+        ESP_LOGI(TAG, "enc_fps: out=%" PRIu32 " kbps=%" PRIu32 " max=%" PRIu32 "K "
+                      "(sink_ms=%" PRIu32 "/%" PRIu32 ")",
+                 enc_fps, kbps, enc_window_max_len / 1024,
+                 sink_us / 1000, (uint32_t)(enc_window_us / 1000));
         enc_fps_window_start_us = enc_now_us;
         enc_fps_window_out = 0;
+        enc_window_bytes = 0;
+        enc_window_max_len = 0;
     }
 }
 
@@ -655,6 +688,232 @@ static void register_raw_sink(void)
     }
 }
 
+#if MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR && CONFIG_MEDIA_STREAM_UVC_PASSTHROUGH_H264 && \
+    CONFIG_MEDIA_STREAM_UVC_BITRATE_VIA_RESTART
+/**
+ * Apply a pending bitrate change by restarting the UVC stream.
+ *
+ * The last resort actuation, for a camera that honours the H.264 extension-unit
+ * PROBE/COMMIT at runtime and then ignores the value (see the refusal latch in the
+ * frame loop). Restarting is the only remaining way to change the rate, because the
+ * camera only reads it while the stream is being set up.
+ *
+ * Costly and deliberately rare: esp_video_if_start() on UVC frees the capture buffers,
+ * reopens the device and re-negotiates the format, so this loses roughly a second of
+ * video and forces a fresh IDR. Two gates keep it rare - a minimum interval, and a
+ * minimum distance between what the camera committed and what the ladder now wants -
+ * and both are Kconfig, because the right trade depends on how bad the uplink is.
+ *
+ * MUST be called with no capture buffer held: it tears the buffers down. The call site
+ * is the top of the loop, before esp_video_if_get_frame().
+ */
+static void uvc_maybe_restart_for_bitrate(void)
+{
+    if (!s_xu_restart_mode) {
+        return;
+    }
+
+    const int64_t now = esp_timer_get_time();
+    if ((now - s_last_restart_us) <
+            (int64_t) CONFIG_MEDIA_STREAM_UVC_RESTART_MIN_INTERVAL_S * 1000000) {
+        return;
+    }
+
+    /* What the ladder wants versus what the camera is actually doing. The committed
+     * value is the honest baseline here - comparing against our own last request would
+     * compare two numbers the camera never agreed to. */
+    video_rate_ctrl_encoder_stats_t enc = {0};
+    if (video_rate_ctrl_get_encoder_stats(&enc) != ESP_OK ||
+            enc.requested_bps == 0 || enc.committed_bps == 0) {
+        return;
+    }
+    const uint32_t want = enc.requested_bps;
+    const uint32_t have = enc.committed_bps;
+    const uint32_t delta = (want > have) ? (want - have) : (have - want);
+    if ((uint64_t) delta * 100ULL <
+            (uint64_t) have * (uint64_t) CONFIG_MEDIA_STREAM_UVC_RESTART_MIN_DELTA_PCT) {
+        return;
+    }
+
+    /* Convert to the budget-at-1280x720 the setter takes: it goes through the same
+     * pixel-count scaling as the Kconfig value, so handing it an absolute rate for the
+     * current resolution would scale it a second time (2.25x at 1080p). */
+    video_resolution_t res = {0};
+    uint32_t ref_bps = want;
+    if (esp_video_if_get_resolution(&res) == ESP_OK && res.width && res.height) {
+        const uint64_t pixels = (uint64_t) res.width * (uint64_t) res.height;
+        if (pixels) {
+            ref_bps = (uint32_t) (((uint64_t) want * MEDIA_STREAM_UVC_BITRATE_REF_PIXELS) / pixels);
+        }
+    }
+
+    ESP_LOGW(TAG, "restarting the UVC stream to apply %" PRIu32 " bps (camera is at %"
+                  PRIu32 "); about a second of video is lost", want, have);
+    esp_video_uvc_set_h264_start_bitrate(ref_bps);
+    s_last_restart_us = now;
+
+    esp_video_if_stop();
+    if (esp_video_if_start() != ESP_OK) {
+        /* One failed restart is not worth risking a second: on this stack a half-torn
+         * UVC stream is what needs a physical replug to clear. */
+        ESP_LOGE(TAG, "stream restart failed; bitrate actuation disabled for this session");
+        s_xu_restart_mode = false;
+        video_rate_ctrl_set_bitrate_actuable(false);
+        return;
+    }
+
+    /* Read back what it committed this time and report it, so the next comparison is
+     * against reality. NOT re-seeding video_rate_ctrl_init(): its max_bitrate_bps is the
+     * camera's capability, and lowering it to whatever we just asked for would make the
+     * reduced rate the new L0 and leave the ladder unable to climb back. */
+    uint32_t committed = 0;
+    if (esp_video_uvc_get_h264_committed_bitrate(&committed) == ESP_OK && committed) {
+        video_rate_ctrl_report_committed_bitrate_bps(committed);
+        ESP_LOGI(TAG, "stream restarted: camera now at %" PRIu32 " bps (asked %" PRIu32
+                      " at the %ux%u reference)", committed, ref_bps,
+                 MEDIA_STREAM_UVC_BITRATE_REF_W, MEDIA_STREAM_UVC_BITRATE_REF_H);
+
+        /* The camera would not go as low as asked, so that is its floor - tell the
+         * ladder, or this repeats forever: the gap between what the ladder wants and
+         * what the camera gives stays above the restart threshold, and we spend a
+         * restart per interval buying nothing. Measured: asked 180000 at 1080p,
+         * committed 256000, four restarts in two minutes with no change. Only
+         * believed when asking DOWN - a camera clamping upward is a different fact. */
+        if (want < committed) {
+            const uint32_t tol = committed / 10;
+            if (want + tol < committed) {
+                video_rate_ctrl_set_min_bitrate_bps(committed);
+            }
+        }
+    }
+    /* Fresh stream: give the mid-stream path another chance (a camera may accept
+     * changes in some states), and resync downstream on the first IDR. */
+    s_xu_refusals = 0;
+    s_wait_for_idr = true;
+}
+#endif
+
+#if MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR && CONFIG_MEDIA_STREAM_UVC_PASSTHROUGH_H264
+/* Runtime trade-off switch. Requested from any task, applied by the capture task.
+ *
+ * Deliberately NOT gated on CONFIG_MEDIA_STREAM_UVC_BITRATE_VIA_RESTART: that option is
+ * about whether the rate CONTROLLER may spend restarts, and this is a one-off operator
+ * request. The two share the restart mechanism and nothing else, including the interval
+ * gate - an operator flipping the setting is not a control loop that can ring.
+ *
+ * Plain bools rather than a queue: a later request simply supersedes an earlier one, so a
+ * torn read can only mean acting on the newer value, which is the answer either way. */
+static volatile bool s_tradeoff_req_pending;
+static volatile bool s_tradeoff_req_pin;
+/* Sentinel-free: a separate "was a bitrate asked for" flag, because 0 is a meaningful
+ * request (restore the configured default) and not an absence. */
+static volatile bool     s_bitrate_req_pending;
+static volatile uint32_t s_bitrate_req_ref_bps;
+
+esp_err_t video_capture_set_rate_tradeoff(bool pin_frame_rate)
+{
+    s_tradeoff_req_pin     = pin_frame_rate;
+    s_tradeoff_req_pending = true;
+    return ESP_OK;
+}
+
+esp_err_t video_capture_set_camera_bitrate(uint32_t ref_bitrate_bps)
+{
+    s_bitrate_req_ref_bps = ref_bitrate_bps;
+    s_bitrate_req_pending = true;
+    s_tradeoff_req_pending = true;   /* same restart carries both */
+    return ESP_OK;
+}
+
+/* AE Priority is a live Camera Terminal control, so this needs no restart and no special
+ * call site - but it is re-applied inside the trade-off path anyway, because a stream
+ * restart re-runs the camera's own setup and would otherwise revert it. */
+static void uvc_apply_ae_priority(bool pin_frame_rate)
+{
+    const uint8_t want = pin_frame_rate ? 0u : 1u;
+    uint8_t committed = 0xff;
+    const esp_err_t err = esp_video_uvc_set_ae_priority(want, &committed);
+
+    if (err == ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGW(TAG, "camera cannot hold its sensor frame rate (no AE Priority control); in "
+                      "dim light it will shed fps whatever the encoder is told");
+    } else if (err != ESP_OK) {
+        ESP_LOGW(TAG, "AE Priority %u not applied: %s", want, esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG, "sensor frame rate: %s (AE Priority %u)",
+                 committed == 0 ? "held constant - exposure gives way"
+                                : "free to fall so exposure is correct", committed);
+    }
+}
+
+/* MUST be called with no capture buffer held - it tears the buffers down. Same call site
+ * constraint as uvc_maybe_restart_for_bitrate(), for the same reason. */
+static void uvc_maybe_apply_tradeoff(void)
+{
+    if (!s_tradeoff_req_pending) {
+        return;
+    }
+    s_tradeoff_req_pending = false;
+
+    if (s_bitrate_req_pending) {
+        s_bitrate_req_pending = false;
+        const uint32_t ref = s_bitrate_req_ref_bps;
+        esp_video_uvc_set_h264_start_bitrate(ref);
+        /* See the header: the ladder's ceiling is the previously committed rate, so leaving
+         * actuation on would have it spending restarts undoing this. */
+        video_rate_ctrl_set_bitrate_actuable(false);
+        ESP_LOGW(TAG, "camera bitrate budget -> %" PRIu32 " bps at the %ux%u reference "
+                      "(0 = configured default); rate-control actuation is now OFF",
+                 ref, MEDIA_STREAM_UVC_BITRATE_REF_W, MEDIA_STREAM_UVC_BITRATE_REF_H);
+    }
+
+    const bool pin = s_tradeoff_req_pin;
+    const uint32_t want_fps = (CONFIG_MEDIA_STREAM_UVC_TARGET_FPS > 0)
+                              ? CONFIG_MEDIA_STREAM_UVC_TARGET_FPS : 30u;
+
+    esp_video_uvc_set_h264_frame_interval(
+        pin ? (MEDIA_STREAM_UVC_INTERVAL_UNITS_PER_S / want_fps) : 0);
+    /* The sensor half of the same choice. Without this the trade-off is unreachable in dim
+     * light: no encoder setting can create a frame auto-exposure never captured. */
+    uvc_apply_ae_priority(pin);
+    ESP_LOGW(TAG, "rate trade-off -> %s; restarting the UVC stream to apply it, "
+                  "about a second of video is lost",
+             pin ? "frame rate pinned (quality gives way)"
+                 : "frame rate free (the camera may shed fps)");
+
+    esp_video_if_stop();
+    if (esp_video_if_start() != ESP_OK) {
+        ESP_LOGE(TAG, "stream restart failed applying the rate trade-off; the camera needs "
+                      "a replug");
+        return;
+    }
+
+    /* The camera re-reads its whole encoder config during STREAMON, so the bitrate is
+     * committed again here too - report it, or the ladder keeps comparing against the
+     * value from before the restart. */
+    uint32_t committed = 0;
+    if (esp_video_uvc_get_h264_committed_bitrate(&committed) == ESP_OK && committed) {
+        video_rate_ctrl_report_committed_bitrate_bps(committed);
+    }
+    s_wait_for_idr = true;
+}
+#else
+esp_err_t video_capture_set_rate_tradeoff(bool pin_frame_rate)
+{
+    /* Defined unconditionally so the console command and any other caller link on every
+     * target. There is nothing to trade where we own the encoder: fps and quality are
+     * separate knobs there, not two ways of spending one bitrate. */
+    (void) pin_frame_rate;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t video_capture_set_camera_bitrate(uint32_t ref_bitrate_bps)
+{
+    (void) ref_bitrate_bps;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+#endif
+
 static void video_encoder_task(void *arg)
 {
     ESP_LOGD(TAG, "Video encoder task started (singleton mode - runs continuously)");
@@ -673,6 +932,16 @@ static void video_encoder_task(void *arg)
         }
 
         video_frame_preprocess_fn_t frame_preprocess_fn = (video_frame_preprocess_fn_t) arg;
+#if MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR && CONFIG_MEDIA_STREAM_UVC_PASSTHROUGH_H264
+        /* Here, and only here: both of these tear the capture buffers down, so they have
+         * to run at a point where this task holds none. The operator request goes first -
+         * it changes how the ladder's next bitrate will be spent. */
+        uvc_maybe_apply_tradeoff();
+#endif
+#if MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR && CONFIG_MEDIA_STREAM_UVC_PASSTHROUGH_H264 && \
+    CONFIG_MEDIA_STREAM_UVC_BITRATE_VIA_RESTART
+        uvc_maybe_restart_for_bitrate();
+#endif
 #if USE_ESP_VIDEO_IF
         // Get raw frame
         video_fb_t *raw_frame = esp_video_if_get_frame();
@@ -928,11 +1197,65 @@ static void video_encoder_task(void *arg)
                 uint32_t committed = 0;
                 const esp_err_t rc_ret = esp_video_uvc_set_h264_bitrate(new_bps, &committed);
                 if (rc_ret == ESP_OK) {
-                    /* Logged, not fed back into the ladder. A camera whose pipeline has
-                     * died accepts these writes silently, so the committed value is a
-                     * report and the controller's own rung stays authoritative. */
+                    /* Reported for diagnostics, deliberately NOT fed into change
+                     * detection: a camera that answers every request with the same
+                     * number would then look like a permanently pending change and
+                     * turn this 2 s throttle into an unbounded EP0 storm. */
+                    video_rate_ctrl_report_committed_bitrate_bps(committed);
                     ESP_LOGD(TAG, "camera bitrate -> %" PRIu32 " bps (committed %" PRIu32 ")",
                              new_bps, committed);
+
+                    /* A SILENT refusal: probe and commit both succeeded and the camera
+                     * kept its own number. Observed on a camera that accepts an H.264
+                     * bitrate only while the stream is being set up - at runtime the
+                     * transaction is honoured and the value ignored.
+                     *
+                     * This has to be latched, because the alternative is worse than
+                     * useless: the ladder keeps stepping down a lever that reaches
+                     * nothing, `sink-stats` reports rungs the wire never saw, and we
+                     * spend three EP0 control transfers every 2 s on the task that also
+                     * feeds every sink. Two consecutive refusals rather than one, so a
+                     * single clamp at a boundary is not mistaken for a camera that never
+                     * moves; 10% tolerance because clamping to a nearby supported rate
+                     * is normal and still counts as actuating. */
+                    const uint32_t tol = new_bps / 10;
+                    if (committed + tol < new_bps || committed > new_bps + tol) {
+                        if (++s_xu_refusals >= 2) {
+                            /* Either way the mid-stream path is dead and must stop
+                             * spending EP0 transfers on it. What differs is whether
+                             * there is another way to actuate at all. */
+                            s_xu_rate_ctrl_supported = false;
+#if CONFIG_MEDIA_STREAM_UVC_BITRATE_VIA_RESTART
+                            ESP_LOGW(TAG, "camera ignores runtime bitrate changes (asked %"
+                                          PRIu32 ", committed %" PRIu32 " twice) - it accepts "
+                                          "an H.264 rate only at stream start; switching to "
+                                          "restart-based actuation",
+                                     new_bps, committed);
+                            s_xu_restart_mode = true;
+                            /* Deliberately NOT marking the bitrate inactuable: the
+                             * ladder must keep producing targets for the restart path
+                             * to aim at, and freezing it here would starve it. */
+                            s_last_restart_us = esp_timer_get_time();
+                            /* Actuation is now a stream restart, minutes apart. Without
+                             * saying so the queue front-end re-evaluates every 500 ms
+                             * and walks the whole ladder before the first change has
+                             * reached the camera - measured: eight rungs in 3 s. */
+                            video_rate_ctrl_set_actuation_period_ms(
+                                CONFIG_MEDIA_STREAM_UVC_RESTART_MIN_INTERVAL_S * 1000);
+#else
+                            ESP_LOGW(TAG, "camera ignores runtime bitrate changes (asked %"
+                                          PRIu32 ", committed %" PRIu32 " twice) - it accepts "
+                                          "an H.264 rate only at stream start; camera-side "
+                                          "rate control disabled for this session. Enable "
+                                          "CONFIG_MEDIA_STREAM_UVC_BITRATE_VIA_RESTART to "
+                                          "actuate by restarting the stream instead",
+                                     new_bps, committed);
+                            video_rate_ctrl_set_bitrate_actuable(false);
+#endif
+                        }
+                    } else {
+                        s_xu_refusals = 0;
+                    }
                 } else {
                     ESP_LOGW(TAG, "camera refused a bitrate change (%s); camera-side rate "
                                   "control disabled for this session",
@@ -1008,6 +1331,35 @@ esp_err_t esp32p4_frame_grabber_init(video_frame_preprocess_fn_t frame_preproces
     /* Retry: a USB camera may not have finished enumerating when the first session
      * starts (the UVC device waits ~10 s for it, then open() returns ENODEV). Failing
      * outright here kills the whole session for what is often a transient miss. */
+#if MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR && CONFIG_MEDIA_STREAM_UVC_PASSTHROUGH_H264
+    /* Must be chosen BEFORE the interface comes up: the H.264 extension-unit config is
+     * applied inside STREAMON, so setting it after the camera is already streaming
+     * would only take effect on a later restart. The rate here is what we will ask the
+     * driver for - if it negotiates something else the camera may refuse the hint, and
+     * the `camera H.264 committed:` line reports the interval it actually took. */
+#if CONFIG_MEDIA_STREAM_UVC_PREFER_FRAMERATE
+    {
+        const uint32_t want_fps = (CONFIG_MEDIA_STREAM_UVC_TARGET_FPS > 0)
+                                  ? CONFIG_MEDIA_STREAM_UVC_TARGET_FPS : 30u;
+        esp_video_uvc_set_h264_frame_interval(MEDIA_STREAM_UVC_INTERVAL_UNITS_PER_S / want_fps);
+        ESP_LOGI(TAG, "rate trade-off: frame rate pinned at %" PRIu32 " fps - quality "
+                      "absorbs any bitrate shortfall", want_fps);
+    }
+#else
+    esp_video_uvc_set_h264_frame_interval(0);
+    ESP_LOGI(TAG, "rate trade-off: frame rate left free - the camera holds quality and "
+                  "sheds fps when the bitrate is short");
+#endif
+    /* Recorded now, applied by the driver at stream start: there is no stream to talk to
+     * yet, and AE Priority has to survive the restarts the bitrate actuator performs.
+     * ESP_ERR_INVALID_STATE is the expected answer here and is not a failure. */
+#if CONFIG_MEDIA_STREAM_UVC_PREFER_FRAMERATE
+    (void) esp_video_uvc_set_ae_priority(0, NULL);
+#else
+    (void) esp_video_uvc_set_ae_priority(1, NULL);
+#endif
+#endif
+
     esp_err_t ret = ESP_FAIL;
     for (int attempt = 1; attempt <= CAMERA_INIT_MAX_ATTEMPTS; attempt++) {
         ret = esp_video_if_init();
@@ -1136,10 +1488,23 @@ esp_err_t esp32p4_frame_grabber_init(video_frame_preprocess_fn_t frame_preproces
     uint32_t xu_bps = 0;
     if (esp_video_uvc_get_h264_committed_bitrate(&xu_bps) == ESP_OK && xu_bps > 0) {
         s_xu_rate_ctrl_supported = true;
+        /* Fresh verdict per stream: a camera that ignored runtime changes last
+         * session may accept them after a replug, and xu_bps is what it just
+         * committed at stream start. */
+        s_xu_refusals = 0;
+        /* Seed the committed value from what the camera took at stream start, so
+         * `sink-stats` reports reality from the first frame instead of 0 until some
+         * later change happens to report one - and so the restart path's want-vs-have
+         * comparison has a real baseline before its first restart. */
+        video_rate_ctrl_report_committed_bitrate_bps(xu_bps);
         s_last_xu_commit_us = esp_timer_get_time();
         video_rate_ctrl_init(cfg.enc_cfg.fps, xu_bps,
                              cfg.enc_cfg.res.width, cfg.enc_cfg.res.height,
                              /* fps_actuable = */ false);
+        /* After init(), which resets it: even the working mid-stream path is rate
+         * limited to one commit per XU_COMMIT_MIN_INTERVAL_US, so the level front-end
+         * must not out-run it. */
+        video_rate_ctrl_set_actuation_period_ms(XU_COMMIT_MIN_INTERVAL_US / 1000);
         ESP_LOGI(TAG, "UVC passthrough: hardware encoder idle, camera-side rate control "
                       "active from %" PRIu32 " bps (bitrate only, fps fixed)", xu_bps);
     } else {

@@ -309,6 +309,86 @@ menu "Media Stream Configuration"
             depends on MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR
             default 1080
 
+        choice MEDIA_STREAM_UVC_RATE_TRADEOFF
+            prompt "When the bitrate is too low, prefer"
+            depends on MEDIA_STREAM_UVC_PASSTHROUGH_H264
+            default MEDIA_STREAM_UVC_PREFER_QUALITY
+            help
+                A camera cannot always have both the frame rate and the picture. This
+                chooses which one it sacrifices, and it sets BOTH controls that decide
+                it.
+
+                Switchable at runtime with the `uvc-rate pin|free` console command,
+                which restarts only the UVC stream - no board reset, so the two can be
+                compared on one camera lifetime.
+
+            config MEDIA_STREAM_UVC_PREFER_QUALITY
+                bool "Prefer Quality"
+                help
+                    Auto-Exposure Priority 1 and no frame-interval hint: exposure wins
+                    and the sensor rate falls, and the encoder holds bits-per-pixel
+                    roughly constant. A correctly exposed, sharp picture, fewer of them
+                    - measured at 14-15 fps in indoor evening light, and at the bottom
+                    of the rate ladder it can reach single digits.
+
+                    This is the pre-existing behaviour, so it is the default.
+
+            config MEDIA_STREAM_UVC_PREFER_FRAMERATE
+                bool "Prefer Framerate"
+                help
+                    Auto-Exposure Priority 0 plus the frame-interval hint and the
+                    fixed-frame-rate flag: exposure may not run past the frame interval
+                    and the encoder must fit each frame into bitrate/fps bits. Smooth
+                    motion, darker and softer picture - measured at 29-30 fps where the
+                    default gave 14-15, at the same bitrate.
+
+                    Choose this where a dropped frame costs more than a blurry one -
+                    motion detection, anything counting or tracking.
+
+                    Two log lines at boot say whether the camera honoured it. Wanted:
+                    `sensor frame rate: held constant` and `AE Priority ... committed 0`.
+                    A camera whose Camera Terminal does not implement AE Priority warns
+                    that it cannot hold its sensor rate.
+
+        endchoice
+
+        config MEDIA_STREAM_UVC_BITRATE_VIA_RESTART
+            bool "Apply a new camera bitrate by restarting the stream"
+            depends on MEDIA_STREAM_UVC_PASSTHROUGH_H264
+            default n
+            help
+                Some UVC cameras accept an H.264 bitrate only while the stream is
+                being set up. At runtime the extension-unit PROBE and COMMIT both
+                succeed and the value is then ignored.
+
+                With this enabled the grabber restarts the UVC stream to apply a new
+                bitrate, which is the only actuation left. It is NOT free: the restart
+                frees and reallocates capture buffers, reopens the device and
+                re-negotiates the format, so it costs a visible gap of roughly a
+                second and a fresh IDR.
+
+        config MEDIA_STREAM_UVC_RESTART_MIN_INTERVAL_S
+            int "Minimum seconds between bitrate restarts"
+            depends on MEDIA_STREAM_UVC_BITRATE_VIA_RESTART
+            range 10 600
+            default 30
+            help
+                Floor on how often the stream may be restarted to change bitrate.
+                Sized against the cost: a restart is about a second of lost video, so
+                once every 30 s is a ~3% duty cycle, against the 30-50% loss a
+                saturated uplink produces.
+
+        config MEDIA_STREAM_UVC_RESTART_MIN_DELTA_PCT
+            int "Minimum bitrate change worth a restart (percent)"
+            depends on MEDIA_STREAM_UVC_BITRATE_VIA_RESTART
+            range 5 90
+            default 25
+            help
+                A restart must buy enough to pay for itself. Below this much change
+                between what the camera committed and what the ladder now wants, the
+                pending target is left to accumulate rather than spending a glitch on a
+                rung that barely moves.
+
         config MEDIA_STREAM_UVC_TARGET_FPS
             int "UVC capture frame rate (0 = leave the camera's default)"
             depends on MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR

@@ -1,9 +1,19 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.22)
+
+# for usrsctp submodule
+set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
 # Include common KVS SDK path setting
 include(${CMAKE_CURRENT_SOURCE_DIR}/../common_components/set_kvs_sdk_path.cmake)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
+
+# ESP-IDF v6 moved hal/spi_flash_types.h into the non-common esp_hal_mspi
+# component; espressif/network_provisioning 1.2.4 (pulled in by
+# CONFIG_APP_NETWORK_PROV_BLE) includes esp_flash.h without declaring the
+# dependency. No-op on 5.4/5.5.
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/idf6_compat.cmake)
+
 project(webrtc_classic)
 option(ENABLE_DATA_CHANNEL "Enable data_channel support" ON)
 

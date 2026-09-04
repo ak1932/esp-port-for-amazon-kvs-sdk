@@ -90,6 +90,41 @@ Both resources are created on demand if they do not exist and the identity is al
 On a UVC camera, note that `CONFIG_KVS_COMBINED_VIDEO_WIDTH/HEIGHT` do **not** apply —
 `CONFIG_MEDIA_STREAM_UVC_CAPTURE_*` and the `CONFIG_ESP_VIDEO_UVC_H264_*` options do.
 
+### UVC camera rate control (`Media Stream Configuration`)
+
+Only on the H.264 passthrough path, where the camera is the encoder. Frame rate is never
+a lever there — a passthrough frame arrives already encoded, and dropping one corrupts
+the stream to the next IDR — so the camera's own bitrate is the whole actuation surface.
+
+| Option | Default | |
+|---|---|---|
+| `CONFIG_MEDIA_STREAM_UVC_RATE_TRADEOFF` | Prefer Quality | What gives way when the bitrate is short: frames or sharpness. `Prefer Framerate` pins the sensor rate and lets quality absorb it. Switchable at runtime with `uvc-rate`. |
+| `CONFIG_MEDIA_STREAM_UVC_BITRATE_VIA_RESTART` | `n` | Make restarting the stream *the* way a new bitrate is applied, for a camera that ignores mid-stream changes. |
+| `CONFIG_MEDIA_STREAM_UVC_RESTART_MIN_INTERVAL_S` | 30 (10–600) | Floor on how often a restart may happen. |
+| `CONFIG_MEDIA_STREAM_UVC_RESTART_MIN_DELTA_PCT` | 25 (5–90) | How far the target must sit from what the camera committed before a restart is worth it. |
+
+**Why the restart option exists.** Some cameras accept an H.264 bitrate only while the
+stream is being set up. At runtime the extension-unit probe and commit both *succeed* and
+the value is then ignored, so nothing the rate controller decides reaches the wire.
+
+Turning the option on says your camera is one of those, and the mid-stream lever is then
+not tried at all — the first bitrate change restarts the stream. Left off, the grabber
+tries mid-stream and compares what the camera committed against what was asked for; after
+two refusals it declares the bitrate unactuable and freezes the controllers, because with
+frame rate already fixed that leaves no lever, and `sink-stats` then says so rather than
+reporting a control loop that does not exist.
+
+**It is not free.** A restart frees and reallocates the capture buffers, reopens the
+device and re-negotiates the format: roughly a second of lost video and a fresh IDR.
+Hence the two gates. They are deliberately asymmetric — a marginal *cut* is not worth a
+glitch, but the ladder climbs one rung at a time and adjacent rungs are only 20–25%
+apart, so on the way back **up** a much smaller change is accepted or the recovery
+strands and the bitrate appears never to return. The ladder is also told that actuation
+now costs a restart, so it stops re-evaluating faster than a change can possibly land.
+
+Leave it off unless the log says you need it; the line to look for is `camera ignores
+runtime bitrate changes`.
+
 ## Console commands
 
 ```
@@ -99,7 +134,16 @@ start-webrtc       start KVS WebRTC signaling and streaming
 stop-webrtc        stop it (camera stays up if PutMedia is running)
 sink-stats         per-consumer frame counts and callback timing
 sink-stats-reset   zero those counters
+uvc-rate pin|free  what gives way when the camera's bitrate is short (restarts the stream)
+uvc-bitrate <bps>  camera bitrate budget at the 1280x720 reference; restarts the stream
+                   and turns rate-control actuation off, so it is a measurement lever
 ```
+
+`uvc-rate` and `uvc-bitrate` exist so the two settings can be compared on **one camera
+lifetime**: reflashing resets the board, a reset taken while the camera streams wedges it,
+and only a physical replug clears that. Both are queued and applied by the capture task at
+the top of its loop. Watch the `camera H.264 committed:` line for what the camera actually
+agreed to — it clamps freely, and the committed value is the one to quote.
 
 `reboot`, `mem-dump`, `task-dump`, `sock-dump`, `heap-trace` and
 `wifi-set <ssid> <password>` come from the shared utilities.
@@ -170,48 +214,38 @@ paying to mux buffers the session would refuse. `sink-stats` shows both effects 
 `gate_held` for the first, `max_us`/`avg_us` for how much of the shared per-frame budget
 each path uses.
 
-**Known limitation.** `video_rate_ctrl` is process-global and only the WebRTC path feeds
-it, so where it is active, WebRTC backing off for a congested viewer link also throttles
-the frame rate the archive records. On an S31 with a UVC camera nothing throttles at all:
-the camera owns bitrate and GOP, so `CONFIG_ESP_VIDEO_UVC_H264_BITRATE_BPS`,
-`_IFRAME_PERIOD_MS` and the capture resolution are static choices. Details:
-[`components/media_stream/README.md`](../../components/media_stream/README.md).
+**One encoder, so one sink's congestion is felt by the other** — see the next section.
+On a UVC camera without a usable H.264 extension unit there is no lever at all:
+`CONFIG_ESP_VIDEO_UVC_H264_BITRATE_BPS`, `_IFRAME_PERIOD_MS` and the capture resolution
+are static choices, and PutMedia's upload queue is the only slack in the system.
 
-## Rate control when both sides run
+## Rate control across both sinks
 
-Each sink runs its **own** congestion controller. They measure different things,
-because they congest differently:
+Each sink runs **its own** congestion controller, because the two congest differently.
+PutMedia is store-and-forward, so backpressure shows up as a filling upload queue — a
+*level* signal, evaluated on a slow cadence with a trend term, because the queue cannot
+respond to a change for seconds, and suppressed entirely while PutMedia is refusing
+buffers (the queue then drains to empty though the stream is broken, and a dropped buffer
+is reported as an overflow instead). WebRTC would report how long a frame took to send,
+but that measures packetisation rather than the link, so its controller ships **disabled**.
 
-| Sink | Signal | State | Why |
-|---|---|---|---|
-| `putmedia` | upload-queue occupancy | **adapting** | Store-and-forward. Individual chunk writes rarely stall; the backlog grows instead. |
-| `webrtc` | per-frame send duration | **off** — see below | Real-time, *in principle*. In practice this signal does not work here. |
-
-Both drive the same fps/bitrate ladder, and both feed one arbiter — because there
-is only one H.264 encoder, and an encoded frame cannot be dropped for one sink
-and kept for another (every P-frame references the ones before it). The arbiter
-takes the **strict minimum**:
+Only the controllers are per sink. There is one encoder, and an encoded frame cannot be
+dropped for one sink and kept for another — every P-frame references the ones before it —
+so every sink receives every frame and the grabber drives the encoder at the **strict
+minimum** across the adapting controllers:
 
 ```
 encoder fps     = min(target fps of every adapting sink)
 encoder bitrate = min(target bitrate of every adapting sink)
 ```
 
-**Worst sink wins, and that is deliberate** — overshooting the slower consumer
-corrupts its stream rather than merely degrading it.
+Worst sink wins, deliberately: overshooting the slower consumer corrupts its stream
+rather than merely degrading it. Two rules keep that honest — a controller that stops
+reporting is dropped from the minimum after 5 s, so a wedged sender cannot pin the
+encoder at its last rung, and a controller with no working signal must stay disabled,
+since the reports are the only thing that lets one climb back up.
 
-Two details keep the PutMedia side honest:
-
-- Queue depth is a *level* signal, so it is evaluated on a slow cadence with a
-  trend term. Reacting per frame would walk the ladder to the floor on a
-  transient, seconds before the queue could possibly respond.
-- While PutMedia is refusing buffers (session reopening, or skipping to the next
-  cluster after a loss) the queue **drains to empty** even though the stream is
-  broken. Reporting is suppressed in that state, and an actual dropped buffer is
-  reported as an overflow instead.
-
-Read it live with `sink-stats`, which prints each controller's rung alongside the
-arbitrated result:
+`sink-stats` prints each controller's rung beside the arbitrated result:
 
 ```
 controller     state     rung   fps    bitrate  load%    netceil   reports
@@ -220,9 +254,10 @@ putmedia       adapting     3    20     524288     31          0      1902
 encoder (strict min of adapting rows): 20 fps / 524288 bps
 ```
 
-Only rows marked `adapting` enter the minimum. A controller that stops reporting
-is marked `stale` and dropped from it after 5 s, so a wedged sender cannot pin the
-encoder at its last rung.
+On UVC passthrough only the bitrate column actuates, through the camera's own encoder;
+frame rate is fixed. See [UVC camera rate control](#uvc-camera-rate-control-media-stream-configuration)
+above, and [`components/media_stream/README.md`](../../components/media_stream/README.md)
+for the ladder itself.
 
 ## Next Steps
 

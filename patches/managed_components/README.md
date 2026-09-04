@@ -14,13 +14,41 @@ idf.py -B build.uvc16 build            # once, so managed_components/ exists
 ```
 
 The script is idempotent and refuses to force a patch onto a component version it was
-not made against.
+not made against. It takes the IDF target as an optional second argument (`media_stream`'s
+CMakeLists passes `${IDF_TARGET}`; otherwise it reads `CONFIG_IDF_TARGET` from the
+example's `sdkconfig`), because what a mismatch *means* depends on the target - see below.
+
+## The UVC patches are esp32s31-only, and on esp32s31 a mismatch is fatal
+
+`components/media_stream/idf_component.yml` holds `esp_video` at `~2.0.1` on every target
+except esp32s31, and requests `usb_host_uvc` on esp32s31 only, so that the board BSPs can
+resolve to a version that compiles on ESP-IDF v6.
+
+**0002 and 0004 survived the same audit untouched.** Pristine 2.5.2 has no `uvcx`, no
+`UVCX_VIDEO_CONFIG_PROBE`/`COMMIT`, no XU GUID and no `ae_priority`; its H.264 vocabulary is
+inert (`UVC_VS_GENERATE_KEY_FRAME_CONTROL` and `UVC_VC_DESC_SUBTYPE_EXTENSION_UNIT` are
+enum-only at `private_include/usb_types_uvc.h:51,68` and never issued), and `include/` is
+byte-identical to 2.5.1. The alternate setting is still chosen once before the probe from the
+`MAX_MPS_IN` constant (`uvc_host.c:595`, called at `:818`, probe at `:843-845`) and never
+revisited, and `uvc_host_usb_ctrl()` (`uvc_host.c:1113-1166`) is byte-identical to 2.5.1 with
+no EP0 retry. Two known gaps in 0004, neither introduced by the retarget: it passes a
+`uint32_t dwMaxPayloadTransferSize` into a `uint16_t` parameter
+(`uvc_descriptor_parsing.c:113` - harmless below 64 KiB), and it only covers the
+`uvc_host_stream_open()` path, so `uvc_host_stream_format_select()` (`uvc_host.c:983-1022`)
+still leaves the alt setting stale after a runtime resolution change.
+
+One free improvement rode along in 2.5.2 and is worth knowing: `uvc_host_stream_close()`
+now uses `ESP_ERROR_CHECK_WITHOUT_ABORT` (`uvc_host.c:922`), so closing a stalled or yanked
+camera no longer aborts the system. It does **not** replace the STREAMOFF-on-shutdown handler
+in `esp_video_if.c` - see `components/media_stream/KNOWN_ISSUES.md` §1.
+
+There is no 0001 any more, and the numbering keeps its gap on purpose - 0002/0003/0004 are
+referenced by number from here and from `components/media_stream/KNOWN_ISSUES.md`.
 
 | Patch | Component | Why | Drop when |
 |-------|-----------|-----|-----------|
-| `0001-usb_host_uvc-2.4.2-complete-frame-on-frame-id-toggle.patch` | `espressif/usb_host_uvc` 2.4.2 | The isochronous path completes a frame only when the payload header carries the EoF flag. Cameras that never set it (observed on a Logitech H.264 stream: ~21 MB of valid payloads with zero EoF flags, on every alternate setting) hit the frame-ID toggle instead, which logged `missed EoF` and **reset the buffer**, discarding a complete frame every time. No frame ever reached the application. The patch completes the frame at the toggle, which is the only frame boundary such a camera provides. | `usb_host_uvc` releases the equivalent isoc fix. Upstream fixed the analogous **bulk** case in 2.5.1 ("bulk frame reconstruction for non-conforming cameras that can send a same-frame payload header without EOF"); the isoc path is unchanged as of 2.5.1. Related: [esp-usb#538](https://github.com/espressif/esp-usb/issues/538) reports the same `missed EoF` symptom from a different cause (a high-bandwidth alt setting the RX FIFO cannot sustain) - both can produce it, so check which applies before dropping this. |
-| `0002-usb_host_uvc-h264-extension-unit-rate-control.patch` | `espressif/usb_host_uvc` 2.5.1 | No way to reach the camera's own H.264 encoder. Adds `uvc_host_stream_h264_set_rate()` / `uvc_host_stream_request_key_frame()` over the H.264 extension unit (GUID-located `UVCX_VIDEO_CONFIG_PROBE/COMMIT`), and fills `wWidth`/`wHeight` from the negotiated format so the commit is not rejected. | `usb_host_uvc` exposes encoding-unit controls of its own. |
-| `0004-usb_host_uvc-match-alt-setting-to-negotiated-payload.patch` | `espressif/usb_host_uvc` 2.5.1 | Alternate setting is chosen before the probe, so it does not match `dwMaxPayloadTransferSize`; every isoc packet then returns `COMPLETED` with zero bytes. Also makes `uvc_host_usb_ctrl()` survive a transaction error: USBH clears EP0 from the host-library task, not inline, so a resubmit has to yield first - without that a single `Dev 1 EP 0 Error` after a soft reset turned every later control transfer into `ESP_ERR_INVALID_STATE` and the stream never opened. A STALL is deliberately *not* retried (it is the device's definitive answer, and USBH re-arms EP0 itself), and the `usb_host_endpoint_clear(dev_hdl, 0)` this patch used to do is gone - EP0 is not claimable, so it only ever printed two error lines. | Upstream re-selects the alt setting after the probe. |
+| `0002-usb_host_uvc-h264-extension-unit-rate-control.patch` | `espressif/usb_host_uvc` 2.5.2 | No way to reach the camera's own H.264 encoder. Adds `uvc_host_stream_h264_set_rate()` / `uvc_host_stream_request_key_frame()` over the H.264 extension unit (GUID-located `UVCX_VIDEO_CONFIG_PROBE/COMMIT`), and fills `wWidth`/`wHeight` from the negotiated format so the commit is not rejected. Also pins the frame rate on request (`bmHints` frame-interval bit plus the `FIXED_FRAME_RATE` flag in `bRateControlMode`), which is what chooses whether a too-small bitrate costs frames or sharpness. Adds `uvc_host_stream_set_ae_priority()` over the Camera Terminal's Auto-Exposure Priority control - the SENSOR half of that same choice, and the half that actually dominates indoors. | `usb_host_uvc` exposes encoding-unit controls of its own. |
+| `0004-usb_host_uvc-match-alt-setting-to-negotiated-payload.patch` | `espressif/usb_host_uvc` 2.5.2 | Alternate setting is chosen before the probe, so it does not match `dwMaxPayloadTransferSize`; every isoc packet then returns `COMPLETED` with zero bytes. Also makes `uvc_host_usb_ctrl()` survive a transaction error: USBH clears EP0 from the host-library task, not inline, so a resubmit has to yield first - without that a single `Dev 1 EP 0 Error` after a soft reset turned every later control transfer into `ESP_ERR_INVALID_STATE` and the stream never opened. A STALL is deliberately *not* retried (it is the device's definitive answer, and USBH re-arms EP0 itself), and the `usb_host_endpoint_clear(dev_hdl, 0)` this patch used to do is gone - EP0 is not claimable, so it only ever printed two error lines. | Upstream re-selects the alt setting after the probe. |
 | `0003-esp_video-apply-uvc-h264-config-before-stream-start.patch` | `espressif/esp_video` 2.4.1 | Opens the UVC stream with the V4L2-selected format instead of `frame_info[0]`, applies the H.264 extension-unit config between `format_select()` and `stream_start()`, and defines `esp_video_uvc_request_key_frame()`. It no longer asks for a key frame at stream start: a camera without that control STALLs it and USBH logs `Dev N EP 0 STALL` at ERROR on every boot for nothing. The root-port-power workaround it once carried is gone — `PRTPWR` does not gate the camera's VBUS, so it never did anything; see `components/media_stream/README.md`. | `esp_video` opens with the selected format and exposes UVC encoder controls. |
 
 ## Regression: 0003 lost its `.vs_format` change once
@@ -58,7 +86,8 @@ Traps that only show up on a fresh `managed_components/`:
 - **The component manager silently reverts these patches - now handled automatically.**
   Delete a managed component and let the component manager re-fetch it, and a later
   `idf.py build` may restore it again from its checksum, throwing away every patch applied
-  in between with no message. It bit 0001/0002/0004 on `usb_host_uvc` while 0003 on
+  in between with no message. It bit `usb_host_uvc` (0002, 0004 and the since-dropped 0001)
+  while 0003 on
   `esp_video` survived the same build, so it is per-component and invisible in the output.
   The symptom was a build failing on `implicit declaration of function
   'uvc_host_stream_h264_set_rate'` - a declaration patch 0002 adds to
@@ -70,12 +99,27 @@ Traps that only show up on a fresh `managed_components/`:
   cannot run any earlier than a component CMakeLists - `managed_components/` does not exist
   until the component manager has run - and by then Kconfig has been read, so a run that
   actually applies something exits **10** and CMake stops with "re-run the build". That is
-  deliberate: patches 0001 and 0003 add Kconfig options, and continuing would build against
-  a sdkconfig that predates them.
+  deliberate: patch 0003 adds Kconfig options, and continuing would build against a
+  sdkconfig that predates them. (0001 used to add one too; 2.5.2 ships it upstream.)
 
   Still worth knowing when driving the board by hand: never trust a verification run whose
   build did not print "Project build complete", because `idf.py flash` will happily flash
   the previous binary.
+- **A version-guard failure on esp32s31 usually means a stale `dependencies.lock`.** The
+  guard is fatal there now, and the one thing that trips it in an existing checkout is a
+  lock that predates the pins. `dependencies.lock` is git-ignored, so CI always solves
+  fresh and gets the pinned versions - but locally the component manager does **not**
+  re-solve when a *local* component's manifest changes, only when the project's own
+  manifests do. That is why several examples sat on `esp_video` 2.0.1 long after
+  `media_stream` pinned 2.4.x, and why a plain reconfigure will not fix them. The remedy is
+  one line, per example:
+
+  ```bash
+  rm examples/<example>/dependencies.lock     # then configure again
+  ```
+
+  Refreshing a long-stale lock does move other components too, so expect to re-verify that
+  example rather than assuming it still builds.
 - **CMake 4 and the usrsctp submodule.** `components/esp_usrsctp/usrsctp/CMakeLists.txt` asks
   for `cmake_minimum_required(VERSION 3.0)`, and CMake 4 removed compatibility below 3.5. It
   is a submodule, so `examples/kvs_combined/CMakeLists.txt` sets `CMAKE_POLICY_VERSION_MINIMUM
@@ -84,7 +128,7 @@ Traps that only show up on a fresh `managed_components/`:
 ## UVC H.264 capture on ESP32-S31 (investigation log, 2026-08-21)
 
 Goal: a USB-UVC camera that encodes H.264 itself, forwarded untouched, at 640x480 then
-1280x720 then 1920x1080. **Achieved** with the four patches below - see "Where it stands".
+1280x720 then 1920x1080. **Achieved** with the patches below - see "Where it stands".
 
 The camera advertises JPEG, YUYV and H264, each at 640x480 up to 1920x1080, and exposes an
 H.264 extension unit (bUnitID 12 on VideoControl interface 0).
@@ -107,7 +151,8 @@ H.264 extension unit (bUnitID 12 on VideoControl interface 0).
    (512) for H.264, alt 10 (2688) for YUYV, alt 11 at 1080p.
    The camera's alternate settings: 1:192 2:384 3:512 4:640 5:800 6:944 7:1280 8:1600
    9:1984 10:2688 11:3060.
-4. **usb_host_uvc: upstream isoc fixes missing from 2.5.1** (patch 0001, taken verbatim
+4. **usb_host_uvc: upstream isoc fixes missing from 2.5.1** (was patch 0001, **released in
+   2.5.2 and dropped**; taken verbatim
    from esp-usb `c04d1c7` + `23ad9ed`). An *empty* isoc packet failed payload-header
    validation and set `skip_current_frame`, poisoning the frame in progress; a low-bitrate
    stream is mostly empty packets, so every frame died. Also the frame-ID-toggle boundary
@@ -142,7 +187,7 @@ assembly was never involved. Re-add that counter first if this recurs.
 
 **H.264 capture streams.** Fix 3 (alt setting) - the strongest remaining
 candidate when this log was first written, and untestable at the time because the camera had
-stopped enumerating - is validated. With all four patches applied the camera streams H.264
+stopped enumerating - is validated. With these patches applied the camera streams H.264
 at the configured resolution, and `examples/kvs_combined` runs PutMedia and WebRTC off it
 concurrently. The most recent measurement: five chained soft reboots, streaming every time, zero
 `Failed to get frame`, against 4 failures in 6 before the shutdown handler was added. Not yet

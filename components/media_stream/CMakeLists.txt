@@ -7,7 +7,7 @@
 # rather than earlier: managed_components/ does not exist until the component manager
 # has run, which is part of the same configure.
 #
-# The catch is that two of those patches add Kconfig options, and Kconfig has already
+# The catch is that one of those patches adds Kconfig options, and Kconfig has already
 # been read by the time any component CMakeLists runs. So a run that actually applies
 # something has produced a source tree this configure cannot describe - it exits 10 and
 # we stop, rather than let the build proceed against a sdkconfig that predates the
@@ -24,7 +24,7 @@ if(CONFIG_KVS_AUTO_APPLY_PATCHES)
         "${CMAKE_CURRENT_SOURCE_DIR}/../../patches/managed_components/apply_managed_component_patches.sh")
     if(EXISTS "${_mc_apply_script}")
         execute_process(
-            COMMAND bash "${_mc_apply_script}" "${CMAKE_SOURCE_DIR}"
+            COMMAND bash "${_mc_apply_script}" "${CMAKE_SOURCE_DIR}" "${IDF_TARGET}"
             WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../.."
             RESULT_VARIABLE _mc_patch_result
             OUTPUT_VARIABLE _mc_patch_output
@@ -32,7 +32,7 @@ if(CONFIG_KVS_AUTO_APPLY_PATCHES)
         if(_mc_patch_result EQUAL 10)
             message(FATAL_ERROR
                 "Managed-component patches were just applied:\n${_mc_patch_output}\n"
-                "Two of them add Kconfig options, and Kconfig was read before this point, "
+                "One of them adds Kconfig options, and Kconfig was read before this point, "
                 "so this configure cannot see them. Re-run the build - it will pick them "
                 "up and this message will not come back.")
         elseif(NOT _mc_patch_result EQUAL 0)

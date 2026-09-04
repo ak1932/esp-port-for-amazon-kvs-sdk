@@ -1,26 +1,20 @@
 #!/bin/bash
 # Apply local patches to managed (registry) components.
 #
-# Managed components live in <example>/managed_components/, which is generated and
-# git-ignored, so a fix that lives only there is lost on a clean checkout - and the
-# component manager restores a component from its checksum whenever it decides the
-# on-disk copy has drifted, which silently throws these patches away mid-configure.
-# media_stream's CMakeLists therefore runs this at configure time under
-# CONFIG_KVS_AUTO_APPLY_PATCHES; see the exit codes below for how it reports back.
+#   ./patches/managed_components/apply_managed_component_patches.sh examples/streaming_only [target]
 #
-#   ./patches/managed_components/apply_managed_component_patches.sh examples/streaming_only
-#
-# The argument may be relative to the repo root or absolute.
+# The first argument may be relative to the repo root or absolute. The second is the IDF
+# target; media_stream's CMakeLists passes ${IDF_TARGET}, and when it is omitted we read
+# CONFIG_IDF_TARGET out of <example>/sdkconfig. It decides whether the UVC patch set is
+# expected at all - see "Which patches are expected on which target" below.
 #
 # Idempotent: a patch that is already applied is skipped. Exit codes:
-#   0   nothing to do - every patch was already applied, or there is no
-#       managed_components/ yet (a fresh configure, before the component manager has
-#       materialised anything)
+#   0   nothing to do - every patch was already applied or was not expected on this
+#       target
 #   10  at least one patch was applied just now. The caller must treat this as
-#       "re-configure required": two of these patches add Kconfig options, and Kconfig
-#       has already been read by the time any component CMakeLists runs, so this
-#       configure is working from a sdkconfig that predates them.
-#   1   a patch failed to apply
+#       "re-configure required"
+#   1   a patch failed to apply, or a component this target is supposed to patch is on
+#       a version the patch was not made against
 #
 # Each patch here is a stop-gap for an upstream fix that has not been released yet;
 # drop it once the component version that carries the fix is published and pinned.
@@ -30,10 +24,23 @@ set -e
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 EXAMPLE_DIR="${1:-examples/streaming_only}"
 case "$EXAMPLE_DIR" in
-    /*) MC="$EXAMPLE_DIR/managed_components" ;;
-    *)  MC="$REPO_ROOT/$EXAMPLE_DIR/managed_components" ;;
+    /*) EXAMPLE_ABS="$EXAMPLE_DIR" ;;
+    *)  EXAMPLE_ABS="$REPO_ROOT/$EXAMPLE_DIR" ;;
 esac
+MC="$EXAMPLE_ABS/managed_components"
 PATCH_DIR="$REPO_ROOT/patches/managed_components"
+
+# Which patches are expected on which target.
+#
+# The UVC stack (0002/0003/0004) is esp32s31-only, because that is the only target where
+# components/media_stream/idf_component.yml asks for the versions those patches are cut
+# against - esp_video 2.4.1 and usb_host_uvc 2.5.2.
+
+TARGET="${2:-}"
+if [ -z "$TARGET" ] && [ -f "$EXAMPLE_ABS/sdkconfig" ]; then
+    TARGET="$(sed -n 's/^CONFIG_IDF_TARGET="\(.*\)"$/\1/p' "$EXAMPLE_ABS/sdkconfig" | head -1)"
+fi
+UVC_PATCH_TARGET="esp32s31"
 
 # Tracks whether this run changed anything, which is what turns into exit 10.
 APPLIED_ANY=0
@@ -75,24 +82,45 @@ apply_one() {
     APPLIED_ANY=1
 }
 
-# usb_host_uvc: two upstream isoc fixes that are merged in esp-usb but unreleased as of
-# 2.5.1, taken verbatim from that tree:
-#   - 23ad9ed "complete an isoc frame on the frame-ID toggle when EOF is absent" - cameras
-#     that never set EoF otherwise lose every frame at the frame-ID toggle.
-#   - c04d1c7 "handle payload errors and buffer sizing" - an EMPTY isoc packet fails
-#     payload-header validation and used to set skip_current_frame, poisoning the frame in
-#     progress. A low-bitrate stream (H.264) is mostly empty packets, so every frame is
-#     discarded; a high-bitrate one (YUYV) has few and survives. Also makes the ERR-bit
-#     check configurable via CONFIG_UVC_CHECK_PAYLOAD_HEADER_ERR.
-# Drop this patch once a release above 2.5.1 carries both.
-apply_one "$PATCH_DIR/0001-usb_host_uvc-complete-frame-on-frame-id-toggle.patch" \
-          "$MC/espressif__usb_host_uvc" "2.5.1" "usb_host_uvc"
+# apply_one for a patch that is only expected on one target. Same patching, different
+# answer to a version mismatch:
+#   - off that target the patch is not wanted at all, so say so and move on;
+#   - on it, the component being on another version means the pin in
+#     components/media_stream/idf_component.yml and this directory disagree, which is a
+#     bug to fix rather than a line to scroll past. Fail the build.
+apply_expected() {
+    local want_target="$1" patch="$2" target_dir="$3" expect_version="$4" component="$5"
+
+    if [ "$TARGET" != "$want_target" ]; then
+        echo "skip $(basename "$patch"): target is ${TARGET:-unknown}, this patch is ${want_target}-only"
+        return 0
+    fi
+
+    if [ -d "$target_dir" ]; then
+        local have
+        have="$(grep -E '^version:' "$target_dir/idf_component.yml" | awk '{print $2}' | tr -d '"'"'"'')"
+        if [ "$have" != "$expect_version" ]; then
+            echo "ERROR $(basename "$patch"): $component on disk is $have, patch was made against $expect_version." >&2
+            echo "      $target_dir" >&2
+            echo "      On $want_target this is fatal. Either the pin in" >&2
+            echo "      components/media_stream/idf_component.yml moved, or this example's" >&2
+            echo "      dependencies.lock is stale - the component manager does not re-solve when a" >&2
+            echo "      *local* component's manifest changes, so 'rm $EXAMPLE_DIR/dependencies.lock'" >&2
+            echo "      and configure again. If the fix has been released upstream, drop the patch;" >&2
+            echo "      otherwise rebase it onto $have and update the expected version here." >&2
+            exit 1
+        fi
+    fi
+
+    apply_one "$patch" "$target_dir" "$expect_version" "$component"
+}
 
 # usb_host_uvc: reach the camera's own H.264 encoder (bitrate, key-frame period) through the
 # H.264 extension unit, and ask for a key frame on demand. Without this the camera streams at
 # whatever rate it likes with a multi-second GOP.
-apply_one "$PATCH_DIR/0002-usb_host_uvc-h264-extension-unit-rate-control.patch" \
-          "$MC/espressif__usb_host_uvc" "2.5.1" "usb_host_uvc"
+apply_expected "$UVC_PATCH_TARGET" \
+          "$PATCH_DIR/0002-usb_host_uvc-h264-extension-unit-rate-control.patch" \
+          "$MC/espressif__usb_host_uvc" "2.5.2" "usb_host_uvc"
 
 # usb_host_uvc: pick the alternate setting that matches the payload size the camera
 # negotiated. uvc_claim_interface() has to run before the probe, so it caps on MAX_MPS_IN
@@ -100,12 +128,14 @@ apply_one "$PATCH_DIR/0002-usb_host_uvc-h264-extension-unit-rate-control.patch" 
 # camera) while the probe then negotiates dwMaxPayloadTransferSize = 512 for H.264. Every
 # isoc packet comes back COMPLETED with zero bytes. Re-selecting after the probe picks
 # alt 3 (512) for H.264, alt 10 (2688) for YUYV, alt 11 at 1080p.
-apply_one "$PATCH_DIR/0004-usb_host_uvc-match-alt-setting-to-negotiated-payload.patch" \
-          "$MC/espressif__usb_host_uvc" "2.5.1" "usb_host_uvc"
+apply_expected "$UVC_PATCH_TARGET" \
+          "$PATCH_DIR/0004-usb_host_uvc-match-alt-setting-to-negotiated-payload.patch" \
+          "$MC/espressif__usb_host_uvc" "2.5.2" "usb_host_uvc"
 
 # esp_video: apply that configuration between format_select() and stream_start(), which is the
 # only point the camera accepts it.
-apply_one "$PATCH_DIR/0003-esp_video-apply-uvc-h264-config-before-stream-start.patch" \
+apply_expected "$UVC_PATCH_TARGET" \
+          "$PATCH_DIR/0003-esp_video-apply-uvc-h264-config-before-stream-start.patch" \
           "$MC/espressif__esp_video" "2.4.1" "esp_video"
 
 if [ "$APPLIED_ANY" -eq 1 ]; then

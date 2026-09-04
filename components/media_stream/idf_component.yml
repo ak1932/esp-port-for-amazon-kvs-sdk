@@ -7,21 +7,23 @@ dependencies:
     rules:
       - if: "target in [esp32, esp32s3]"
 
-  # Require esp_video >= 2.0.1 for the AWB subwindow zero-init fix (upstream
-  # MR !443) needed on ESP32-P4 rev >= 3.0 / ECO5+ silicon; also auto-climbs the
-  # EV-board BSP via the dep solver.
-  # ~2.0.1 (>=2.0.1,<2.1.0): the solver otherwise maximizes esp_video (2.3.x)
-  # and, since the BSPs are requested as '*' via bsp_selector, sacrifices the
-  # BSP down to the 4.x line (which lacks the audio-codec API). The 5.x BSPs
-  # require esp_video ~2.0, so capping here keeps the newest BSP resolvable.
-  # Second reason to hold this pin: a newer esp_video drags esp_audio_codec up
-  # with it, and the latest of those drops support for P4 rev < 3 silicon. Any
-  # bump has to pin esp_audio_codec below 2.6.0 (see its `matches` rule) and be
-  # re-validated on P4 hardware.
+  # Two pins: esp32s31 wants the newest esp_video, every other target wants the
+  # oldest that still carries the fix we need.
   espressif/esp_video:
     version: "~2.4.1"
     rules:
       - if: "target not in [esp32]"
+    matches:
+      - if: 'target == "esp32s31"'
+        version: "~2.4.1"
+      - if: 'target != "esp32s31"'
+        version: "~2.0.1"
+
+  # Pulled in transitively by esp_video, but pinned exactly, not floated.
+  espressif/usb_host_uvc:
+    version: "==2.5.2"
+    rules:
+      - if: "target in [esp32s31]"
 
   espressif/esp_h264:
     public: true

@@ -149,13 +149,16 @@ static int sink_stats_cli(int argc, char **argv)
         return 0;
     }
 
-    printf("\n%-14s %-8s %5s %5s %10s %6s %10s %9s\n",
-           "controller", "state", "rung", "fps", "bitrate", "load%", "netceil", "reports");
+    /* `bar` is the recovery limit: the best rung this controller may climb back into,
+     * raised whenever a rung congests. rung == bar means it is being held there
+     * deliberately, which is the difference between "cannot recover" and "will not yet". */
+    printf("\n%-14s %-8s %5s %4s %5s %10s %6s %10s %9s\n",
+           "controller", "state", "rung", "bar", "fps", "bitrate", "load%", "netceil", "reports");
     for (size_t i = 0; i < rc_count; i++) {
-        printf("%-14s %-8s %5" PRIu32 " %5" PRIu32 " %10" PRIu32 " %6" PRIu32 " %10" PRIu32 " %9" PRIu32 "\n",
+        printf("%-14s %-8s %5" PRIu32 " %4" PRIu32 " %5" PRIu32 " %10" PRIu32 " %6" PRIu32 " %10" PRIu32 " %9" PRIu32 "\n",
                rc[i].name,
                rc[i].stale ? "stale" : (rc[i].enabled ? "adapting" : "off"),
-               rc[i].level, rc[i].target_fps, rc[i].target_bitrate_bps,
+               rc[i].level, rc[i].probe_bar_level, rc[i].target_fps, rc[i].target_bitrate_bps,
                rc[i].load_pct, rc[i].net_ceiling_bps, rc[i].reports);
     }
     printf("encoder (strict min of adapting rows): %" PRIu32 " fps / %" PRIu32 " bps\n",
@@ -174,6 +177,12 @@ static int sink_stats_cli(int argc, char **argv)
                enc.requested_bps, enc.committed_bps,
                (!enc.fps_actuable && !enc.bitrate_actuable)
                    ? "  <- no lever: rate control is inert" : "");
+        if (enc.fps_pin_wanted) {
+            printf("frame-rate pin: %s | floor %" PRIu32 " bps (pinned needs %" PRIu32
+                   " bps), ladder stops at L%" PRIu32 "\n",
+                   enc.fps_pinned ? "held" : "GIVEN UP (bitrate too low for a stable rate)",
+                   enc.floor_bps, enc.pinned_floor_bps, enc.deepest_level);
+        }
     }
     return 0;
 }

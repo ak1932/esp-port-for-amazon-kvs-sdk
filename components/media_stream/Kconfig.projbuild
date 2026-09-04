@@ -361,11 +361,15 @@ menu "Media Stream Configuration"
                 being set up. At runtime the extension-unit PROBE and COMMIT both
                 succeed and the value is then ignored.
 
-                With this enabled the grabber restarts the UVC stream to apply a new
-                bitrate, which is the only actuation left. It is NOT free: the restart
-                frees and reallocates capture buffers, reopens the device and
-                re-negotiates the format, so it costs a visible gap of roughly a
-                second and a fresh IDR.
+                With this enabled, restarting the stream IS the actuation: the
+                mid-stream extension-unit lever is not tried even once, so the very
+                first bitrate change restarts the stream. Leave it off for a camera
+                that honours changes while streaming - there the grabber detects a
+                refusal and reports it, and no restart is ever spent.
+
+                It is NOT free: the restart frees and reallocates capture buffers,
+                reopens the device and re-negotiates the format, so it costs a visible
+                gap of roughly a second and a fresh IDR.
 
         config MEDIA_STREAM_UVC_RESTART_MIN_INTERVAL_S
             int "Minimum seconds between bitrate restarts"

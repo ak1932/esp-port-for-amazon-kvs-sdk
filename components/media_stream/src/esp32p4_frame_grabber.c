@@ -32,7 +32,7 @@
 #include "esp_log.h"
 
 #include "esp_dma_utils.h"
-#include "video_rate_ctrl.h"
+#include "video_rate_ctrl_priv.h"
 #include "esp_video_if_cam_sel.h"   /* MEDIA_STREAM_ENABLE_*_CAM_SENSOR selection */
 #include "esp_video_uvc_ctrl.h"      /* camera-side encoder controls (patches 0002/0003) */
 
@@ -136,18 +136,34 @@ static bool s_key_frame_ctrl_supported = true;
  * extension unit answers every attempt with an EP0 STALL, and hammering the control
  * endpoint of a UVC camera is how it gets into a state only a replug fixes. */
 static bool s_xu_rate_ctrl_supported;
+#if !CONFIG_MEDIA_STREAM_UVC_BITRATE_VIA_RESTART
 /* Consecutive commits whose transaction the camera honoured while ignoring the
  * value. Distinct from the STALL case above: nothing fails, so only comparing
- * committed against requested reveals it. */
+ * committed against requested reveals it. Only meaningful where the mid-stream
+ * lever is tried at all - with restart-based actuation selected it never is. */
 static uint32_t s_xu_refusals;
+#endif
 static int64_t s_last_xu_commit_us;
+/* When the UVC stream was last restarted, by ANY path - the bitrate actuator, the
+ * ladder's frame-rate pin, or the operator. One stamp, because it is one camera and
+ * every restart costs it the same second of video; the gates below all read it. */
+static int64_t s_last_restart_us;
 #if MEDIA_STREAM_ENABLE_USB_UVC_CAM_SENSOR && CONFIG_MEDIA_STREAM_UVC_PASSTHROUGH_H264 && \
     CONFIG_MEDIA_STREAM_UVC_BITRATE_VIA_RESTART
-/* Set once the mid-stream lever is known not to work, when restarting the stream
- * is available as the fallback actuation. Mutually exclusive with declaring the
- * bitrate not actuable: in this mode it IS actuable, just expensive. */
+/* Restart-based actuation. Set at stream start, not on discovering a refusal: the
+ * option says the camera needs restarts, so the mid-stream lever is not tried even
+ * once. Mutually exclusive with declaring the bitrate not actuable - in this mode it
+ * IS actuable, just expensive. */
 static bool    s_xu_restart_mode;
-static int64_t s_last_restart_us;
+#endif
+
+/* Minimum spacing for restarts the LADDER asks for through its frame-rate pin. Where the
+ * bitrate actuator restarts too they share its Kconfig interval, since both spend the
+ * same second of video; otherwise the same default that option carries. */
+#if CONFIG_MEDIA_STREAM_UVC_BITRATE_VIA_RESTART
+#define UVC_PIN_RESTART_MIN_INTERVAL_S  CONFIG_MEDIA_STREAM_UVC_RESTART_MIN_INTERVAL_S
+#else
+#define UVC_PIN_RESTART_MIN_INTERVAL_S  30
 #endif
 
 /* Minimum spacing between bitrate commits. Each one is a PROBE/PROBE/COMMIT - three
@@ -156,6 +172,11 @@ static int64_t s_last_restart_us;
  * nothing: video_rate_ctrl_pull_bitrate_bps() hands back the LATEST target, so skipping
  * an intermediate rung just means arriving at the current one slightly later. */
 #define XU_COMMIT_MIN_INTERVAL_US   (2 * 1000 * 1000)
+
+/* Minimum change worth a restart when the ladder is climbing. Much smaller than the
+ * Kconfig threshold, which is sized for the descent: see the gate in
+ * uvc_maybe_restart_for_bitrate() for why the two directions differ. */
+#define XU_UPWARD_MIN_DELTA_PCT     5
 #endif
 
 /* Camera bring-up can miss a transient window (USB enumeration in particular). */
@@ -732,7 +753,26 @@ static void uvc_maybe_restart_for_bitrate(void)
     const uint32_t delta = (want > have) ? (want - have) : (have - want);
     if ((uint64_t) delta * 100ULL <
             (uint64_t) have * (uint64_t) CONFIG_MEDIA_STREAM_UVC_RESTART_MIN_DELTA_PCT) {
-        return;
+        /* Below the threshold. Going DOWN that is the right answer - a restart costs a
+         * second of video and a marginal cut does not pay for it.
+         *
+         * Going UP it strands the climb. The ladder walks one rung at a time, and
+         * adjacent rungs are ~20-25% apart, so a step that lands just under the
+         * threshold never reaches the camera: measured from 520 kbps, the next rung is
+         * 640 kbps - 23% - so the wire stayed at 520 while the ladder climbed, and only
+         * moved when it reached 800 kbps two rungs later. To an observer the bitrate
+         * simply never recovers.
+         *
+         * Upward, the interval gate above has already imposed the real cost control, and
+         * the ladder only climbs after sustained health. So take any change worth more
+         * than a token amount. */
+        if (want <= have) {
+            return;
+        }
+        if ((uint64_t) delta * 100ULL <
+                (uint64_t) have * (uint64_t) XU_UPWARD_MIN_DELTA_PCT) {
+            return;
+        }
     }
 
     /* Convert to the budget-at-1280x720 the setter takes: it goes through the same
@@ -786,9 +826,7 @@ static void uvc_maybe_restart_for_bitrate(void)
             }
         }
     }
-    /* Fresh stream: give the mid-stream path another chance (a camera may accept
-     * changes in some states), and resync downstream on the first IDR. */
-    s_xu_refusals = 0;
+    /* Resync downstream on the first IDR of the new stream. */
     s_wait_for_idr = true;
 }
 #endif
@@ -798,13 +836,27 @@ static void uvc_maybe_restart_for_bitrate(void)
  *
  * Deliberately NOT gated on CONFIG_MEDIA_STREAM_UVC_BITRATE_VIA_RESTART: that option is
  * about whether the rate CONTROLLER may spend restarts, and this is a one-off operator
- * request. The two share the restart mechanism and nothing else, including the interval
- * gate - an operator flipping the setting is not a control loop that can ring.
+ * request. An operator flipping the setting is not a control loop that can ring, so their
+ * request is not interval-gated either. The ladder's own pin changes, collected in
+ * uvc_maybe_apply_tradeoff(), ARE a control loop and do wait out s_last_restart_us.
  *
  * Plain bools rather than a queue: a later request simply supersedes an earlier one, so a
  * torn read can only mean acting on the newer value, which is the answer either way. */
 static volatile bool s_tradeoff_req_pending;
-static volatile bool s_tradeoff_req_pin;
+/* Starts as the Kconfig choice and is overwritten by every request that is applied, so it
+ * doubles as the trade-off currently in effect. That matters for a bitrate-only request:
+ * it rides the same restart and re-applies THIS, and a zero default here silently turned
+ * a PREFER_FRAMERATE build into "free" on the first `uvc-bitrate`. */
+#if CONFIG_MEDIA_STREAM_UVC_PREFER_FRAMERATE
+static volatile bool s_tradeoff_req_pin = true;
+#else
+static volatile bool s_tradeoff_req_pin = false;
+#endif
+/* Whether the pending change came from the rate controller rather than the operator.
+ * Decides which acknowledgement the controller gets back, and that choice is what
+ * keeps a forced release reversible - see the operator_request flag of
+ * video_rate_ctrl_set_fps_pinned(). */
+static volatile bool s_tradeoff_from_ladder;
 /* Sentinel-free: a separate "was a bitrate asked for" flag, because 0 is a meaningful
  * request (restore the configured default) and not an absence. */
 static volatile bool     s_bitrate_req_pending;
@@ -813,6 +865,7 @@ static volatile uint32_t s_bitrate_req_ref_bps;
 esp_err_t video_capture_set_rate_tradeoff(bool pin_frame_rate)
 {
     s_tradeoff_req_pin     = pin_frame_rate;
+    s_tradeoff_from_ladder = false;   /* an operator request supersedes a queued one */
     s_tradeoff_req_pending = true;
     return ESP_OK;
 }
@@ -850,6 +903,30 @@ static void uvc_apply_ae_priority(bool pin_frame_rate)
  * constraint as uvc_maybe_restart_for_bitrate(), for the same reason. */
 static void uvc_maybe_apply_tradeoff(void)
 {
+    /* The ladder gives the pin up when it runs out of room above the bits-per-pixel
+     * floor, and asks for it back once the arbitrated bitrate can afford it. Folded into
+     * the operator's own request path because both need the same stream restart, and
+     * because a later request should simply supersede an earlier one either way. */
+    /* Interval-gated, unlike the operator's request: this is a control loop, and an
+     * ungated release/re-assert pair is a stream restart every time the ladder crosses
+     * the pinned floor. The change is left UNPULLED while the gate is closed - a later
+     * decision overwrites it, so waiting loses nothing and acts on the newest value. */
+    int ladder_pin = -1;
+    if ((esp_timer_get_time() - s_last_restart_us) >=
+            (int64_t) UVC_PIN_RESTART_MIN_INTERVAL_S * 1000000) {
+        ladder_pin = video_rate_ctrl_pull_fps_pin();
+    }
+    if (ladder_pin >= 0) {
+        s_tradeoff_req_pin      = (ladder_pin != 0);
+        s_tradeoff_req_pending  = true;
+        s_tradeoff_from_ladder  = true;
+        ESP_LOGW(TAG, "rate control %s the frame-rate pin: %s",
+                 ladder_pin ? "re-asserting" : "giving up",
+                 ladder_pin ? "the bitrate can pay for the frames again"
+                            : "the bitrate is below what a fixed frame rate needs, and "
+                              "holding it would make the rate unstable rather than lower");
+    }
+
     if (!s_tradeoff_req_pending) {
         return;
     }
@@ -867,7 +944,9 @@ static void uvc_maybe_apply_tradeoff(void)
                  ref, MEDIA_STREAM_UVC_BITRATE_REF_W, MEDIA_STREAM_UVC_BITRATE_REF_H);
     }
 
-    const bool pin = s_tradeoff_req_pin;
+    const bool pin         = s_tradeoff_req_pin;
+    const bool from_ladder = s_tradeoff_from_ladder;
+    s_tradeoff_from_ladder = false;
     const uint32_t want_fps = (CONFIG_MEDIA_STREAM_UVC_TARGET_FPS > 0)
                               ? CONFIG_MEDIA_STREAM_UVC_TARGET_FPS : 30u;
 
@@ -876,11 +955,20 @@ static void uvc_maybe_apply_tradeoff(void)
     /* The sensor half of the same choice. Without this the trade-off is unreachable in dim
      * light: no encoder setting can create a frame auto-exposure never captured. */
     uvc_apply_ae_priority(pin);
+    /* Report, do not request: this tells the ladder what the actuator has just done, so
+     * its floor matches reality. It deliberately does not publish another pin change,
+     * which is what keeps a ladder-driven release from looping - and when the ladder is
+     * the one that asked, it must not overwrite the operator's standing request either,
+     * or the automatic re-assert has nothing left to re-assert. */
+    video_rate_ctrl_set_fps_pinned(pin, /* operator_request = */ !from_ladder);
     ESP_LOGW(TAG, "rate trade-off -> %s; restarting the UVC stream to apply it, "
                   "about a second of video is lost",
              pin ? "frame rate pinned (quality gives way)"
                  : "frame rate free (the camera may shed fps)");
 
+    /* Stamped for every restart, so the bitrate actuator - which runs right after this in
+     * the same loop pass - does not follow it with a second one. */
+    s_last_restart_us = esp_timer_get_time();
     esp_video_if_stop();
     if (esp_video_if_start() != ESP_OK) {
         ESP_LOGE(TAG, "stream restart failed applying the rate trade-off; the camera needs "
@@ -1184,11 +1272,17 @@ static void video_encoder_task(void *arg)
          * the stream to the next IDR, which is why video_rate_ctrl_init() was told
          * fps_actuable = false and every rung reports the native rate.
          *
+         * Compiled out entirely with CONFIG_MEDIA_STREAM_UVC_BITRATE_VIA_RESTART: that
+         * option states the camera takes a bitrate only at stream start, so the whole
+         * mid-stream path - including its refusal detection - is dead weight there, and
+         * uvc_maybe_restart_for_bitrate() at the top of this loop does the actuating.
+         *
          * Deliberately rate limited: three EP0 control transfers on the task that also
          * feeds every sink is not a per-frame cost. The check is on the PULL, not on what
          * comes out of it, because the pending target is held until someone takes it - so
          * declining to pull leaves the latest value waiting rather than discarding it, and
          * a rung change is delayed, never lost. */
+#if !CONFIG_MEDIA_STREAM_UVC_BITRATE_VIA_RESTART
         if (s_xu_rate_ctrl_supported &&
             (esp_timer_get_time() - s_last_xu_commit_us) >= XU_COMMIT_MIN_INTERVAL_US) {
             const uint32_t new_bps = video_rate_ctrl_pull_bitrate_bps();
@@ -1214,35 +1308,21 @@ static void video_encoder_task(void *arg)
                      * useless: the ladder keeps stepping down a lever that reaches
                      * nothing, `sink-stats` reports rungs the wire never saw, and we
                      * spend three EP0 control transfers every 2 s on the task that also
-                     * feeds every sink. Two consecutive refusals rather than one, so a
-                     * single clamp at a boundary is not mistaken for a camera that never
-                     * moves; 10% tolerance because clamping to a nearby supported rate
-                     * is normal and still counts as actuating. */
+                     * feeds every sink.
+                     *
+                     * Two consecutive refusals, not one: the verdict here freezes every
+                     * controller for the rest of the session, so a single clamp at a rate
+                     * boundary must not be mistaken for a camera that never moves. (A
+                     * build with restart-based actuation available does not reach this
+                     * code at all - it never tries the mid-stream lever.) 10% tolerance
+                     * because clamping to a nearby supported rate is normal and still
+                     * counts as actuating. */
                     const uint32_t tol = new_bps / 10;
                     if (committed + tol < new_bps || committed > new_bps + tol) {
                         if (++s_xu_refusals >= 2) {
-                            /* Either way the mid-stream path is dead and must stop
-                             * spending EP0 transfers on it. What differs is whether
-                             * there is another way to actuate at all. */
+                            /* The mid-stream path is dead and must stop spending EP0
+                             * transfers on it. With fps fixed as well, no lever is left. */
                             s_xu_rate_ctrl_supported = false;
-#if CONFIG_MEDIA_STREAM_UVC_BITRATE_VIA_RESTART
-                            ESP_LOGW(TAG, "camera ignores runtime bitrate changes (asked %"
-                                          PRIu32 ", committed %" PRIu32 " twice) - it accepts "
-                                          "an H.264 rate only at stream start; switching to "
-                                          "restart-based actuation",
-                                     new_bps, committed);
-                            s_xu_restart_mode = true;
-                            /* Deliberately NOT marking the bitrate inactuable: the
-                             * ladder must keep producing targets for the restart path
-                             * to aim at, and freezing it here would starve it. */
-                            s_last_restart_us = esp_timer_get_time();
-                            /* Actuation is now a stream restart, minutes apart. Without
-                             * saying so the queue front-end re-evaluates every 500 ms
-                             * and walks the whole ladder before the first change has
-                             * reached the camera - measured: eight rungs in 3 s. */
-                            video_rate_ctrl_set_actuation_period_ms(
-                                CONFIG_MEDIA_STREAM_UVC_RESTART_MIN_INTERVAL_S * 1000);
-#else
                             ESP_LOGW(TAG, "camera ignores runtime bitrate changes (asked %"
                                           PRIu32 ", committed %" PRIu32 " twice) - it accepts "
                                           "an H.264 rate only at stream start; camera-side "
@@ -1251,7 +1331,6 @@ static void video_encoder_task(void *arg)
                                           "actuate by restarting the stream instead",
                                      new_bps, committed);
                             video_rate_ctrl_set_bitrate_actuable(false);
-#endif
                         }
                     } else {
                         s_xu_refusals = 0;
@@ -1264,6 +1343,7 @@ static void video_encoder_task(void *arg)
                 }
             }
         }
+#endif  /* !CONFIG_MEDIA_STREAM_UVC_BITRATE_VIA_RESTART */
 #endif
 
         /* A P-frame that references a frame the viewer never got decodes to garbage,
@@ -1487,11 +1567,21 @@ esp_err_t esp32p4_frame_grabber_init(video_frame_preprocess_fn_t frame_preproces
      * Recovery is bounded by the periodic request below, or by the camera's own GOP. */
     uint32_t xu_bps = 0;
     if (esp_video_uvc_get_h264_committed_bitrate(&xu_bps) == ESP_OK && xu_bps > 0) {
+#if CONFIG_MEDIA_STREAM_UVC_BITRATE_VIA_RESTART
+        /* The option says this camera only takes a bitrate at stream start, so the
+         * mid-stream lever is not tried even once. Probing it first would spend three
+         * EP0 control transfers per attempt to change nothing, and - worse - the ladder
+         * would step down believing it had actuated, so every rung until the refusal was
+         * detected described a wire that never moved. */
+        s_xu_restart_mode        = true;
+        s_xu_rate_ctrl_supported = false;
+#else
         s_xu_rate_ctrl_supported = true;
         /* Fresh verdict per stream: a camera that ignored runtime changes last
          * session may accept them after a replug, and xu_bps is what it just
          * committed at stream start. */
         s_xu_refusals = 0;
+#endif
         /* Seed the committed value from what the camera took at stream start, so
          * `sink-stats` reports reality from the first frame instead of 0 until some
          * later change happens to report one - and so the restart path's want-vs-have
@@ -1501,12 +1591,34 @@ esp_err_t esp32p4_frame_grabber_init(video_frame_preprocess_fn_t frame_preproces
         video_rate_ctrl_init(cfg.enc_cfg.fps, xu_bps,
                              cfg.enc_cfg.res.width, cfg.enc_cfg.res.height,
                              /* fps_actuable = */ false);
-        /* After init(), which resets it: even the working mid-stream path is rate
-         * limited to one commit per XU_COMMIT_MIN_INTERVAL_US, so the level front-end
-         * must not out-run it. */
+        /* After init(), which resets it. Either lever is rate limited, so tell the
+         * level front-end which one it is driving or it walks the whole ladder before
+         * the first change has reached the camera. */
+#if CONFIG_MEDIA_STREAM_UVC_BITRATE_VIA_RESTART
+        video_rate_ctrl_set_actuation_period_ms(
+            CONFIG_MEDIA_STREAM_UVC_RESTART_MIN_INTERVAL_S * 1000);
+#else
         video_rate_ctrl_set_actuation_period_ms(XU_COMMIT_MIN_INTERVAL_US / 1000);
+#endif
+        /* After init(), which resets the pin to whatever was last requested - and on a
+         * first boot nothing has been requested yet. This is what gives the ladder its
+         * bits-per-pixel floor, so it stops descending into rungs where a pinned frame
+         * rate becomes an unstable one. */
+#if CONFIG_MEDIA_STREAM_UVC_PREFER_FRAMERATE
+        video_rate_ctrl_set_fps_pinned(true, /* operator_request = */ true);
+#else
+        video_rate_ctrl_set_fps_pinned(false, /* operator_request = */ true);
+#endif
+#if CONFIG_MEDIA_STREAM_UVC_BITRATE_VIA_RESTART
         ESP_LOGI(TAG, "UVC passthrough: hardware encoder idle, camera-side rate control "
-                      "active from %" PRIu32 " bps (bitrate only, fps fixed)", xu_bps);
+                      "active from %" PRIu32 " bps (bitrate only, fps fixed); a new bitrate "
+                      "is applied by restarting the stream, at most one every %d s",
+                 xu_bps, CONFIG_MEDIA_STREAM_UVC_RESTART_MIN_INTERVAL_S);
+#else
+        ESP_LOGI(TAG, "UVC passthrough: hardware encoder idle, camera-side rate control "
+                      "active from %" PRIu32 " bps (bitrate only, fps fixed); a new bitrate "
+                      "is applied by extension-unit commits while streaming", xu_bps);
+#endif
     } else {
         s_xu_rate_ctrl_supported = false;
         ESP_LOGW(TAG, "UVC passthrough: no usable H.264 extension unit, so nothing can be "

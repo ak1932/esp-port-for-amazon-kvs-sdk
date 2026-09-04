@@ -11,7 +11,7 @@
 #include "freertos/semphr.h"
 #include "esp_timer.h"
 #include "esp_log.h"
-#include "video_rate_ctrl.h"
+#include "video_rate_ctrl_priv.h"
 
 static const char *TAG = "vrate";
 
@@ -130,6 +130,43 @@ static const vrate_rung_t LADDER[] = {
  * less than the encoder will honor. The ladder L7 bitrate is clamped up to this. */
 #define MIN_BITRATE_BPS      (100 * 1024)
 
+/* Bits per pixel per frame below which a PINNED frame rate cannot be honoured.
+ *
+ * Holding the frame rate only works while the bitrate can still pay for that many
+ * frames. Below this the encoder runs out of budget at maximum QP and starts
+ * discarding frames anyway - and because how many it has to discard depends on the
+ * scene, the result is not a lower frame rate but an unstable one. Measured on
+ * ESP32-S31 at 720p with the sensor pinned at 30 fps: 254 kbps (0.0092 bpp) gave
+ * 15-22 fps, stdev 1.6, with the upload queue permanently full; 520 kbps (0.019 bpp)
+ * gave a rock-steady 29-30. At 1080p, ~900 kbps (0.014 bpp) held 29-30.
+ *
+ * 0.015 sits just under the two stable points and well above the unstable one, and
+ * puts the floor at 415 kbps for 720p30 and 933 kbps for 1080p30. */
+#define PINNED_BPP_NUM       15
+#define PINNED_BPP_DEN       1000
+
+/* How long a rung that congested stays barred from recovery, and how long after a
+ * forced pin release before the pin may be re-asserted.
+ *
+ * The bar is TCP's ssthresh. Without it recovery climbs straight back into the rung
+ * that just collapsed: measured at 1080p, L0 saturated the uplink reproducibly and
+ * the ladder re-entered it every time, a ~5-6 minute cycle costing two stream
+ * restarts and a queue excursion to ~650 buffers per lap. One rung of the bar decays
+ * per interval, so a link that genuinely improves is still found - just not
+ * immediately, and not repeatedly. */
+#define PROBE_BAR_DECAY_MS   60000
+#define PIN_REASSERT_DWELL_MS 30000
+
+/* Recovery evaluation cadence.
+ *
+ * Deliberately NOT the actuation period. That period exists so a step-DOWN cannot be
+ * issued again before the previous one could have taken effect; an upward move the
+ * actuator has not applied yet costs nothing, and the actuator enforces its own
+ * minimum interval anyway. Charging recovery the full period measured 120 s for a
+ * single rung on a camera whose only lever is a stream restart - 7-14 minutes from
+ * the floor back to the top, which reads to a user as "it never recovers". */
+#define RECOVER_EVAL_MS      3000
+
 struct video_rate_ctrl_s {
     bool     in_use;
     bool     enabled;
@@ -153,6 +190,11 @@ struct video_rate_ctrl_s {
 
     int64_t  healthy_since_us;
     uint32_t healthy_reports;
+
+    /* Best (lowest-index) rung recovery may re-enter; 0 = unrestricted. Raised to
+     * L+1 whenever rung L congests, and decayed one rung per PROBE_BAR_DECAY_MS. */
+    uint32_t probe_bar_level;
+    int64_t  probe_bar_us;
 
     int64_t  last_report_us;
     bool     stale;                /* cached, so the transition can be logged once */
@@ -189,8 +231,18 @@ static struct {
     bool     bitrate_actuable;
     /* How long a change takes to reach the encoder. The level front-ends must not
      * re-evaluate faster than this or they step down repeatedly on a signal that
-     * cannot have responded yet. 0 = the encoder is driven directly. */
+     * cannot have responded yet. 0 = the encoder is driven directly. Measured without
+     * it on a restart-actuated camera: all eight rungs in three seconds (queue 33% ->
+     * 39%), re-evaluating every 500 ms while the first step had not reached the camera. */
     uint32_t actuation_period_ms;
+    /* What the operator asked for, versus what is actually in effect. They differ
+     * when the bitrate has fallen below the bits-per-pixel floor: the pin is then
+     * released, because holding it there produces an UNSTABLE frame rate rather than
+     * a lower one, and re-asserted once the arbitrated bitrate can pay for it again.
+     * Keeping the request separate is what makes that reversible. */
+    bool     fps_pin_wanted;
+    bool     fps_pinned;
+    int64_t  pin_released_us;
 } s_agg;
 
 /* Published to the encoder task. Written under s_lock, read lock-free - which is
@@ -198,6 +250,10 @@ static struct {
 static _Atomic uint32_t s_pub_target_fps;   /* 0 = native, nothing to throttle */
 static _Atomic uint32_t s_pub_camera_fps;
 static _Atomic uint32_t s_pending_bitrate;  /* 0 = nothing to apply */
+/* Frame-rate pin change waiting for the capture task: -1 none, 0 release, 1 assert.
+ * Published rather than called back, because applying it means restarting the camera
+ * stream and that may only happen where no capture buffer is held. */
+static _Atomic int32_t s_pending_pin = -1;
 static _Atomic int64_t  s_stale_check_us;   /* next time staleness could matter */
 
 /* Skip accumulator. There is one encoder, so there is one skip decision and one
@@ -222,6 +278,8 @@ static esp_err_t vrate_lock_init(void)
 static inline void vrate_lock(void)   { xSemaphoreTake(s_lock, portMAX_DELAY); }
 static inline void vrate_unlock(void) { xSemaphoreGive(s_lock); }
 
+static void vrate_expire_if_due(int64_t now);
+
 /* The starting rung depends on whether fps is a lever; see the two constants. */
 /* Cadence for the level (queue) front-end: never faster than the encoder can
  * actually respond. See video_rate_ctrl_set_actuation_period_ms(). */
@@ -234,15 +292,74 @@ static int64_t vrate_level_eval_period_us(void)
     return (int64_t) ms * 1000;
 }
 
+static int64_t vrate_recover_eval_period_us(void)
+{
+    uint32_t ms = (RECOVER_EVAL_MS > QUEUE_EVAL_MS) ? RECOVER_EVAL_MS : QUEUE_EVAL_MS;
+    return (int64_t) ms * 1000;
+}
+
 static uint32_t vrate_start_level(void)
 {
     return s_agg.fps_actuable ? START_LEVEL : START_LEVEL_FPS_FIXED;
 }
 
+/* Bitrate below which a pinned frame rate stops being deliverable. Computed
+ * independently of whether the pin is currently in effect, because both the release
+ * and the re-assert decision need to compare against it. */
+static uint32_t vrate_pinned_floor_raw(void)
+{
+    const uint64_t px  = (uint64_t) s_agg.width * (uint64_t) s_agg.height;
+    const uint32_t fps = s_agg.camera_fps ? s_agg.camera_fps : 30u;
+    if (px == 0) {
+        return 0;
+    }
+    return (uint32_t)((px * (uint64_t) fps * PINNED_BPP_NUM) / PINNED_BPP_DEN);
+}
+
+/* The floor every rung is clamped up to: the encoder's absolute minimum, raised to
+ * the bits-per-pixel floor while the frame rate is actually pinned. */
+static uint32_t vrate_floor_bps(void)
+{
+    uint32_t f = s_agg.min_bitrate_bps;
+    if (s_agg.fps_pinned) {
+        const uint32_t pf = vrate_pinned_floor_raw();
+        if (pf > f) {
+            f = pf;
+        }
+    }
+    if (s_agg.max_bitrate_bps && f > s_agg.max_bitrate_bps) {
+        f = s_agg.max_bitrate_bps;
+    }
+    return f;
+}
+
 static uint32_t vrate_rung_bitrate(uint32_t level)
 {
     uint32_t b = (uint32_t)(((uint64_t)s_agg.max_bitrate_bps * LADDER[level].pct) / 100);
-    return (b < s_agg.min_bitrate_bps) ? s_agg.min_bitrate_bps : b;
+    const uint32_t flr = vrate_floor_bps();
+    return (b < flr) ? flr : b;
+}
+
+/* Deepest rung worth entering. Every rung below the first one that has already hit
+ * the floor carries the SAME bitrate, so descending into them changes nothing the
+ * encoder can see - measured on a camera whose floor was 256 kbps: L5, L6 and L7 all
+ * read 256000, and the overflow path dived through all three in 4 seconds, then took
+ * minutes to climb back out of rungs that had never bought anything.
+ *
+ * Only applies where fps is fixed. When fps IS ours to lower, the deeper rungs still
+ * do something even at an identical bitrate. */
+static uint32_t vrate_deepest_useful_level(void)
+{
+    if (s_agg.fps_actuable) {
+        return LADDER_N - 1;
+    }
+    const uint32_t flr = vrate_floor_bps();
+    for (uint32_t i = 0; i < LADDER_N; i++) {
+        if (vrate_rung_bitrate(i) <= flr) {
+            return i;
+        }
+    }
+    return LADDER_N - 1;
 }
 
 static uint32_t vrate_rung_fps(uint32_t level)
@@ -279,7 +396,8 @@ static uint32_t vrate_eff_max(const struct video_rate_ctrl_s *h)
     if (h->net_ceiling_bps != 0 && h->net_ceiling_bps < eff) {
         eff = h->net_ceiling_bps;
     }
-    return (eff < s_agg.min_bitrate_bps) ? s_agg.min_bitrate_bps : eff;
+    const uint32_t flr = vrate_floor_bps();
+    return (eff < flr) ? flr : eff;
 }
 
 /* Highest-quality (lowest-index) rung whose bitrate fits this controller's
@@ -304,6 +422,10 @@ static void vrate_apply_level(struct video_rate_ctrl_s *h, uint32_t level)
     if (level < floor_lvl) {
         level = floor_lvl;
     }
+    const uint32_t deepest = vrate_deepest_useful_level();
+    if (level > deepest) {
+        level = deepest;
+    }
     if (level > LADDER_N - 1) {
         level = LADDER_N - 1;
     }
@@ -322,6 +444,9 @@ static void vrate_reset_signal(struct video_rate_ctrl_s *h)
     h->load_pct        = 0;
     h->healthy_since_us = 0;
     h->healthy_reports  = 0;
+    /* The bar is evidence about the LINK, not about the signal, so a front-end reset
+     * (enable, re-admission after staleness) keeps it. It is cleared only in init(),
+     * where the encoder itself is being redescribed. */
 }
 
 static inline bool vrate_is_stale(const struct video_rate_ctrl_s *h, int64_t now)
@@ -343,6 +468,9 @@ static void vrate_rearbitrate(int64_t now)
      * operating point would only misreport one. Freeze at whatever is in force
      * and let get_stats() say why. */
     if (s_agg.inited && !s_agg.fps_actuable && !s_agg.bitrate_actuable) {
+        /* Park the staleness deadline too: nothing here will ever change, and without
+         * this the encoder task takes the lock on every frame once it has passed. */
+        atomic_store(&s_stale_check_us, INT64_MAX);
         return;
     }
 
@@ -394,6 +522,23 @@ static void vrate_rearbitrate(int64_t now)
         return;
     }
 
+    /* Re-assert the pin here rather than in the ladder: whether the frame rate is
+     * affordable is a property of the ARBITRATED bitrate - the one the single encoder
+     * will actually run at - not of any one controller's rung. Release is the ladder's
+     * job (it needs evidence the floor cannot be carried); this only needs headroom.
+     *
+     * The dwell stops it flapping: without it the re-assert fires on the same
+     * arbitration pass as the release, since the rung it was released at still reads
+     * exactly the floor bitrate. */
+    if (s_agg.fps_pin_wanted && !s_agg.fps_pinned) {
+        const uint32_t pf = vrate_pinned_floor_raw();
+        if (min_bps >= pf &&
+                (now - s_agg.pin_released_us) >= (int64_t) PIN_REASSERT_DWELL_MS * 1000) {
+            s_agg.fps_pinned = true;
+            atomic_store(&s_pending_pin, 1);
+        }
+    }
+
     atomic_store(&s_pub_target_fps, min_fps);
     if (min_bps != s_agg.requested_bitrate) {
         s_agg.requested_bitrate = min_bps;
@@ -416,6 +561,31 @@ static bool vrate_step_down(struct video_rate_ctrl_s *h, uint32_t jump)
         return false;
     }
 
+    const int64_t now = esp_timer_get_time();
+
+    /* This rung just congested, so recovery must not walk straight back into it.
+     * Recorded before any early return: the fact is true even when there is nowhere
+     * left to descend to, and that is exactly the case where it matters most. */
+    if (h->level + 1 > h->probe_bar_level) {
+        h->probe_bar_level = (h->level + 1 <= LADDER_N - 1) ? h->level + 1 : LADDER_N - 1;
+    }
+    h->probe_bar_us = now;
+
+    if (h->level >= vrate_deepest_useful_level()) {
+        /* At the bottom of what the current floor allows. If that floor is the
+         * bits-per-pixel one, the pin is the thing standing in the way - and holding
+         * it here is actively worse than giving it up, because the encoder cannot fit
+         * the frames it is still being handed and sheds a scene-dependent number of
+         * them. Give up the frame rate and let the ladder keep going; a stable 12 fps
+         * beats an unstable 18. */
+        if (s_agg.fps_pinned) {
+            s_agg.fps_pinned      = false;
+            s_agg.pin_released_us = now;
+            atomic_store(&s_pending_pin, 0);
+        } else {
+            return false;
+        }
+    }
     if (h->level >= LADDER_N - 1) {
         return false;
     }
@@ -452,8 +622,35 @@ static bool vrate_mark_healthy(struct video_rate_ctrl_s *h, int64_t now)
         return false;
     }
 
+    /* Decay the bar one rung at a time, so a link that has genuinely improved is
+     * eventually re-probed - but only after it has been quiet long enough that the
+     * probe is not just the previous collapse repeating. */
+    if (h->probe_bar_level > 0 &&
+            (now - h->probe_bar_us) >= (int64_t) PROBE_BAR_DECAY_MS * 1000) {
+        h->probe_bar_level--;
+        h->probe_bar_us = now;
+    }
+    const uint32_t bar = h->probe_bar_level;
+    if (h->level <= bar) {
+        return false;   /* already as high as the evidence supports */
+    }
+
+    /* Jump, rather than single-step. Where fps is fixed, several deep rungs collapse
+     * onto the same floor bitrate, and a single step through them spends a whole
+     * evaluation cadence producing nothing the encoder can see. Only from a queue
+     * that is completely empty (q_primed says this IS a queue controller - the latency
+     * front-end never writes q_ema_pct, so 0 there means nothing), and never past the
+     * bar. */
+    uint32_t nl = h->level - 1;
+    if (h->q_primed && h->q_ema_pct == 0 && h->level >= bar + 3) {
+        nl = h->level - 2;
+    }
+    if (nl < bar) {
+        nl = bar;
+    }
+
     uint32_t prev = h->level;
-    vrate_apply_level(h, h->level - 1);
+    vrate_apply_level(h, nl);
     return h->level != prev;
 }
 
@@ -489,6 +686,13 @@ void video_rate_ctrl_init(uint32_t camera_fps, uint32_t max_bitrate_bps,
     s_agg.committed_bitrate = 0;
     /* Set by the grabber right after this, if the encoder is one that needs it. */
     s_agg.actuation_period_ms = 0;
+    /* The pin follows the request again: this is a fresh encoder configuration, so any
+     * earlier forced release was about a link condition that is no longer evidenced.
+     * fps_pin_wanted itself is deliberately NOT cleared - it is the operator's choice
+     * and outlives a stream restart, which is exactly what a restart-based bitrate
+     * actuator performs on every rung change. */
+    s_agg.fps_pinned      = s_agg.fps_pin_wanted;
+    s_agg.pin_released_us = 0;
     s_agg.inited          = true;
     atomic_store(&s_pub_camera_fps, s_agg.camera_fps);
     atomic_store(&s_pending_bitrate, 0);
@@ -505,20 +709,34 @@ void video_rate_ctrl_init(uint32_t camera_fps, uint32_t max_bitrate_bps,
         vrate_reset_signal(h);
         h->last_report_us = now;
         h->stale          = false;
+        /* Cleared only here: the encoder is being redescribed (possibly at a new
+         * resolution and a new max), so which rungs previously congested says nothing
+         * useful about the new ladder. */
+        h->probe_bar_level = 0;
+        h->probe_bar_us    = now;
         if (h->enabled) {
             vrate_apply_level(h, vrate_start_level());
             seeded++;
         }
     }
     vrate_rearbitrate(now);
-    uint32_t cam = s_agg.camera_fps;
-    uint32_t flr = s_agg.min_bitrate_bps;
+    uint32_t cam    = s_agg.camera_fps;
+    uint32_t flr    = vrate_floor_bps();
+    uint32_t pinflr = s_agg.fps_pinned ? vrate_pinned_floor_raw() : 0;
+    uint32_t deep   = vrate_deepest_useful_level();
     vrate_unlock();
 
     ESP_LOGI(TAG, "init: cam_fps=%" PRIu32 "%s res=%" PRIu32 "x%" PRIu32
-             " max=%" PRIu32 "bps floor=%" PRIu32 "bps, %" PRIu32 " controller(s) adapting",
+             " max=%" PRIu32 "bps floor=%" PRIu32 "bps deepest=L%" PRIu32
+             ", %" PRIu32 " controller(s) adapting",
              cam, fps_actuable ? "" : " (fixed - bitrate only)",
-             width, height, max_bitrate_bps, flr, seeded);
+             width, height, max_bitrate_bps, flr, deep, seeded);
+    if (pinflr) {
+        ESP_LOGI(TAG, "frame rate pinned at %" PRIu32 " fps: will not descend below %"
+                      PRIu32 " bps (%d/%d bits per pixel per frame), and gives the pin up "
+                      "rather than deliver an unstable rate below it",
+                 cam, pinflr, PINNED_BPP_NUM, PINNED_BPP_DEN);
+    }
 }
 
 esp_err_t video_rate_ctrl_create(const char *name, video_rate_ctrl_handle_t *out)
@@ -720,6 +938,8 @@ void video_rate_ctrl_report_queue(video_rate_ctrl_handle_t h,
         vrate_unlock();
         return;
     }
+    /* Armed provisionally with the step-down cadence; the branch below re-arms it
+     * with the recovery cadence when it turns out we are climbing, not falling. */
     h->q_next_eval_us = now + vrate_level_eval_period_us();
 
     uint32_t occ = (used * 100u) / capacity;
@@ -751,8 +971,10 @@ void video_rate_ctrl_report_queue(video_rate_ctrl_handle_t h,
          * climbing back into a queue that is already refilling. */
         moved = vrate_mark_healthy(h, now);
         up    = moved;
+        h->q_next_eval_us = now + vrate_recover_eval_period_us();
     } else {
         vrate_reset_healthy(h);
+        h->q_next_eval_us = now + vrate_recover_eval_period_us();
     }
 
     if (moved) {
@@ -777,7 +999,7 @@ void video_rate_ctrl_report_overflow(video_rate_ctrl_handle_t h)
     if (h == NULL || s_lock == NULL) {
         return;
     }
-    bool     moved = false;
+    bool     moved = false, held = false;
     char     name[VRATE_NAME_LEN];
     uint32_t lvl = 0, fps = 0, bps = 0;
 
@@ -793,16 +1015,32 @@ void video_rate_ctrl_report_overflow(video_rate_ctrl_handle_t h)
     h->stale          = false;
     h->reports++;
 
-    /* Data was actually lost. Treat the queue as full regardless of what the
-     * last sample said, and re-arm the cadence so the drop is not immediately
-     * followed by another one before it can take effect. */
-    h->q_primed       = true;
-    h->q_ema_pct      = 100;
-    h->q_delta        = 0;
-    h->load_pct       = (100u * 100u) / QUEUE_CONGEST_PCT;
-    h->q_next_eval_us = now + vrate_level_eval_period_us();
+    /* Data was actually lost, so record the queue as full whatever the last sample
+     * said. Nothing here is discarded if the step below is held off: the next
+     * evaluation, from either front-end, sees 100% and steps down with severity. */
+    h->q_primed  = true;
+    h->q_ema_pct = 100;
+    h->q_delta   = 0;
+    h->load_pct  = (100u * 100u) / QUEUE_CONGEST_PCT;
 
-    moved = vrate_step_down(h, 2);
+    /* Overflow bypasses the SMOOTHING - no EMA to wait for, no trend to agree - but
+     * NOT the actuation cadence. A step the encoder has not yet had the chance to
+     * apply cannot be the reason the queue is still overflowing, so treating the loss
+     * as fresh evidence against it just spends the ladder for nothing. Measured on a
+     * camera whose only lever is a stream restart, 30 s apart: two overflows 3 s
+     * apart took it L3 -> L5 -> L7 while the wire was still at its original rate, and
+     * the floor it landed on delivered 12 fps instead of 30.
+     *
+     * The deadline moves only when a step actually happens, so a sink that keeps
+     * overflowing still descends - one step per cadence rather than all of them
+     * before the first can land. */
+    if (now >= h->q_next_eval_us) {
+        h->q_next_eval_us = now + vrate_level_eval_period_us();
+        moved = vrate_step_down(h, 2);
+    } else {
+        held = true;
+    }
+
     if (moved || was_stale) {
         vrate_rearbitrate(now);
     }
@@ -813,7 +1051,70 @@ void video_rate_ctrl_report_overflow(video_rate_ctrl_handle_t h)
     if (moved) {
         ESP_LOGW(TAG, "'%s' overflow, data lost: L%" PRIu32 " (%" PRIu32 "fps/%" PRIu32 "bps)",
                  name, lvl, fps, bps);
+    } else if (held) {
+        /* Deliberately quiet: the transport logs the loss itself, and this only says
+         * the ladder is waiting on an actuation it has already asked for. */
+        ESP_LOGD(TAG, "'%s' overflow, data lost: holding L%" PRIu32 " until the last "
+                      "change can reach the encoder", name, lvl);
     }
+}
+
+/* Shared body. @c set_request distinguishes the two callers, and the distinction
+ * matters more than it looks: when the LADDER forces a release, the actuator reports
+ * that back here, and letting that report also clear fps_pin_wanted destroys the
+ * operator's choice - after which nothing ever re-asserts the pin, because the
+ * re-assert is conditional on it. Measured exactly that: one forced release and
+ * `sink-stats` stopped mentioning the pin at all for the rest of the session. */
+static void vrate_set_pin(bool pinned, bool set_request)
+{
+    if (vrate_lock_init() != ESP_OK) {
+        return;
+    }
+    vrate_lock();
+    const bool was = s_agg.fps_pinned;
+    if (set_request) {
+        s_agg.fps_pin_wanted  = pinned;
+        s_agg.pin_released_us = 0;
+    } else if (!pinned) {
+        /* Start the anti-flap dwell from the moment the release actually took effect. */
+        s_agg.pin_released_us = esp_timer_get_time();
+    }
+    s_agg.fps_pinned = pinned;
+    if (s_agg.inited && was != pinned) {
+        /* The floor moved, so rungs that were clamped to it are now wrong. Re-apply
+         * every enabled controller before re-arbitrating. */
+        const int64_t now = esp_timer_get_time();
+        for (int i = 0; i < CONFIG_VIDEO_RATE_CTRL_MAX; i++) {
+            struct video_rate_ctrl_s *h = &s_ctrl[i];
+            if (h->in_use && h->enabled) {
+                vrate_apply_level(h, h->level);
+            }
+        }
+        vrate_rearbitrate(now);
+    }
+    const bool  wanted = s_agg.fps_pin_wanted;
+    const uint32_t flr = s_agg.inited ? vrate_floor_bps() : 0;
+    const uint32_t pf  = vrate_pinned_floor_raw();
+    const uint32_t dp  = s_agg.inited ? vrate_deepest_useful_level() : 0;
+    vrate_unlock();
+    /* No s_pending_pin store: the caller is the one that owns the actuator, and it is
+     * telling US what it just did. Publishing back would loop. */
+
+    if (was != pinned || set_request) {
+        ESP_LOGI(TAG, "frame-rate pin %s (requested %s): floor %" PRIu32 " bps, pinned needs %"
+                      PRIu32 " bps, ladder stops at L%" PRIu32,
+                 pinned ? "held" : "off", wanted ? "on" : "off", flr, pf, dp);
+    }
+}
+
+void video_rate_ctrl_set_fps_pinned(bool pinned, bool operator_request)
+{
+    vrate_set_pin(pinned, operator_request);
+}
+
+int video_rate_ctrl_pull_fps_pin(void)
+{
+    return (int) atomic_exchange(&s_pending_pin, -1);
 }
 
 void video_rate_ctrl_set_min_bitrate_bps(uint32_t bps)
@@ -901,11 +1202,20 @@ esp_err_t video_rate_ctrl_get_encoder_stats(video_rate_ctrl_encoder_stats_t *out
         memset(out, 0, sizeof(*out));
         return ESP_OK;
     }
+    /* Third place staleness is noticed, and the only one on the restart actuator's path:
+     * in restart mode the grabber never pulls a bitrate, it reads requested_bps from here.
+     * Without this a sink that stopped reporting would keep the camera at its rung. */
+    vrate_expire_if_due(esp_timer_get_time());
     vrate_lock();
     out->requested_bps    = s_agg.inited ? s_agg.requested_bitrate : 0;
     out->committed_bps    = s_agg.committed_bitrate;
     out->fps_actuable     = s_agg.fps_actuable;
     out->bitrate_actuable = s_agg.bitrate_actuable;
+    out->fps_pin_wanted   = s_agg.fps_pin_wanted;
+    out->fps_pinned       = s_agg.fps_pinned;
+    out->pinned_floor_bps = s_agg.fps_pin_wanted ? vrate_pinned_floor_raw() : 0;
+    out->floor_bps        = s_agg.inited ? vrate_floor_bps() : 0;
+    out->deepest_level    = s_agg.inited ? vrate_deepest_useful_level() : 0;
     vrate_unlock();
     return ESP_OK;
 }
@@ -1051,6 +1361,7 @@ esp_err_t video_rate_ctrl_get_stats(video_rate_ctrl_stats_t *out, size_t max, si
         o->load_pct           = h->load_pct;
         o->net_ceiling_bps    = h->net_ceiling_bps;
         o->reports            = h->reports;
+        o->probe_bar_level    = h->probe_bar_level;
     }
     if (enc_fps) {
         uint32_t t = atomic_load(&s_pub_target_fps);

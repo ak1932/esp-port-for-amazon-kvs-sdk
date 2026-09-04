@@ -1403,3 +1403,25 @@ esp_err_t esp32p4_snapshot_direct_grab(uint8_t *buf, size_t buf_size,
 #endif /* USE_ESP_VIDEO_IF */
 
 #endif
+
+#if !MEDIA_STREAM_HAS_ESP_VIDEO_CAPTURE
+/* Everything above compiles to an empty object on a target with no esp_video capture
+ * stack, which would take these two with it - but video_capture.h declares them
+ * unconditionally and the kvs_combined example's `uvc-rate` console command calls both,
+ * so the link fails there instead. Same answer as the no-passthrough stubs inside the
+ * guard: with no camera-side encoder there is nothing to trade. */
+#include "esp_err.h"
+#include "video_capture.h"
+
+esp_err_t video_capture_set_rate_tradeoff(bool pin_frame_rate)
+{
+    (void) pin_frame_rate;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t video_capture_set_camera_bitrate(uint32_t ref_bitrate_bps)
+{
+    (void) ref_bitrate_bps;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+#endif /* !MEDIA_STREAM_HAS_ESP_VIDEO_CAPTURE */

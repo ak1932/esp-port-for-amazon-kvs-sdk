@@ -14,6 +14,7 @@ set(srcs
     "${SRC_DIR}/hash_table.c"
     "${SRC_DIR}/hex.c"
     "${SRC_DIR}/instrumented_allocators.c"
+    "${SRC_DIR}/jsmn.c"
     "${SRC_DIR}/kvs_string.c"
     "${SRC_DIR}/logger.c"
     "${SRC_DIR}/mutex.c"

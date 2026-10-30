@@ -9,6 +9,10 @@
 #include "signaling_serializer.h"
 #include "json_serializer.h"
 #include "serializer_internal.h"
+/* The project's jsmn: declarations only, implemented once in kvs_utils. */
+#ifndef JSMN_HEADER
+#define JSMN_HEADER
+#endif
 #include "jsmn.h"
 #include "base64_compat.h"
 

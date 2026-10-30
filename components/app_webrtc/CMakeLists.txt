@@ -1,14 +1,7 @@
 set(KVS_WEBRTC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../amazon-kinesis-video-streams-webrtc-sdk-c")
 
-# Pick generic sources from KVS for app webrtc
-# Ideally, we should not pull in anything from KVS
-set(kvs_sources_for_app_webrtc
-    "${KVS_WEBRTC_ROOT}/src/source/PeerConnection/jsmn.c"
-)
-
 set(component_srcs
     "src/app_webrtc.c"
-    ${kvs_sources_for_app_webrtc}
 )
 
 set(component_add_includedirs

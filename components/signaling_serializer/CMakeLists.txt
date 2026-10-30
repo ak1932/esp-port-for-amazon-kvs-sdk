@@ -10,6 +10,8 @@ if (LINUX_BUILD)
     # Use local protobuf-c sources from ESP components
     set(PROTOBUF_C_SRCS
         "${CMAKE_CURRENT_SOURCE_DIR}/../../components/esp_hosted/common/protobuf-c/protobuf-c/protobuf-c.c"
+        # jsmn, as kvs_utils builds it
+        "${CMAKE_CURRENT_SOURCE_DIR}/../kvs_utils/src/jsmn.c"
     )
 
     set(PROTOBUF_C_INCLUDE_DIRS
@@ -25,6 +27,8 @@ if (LINUX_BUILD)
         "proto"
         # Include protobuf-c headers
         ${PROTOBUF_C_INCLUDE_DIRS}
+        # jsmn.h
+        "${CMAKE_CURRENT_SOURCE_DIR}/../kvs_utils/include"
     )
 
     # Add a definition for Linux builds
@@ -35,6 +39,6 @@ else()
         SRCS ${srcs}
         PRIV_INCLUDE_DIRS "proto"
         INCLUDE_DIRS "include"
-        PRIV_REQUIRES protobuf-c mbedtls
+        PRIV_REQUIRES protobuf-c mbedtls kvs_utils
     )
 endif()

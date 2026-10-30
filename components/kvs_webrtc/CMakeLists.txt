@@ -48,7 +48,6 @@ set(kvs_webrtc_srcs
       "${KVS_WEBRTC_ROOT}/src/source/Metrics/Metrics.c"
       "${KVS_WEBRTC_ROOT}/src/source/PeerConnection/DataChannel.c"
       "${KVS_WEBRTC_ROOT}/src/source/PeerConnection/JitterBuffer.c"
-      "${KVS_WEBRTC_ROOT}/src/source/PeerConnection/jsmn.c"
       "${KVS_WEBRTC_ROOT}/src/source/PeerConnection/PeerConnection.c"
       "${KVS_WEBRTC_ROOT}/src/source/PeerConnection/Retransmitter.c"
       "${KVS_WEBRTC_ROOT}/src/source/PeerConnection/Rtcp.c"

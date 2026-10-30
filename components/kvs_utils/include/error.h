@@ -333,6 +333,7 @@ typedef uint32_t UINT32;
 #define STATUS_HTTP_NOT_ENOUGH_MEMORY         STATUS_HTTP_BASE + 0x00000008
 #define STATUS_HTTP_BUF_OVERFLOW              STATUS_HTTP_BASE + 0x00000009
 #define STATUS_HTTP_IOT_FAILED                STATUS_HTTP_BASE + 0x0000000A
+#define STATUS_HTTP_NO_RESPONSE               STATUS_HTTP_BASE + 0x0000000B
 /******************************************************************************
  * Wss api error codes
  ******************************************************************************/

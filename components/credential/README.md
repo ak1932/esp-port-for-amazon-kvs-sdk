@@ -16,6 +16,15 @@ the stack is agnostic to *where* credentials come from.
 Each has a matching `free*` function. The mode is normally selected from menuconfig — see
 [docs/building.md → AWS credentials](../../docs/building.md#aws-credentials).
 
+### Sharing a provider
+
+One provider can serve several KVS clients, so credentials are fetched and refreshed once for all
+of them. The credentials a provider hands out stay valid until its refresh after next, which is
+enough for a user that takes them just before signing a request. A user that keeps them longer
+reads through `createCredentialProviderView()`: the view hands out its own copy, valid until the
+view's own get after next. Signaling does this with a provider passed in
+`kvs_signaling_config_t.pCredentialProvider`.
+
 ## Internals
 
 Also provides the AWS SigV4 signing helper (`aws_signer_v4.c`) used by the providers.

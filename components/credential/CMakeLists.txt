@@ -1,5 +1,8 @@
 idf_component_register(SRCS "src/aws_signer_v4.c"
+                            "src/aws_clock_skew.c"
+                            "src/aws_signed_request.c"
                             "src/auth.c"
+                            "src/credential_provider_view.c"
                             "src/file_credential_provider.c"
                             "src/iot_credential_provider.c"
                             "src/static_credential_provider.c"

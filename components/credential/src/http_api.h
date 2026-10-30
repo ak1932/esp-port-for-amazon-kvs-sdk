@@ -70,6 +70,10 @@ typedef struct __IotCredentialProvider {
     // Static Aws Credentials structure with the pointer following the main allocation
     PAwsCredentials pAwsCredentials;
 
+    // The credentials before the last refresh. A getter hands out the pointer and drops the
+    // lock, so another user of the provider may still hold it; it lives until the next refresh
+    PAwsCredentials pPrevAwsCredentials;
+
     // Serializes credential get/refresh - the refresh frees and reallocates
     // pAwsCredentials, so concurrent getters must not race it
     MUTEX credentialLock;

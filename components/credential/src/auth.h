@@ -67,6 +67,16 @@ STATUS aws_credential_deserialize(PBYTE);
  * @return - STATUS code of the execution
  */
 STATUS aws_credential_free(PAwsCredentials*);
+
+/**
+ * Makes new credentials a provider's current ones. The replaced set becomes the previous one,
+ * still valid for a user that took it before this refresh; the set before it is freed.
+ *
+ * @param - PAwsCredentials* - IN/OUT - The provider's current credentials
+ * @param - PAwsCredentials* - IN/OUT - The provider's previous credentials
+ * @param - PAwsCredentials - IN - The new credentials, now owned by the provider
+ */
+VOID aws_credential_replace(PAwsCredentials*, PAwsCredentials*, PAwsCredentials);
 #ifdef __cplusplus
 }
 #endif

@@ -128,8 +128,9 @@ STATUS freeIotCredentialProvider(PAwsCredentialProvider* ppCredentialProvider)
     // Call is idempotent
     CHK(pIotCredentialProvider != NULL, retStatus);
 
-    // Release the underlying AWS credentials object
+    // Release the underlying AWS credentials objects
     aws_credential_free(&pIotCredentialProvider->pAwsCredentials);
+    aws_credential_free(&pIotCredentialProvider->pPrevAwsCredentials);
 
     // Release the lock
     if (IS_VALID_MUTEX_VALUE(pIotCredentialProvider->credentialLock)) {

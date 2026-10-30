@@ -44,6 +44,10 @@ extern "C" {
 /**
  * Creates a File based AWS credential provider object
  *
+ * The file is read again once the credentials are within CREDENTIAL_FILE_READ_GRACE_PERIOD of
+ * their expiration. Credentials handed out stay valid until the read after next, so the provider
+ * can be shared (see credential_provider_view.h).
+ *
  * @param - PCHAR - IN - Credentials file path
  * @param - PAwsCredentialProvider* - OUT - Constructed AWS credentials provider object
  *
@@ -83,7 +87,18 @@ typedef STATUS (*CredentialFetchCallback)(UINT64 customData,
                                           PUINT64 pExpiration);
 
 /**
+ * Grace period before expiration at which the callback provider fetches again
+ */
+#define CALLBACK_CREDENTIAL_FETCH_GRACE_PERIOD                                                                                                       \
+    (5 * HUNDREDS_OF_NANOS_IN_A_SECOND + MIN_STREAMING_TOKEN_EXPIRATION_DURATION + STREAMING_TOKEN_EXPIRATION_GRACE_PERIOD)
+
+/**
  * @brief Create a Callback Credential Provider object
+ *
+ * The callback runs on the first get and again once the cached credentials are within
+ * CALLBACK_CREDENTIAL_FETCH_GRACE_PERIOD of their (absolute, 100 ns) expiration. Credentials
+ * handed out stay valid until the fetch after next, so the provider can be shared (see
+ * credential_provider_view.h).
  *
  * @param fetchCb
  * @param customData

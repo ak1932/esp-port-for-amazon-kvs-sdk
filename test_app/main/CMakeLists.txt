@@ -7,6 +7,9 @@ set(srcs
     "test_state_machine.c"
     "test_aws_signer_v4.c"
     "test_kvs_control_plane_url.c"
+    "test_aws_clock_skew.c"
+    "test_callback_credential_provider.c"
+    "test_credential_provider_view.c"
     "test_pending_ice.c"
     "test_stale_peer_watchdog.c"
     "test_bridge_ready_query.c"
@@ -25,6 +28,13 @@ set(srcs
     # SigV4 signer compiled standalone: the credential component pulls esp_http_client
     # (no linux-host build), but the signer itself only needs kvs_utils + mbedtls.
     "../../components/credential/src/aws_signer_v4.c"
+    # Clock skew from an HTTP Date header: kvs_utils + libc only, linked standalone.
+    "../../components/credential/src/aws_clock_skew.c"
+    # The callback and file credential providers, the view a provider is shared through, and
+    # the credentials they hand out: kvs_utils only.
+    "../../components/credential/src/file_credential_provider.c"
+    "../../components/credential/src/credential_provider_view.c"
+    "../../components/credential/src/auth.c"
     # Signaling re-send buffer (ICE candidates, SDP answers) compiled standalone:
     # it is dependency-free (libc only), so the host test links it without the
     # KVS signaling client.
@@ -36,6 +46,7 @@ idf_component_register(SRCS ${srcs}
                        INCLUDE_DIRS "."
                        PRIV_INCLUDE_DIRS
                            "../../components/credential/src"
+                           "../../components/credential/include"
                            "../../components/kvs_utils/src"
                            "../../components/signaling/kvs_signaling/port"
                            "../../components/kvs_webrtc/src"

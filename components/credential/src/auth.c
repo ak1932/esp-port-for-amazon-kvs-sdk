@@ -169,3 +169,10 @@ CleanUp:
     LEAVES();
     return retStatus;
 }
+
+VOID aws_credential_replace(PAwsCredentials* ppCurrent, PAwsCredentials* ppPrevious, PAwsCredentials pNew)
+{
+    aws_credential_free(ppPrevious);
+    *ppPrevious = *ppCurrent;
+    *ppCurrent = pNew;
+}

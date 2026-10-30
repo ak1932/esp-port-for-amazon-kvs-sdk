@@ -38,6 +38,12 @@ typedef struct __FileCredentialProvider {
     // Static Aws Credentials structure with the pointer following the main allocation
     PAwsCredentials pAwsCredentials;
 
+    // The credentials before the last read, kept for a user that still holds them
+    PAwsCredentials pPrevAwsCredentials;
+
+    // Serializes get/read between the users of a shared provider
+    MUTEX lock;
+
     // Pointer to credential file path
     PCHAR credentialsFilepath[MAX_PATH_LEN + 1];
 } FileCredentialProvider, *PFileCredentialProvider;
@@ -47,6 +53,10 @@ typedef struct __CallbackCredentialProvider {
     CredentialFetchCallback fetchCb;
     UINT64 customData;
     PAwsCredentials pAwsCredentials;
+    // The credentials before the last fetch, kept for a user that still holds them
+    PAwsCredentials pPrevAwsCredentials;
+    // Serializes get/fetch between the users of a shared provider
+    MUTEX lock;
 } CallbackCredentialProvider, *PCallbackCredentialProvider;
 
 /******************************************************************************
@@ -74,6 +84,9 @@ STATUS file_credential_provider_createWithTime(PCHAR pCredentialsFilepath, GetCu
 
     pFileCredentialProvider = (PFileCredentialProvider) MEMCALLOC(1, SIZEOF(FileCredentialProvider));
     CHK(pFileCredentialProvider != NULL, STATUS_NOT_ENOUGH_MEMORY);
+
+    pFileCredentialProvider->lock = MUTEX_CREATE(FALSE);
+    CHK(IS_VALID_MUTEX_VALUE(pFileCredentialProvider->lock), STATUS_NOT_ENOUGH_MEMORY);
 
     pFileCredentialProvider->credentialProvider.getCredentialsFn = priv_file_credential_provider_get;
 
@@ -116,6 +129,9 @@ STATUS createCallbackCredentialProvider(CredentialFetchCallback fetchCb,
     pCbProvider = (PCallbackCredentialProvider) MEMCALLOC(1, SIZEOF(CallbackCredentialProvider));
     CHK(pCbProvider != NULL, STATUS_NOT_ENOUGH_MEMORY);
 
+    pCbProvider->lock = MUTEX_CREATE(FALSE);
+    CHK(IS_VALID_MUTEX_VALUE(pCbProvider->lock), STATUS_NOT_ENOUGH_MEMORY);
+
     pCbProvider->fetchCb = fetchCb;
     pCbProvider->customData = customData;
     pCbProvider->credentialProvider.getCredentialsFn = priv_callback_credential_provider_get;
@@ -124,6 +140,9 @@ CleanUp:
     if (STATUS_FAILED(retStatus)) {
         if (pCbProvider != NULL) {
             aws_credential_free(&pCbProvider->pAwsCredentials);
+            if (IS_VALID_MUTEX_VALUE(pCbProvider->lock)) {
+                MUTEX_FREE(pCbProvider->lock);
+            }
             MEMFREE(pCbProvider);
         }
         pCbProvider = NULL;
@@ -143,8 +162,18 @@ static STATUS priv_callback_credential_provider_get(PAwsCredentialProvider pCred
     PCHAR accessKey = NULL, secretKey = NULL, sessionToken = NULL;
     UINT32 accessKeyLen = 0, secretKeyLen = 0, sessionTokenLen = 0;
     UINT64 expiration = 0;
+    PAwsCredentials pNewCredentials = NULL;
+    BOOL locked = FALSE;
 
     CHK(pCbProvider != NULL && ppAwsCredentials != NULL && pCbProvider->fetchCb != NULL, STATUS_NULL_ARG);
+
+    MUTEX_LOCK(pCbProvider->lock);
+    locked = TRUE;
+
+    // Cached until close to expiration
+    CHK(pCbProvider->pAwsCredentials == NULL ||
+            GETTIME() + CALLBACK_CREDENTIAL_FETCH_GRACE_PERIOD > pCbProvider->pAwsCredentials->expiration,
+        retStatus);
 
     CHK_STATUS(pCbProvider->fetchCb(pCbProvider->customData,
                                     &accessKey, &accessKeyLen,
@@ -152,19 +181,20 @@ static STATUS priv_callback_credential_provider_get(PAwsCredentialProvider pCred
                                     &sessionToken, &sessionTokenLen,
                                     &expiration));
 
-    aws_credential_free(&pCbProvider->pAwsCredentials);
-
     CHK_STATUS(aws_credential_create(accessKey, accessKeyLen,
                                      secretKey, secretKeyLen,
                                      sessionToken, sessionTokenLen,
                                      expiration,
-                                     &pCbProvider->pAwsCredentials));
+                                     &pNewCredentials));
 
-    *ppAwsCredentials = pCbProvider->pAwsCredentials;
+    aws_credential_replace(&pCbProvider->pAwsCredentials, &pCbProvider->pPrevAwsCredentials, pNewCredentials);
 
 CleanUp:
-    if (STATUS_FAILED(retStatus)) {
-        *ppAwsCredentials = NULL;
+    if (ppAwsCredentials != NULL) {
+        *ppAwsCredentials = STATUS_FAILED(retStatus) ? NULL : pCbProvider->pAwsCredentials;
+    }
+    if (locked) {
+        MUTEX_UNLOCK(pCbProvider->lock);
     }
     LEAVES();
     return retStatus;
@@ -183,8 +213,13 @@ STATUS file_credential_provider_free(PAwsCredentialProvider* ppCredentialProvide
     // Call is idempotent
     CHK(pFileCredentialProvider != NULL, retStatus);
 
-    // Release the underlying AWS credentials object
+    // Release the underlying AWS credentials objects
     aws_credential_free(&pFileCredentialProvider->pAwsCredentials);
+    aws_credential_free(&pFileCredentialProvider->pPrevAwsCredentials);
+
+    if (IS_VALID_MUTEX_VALUE(pFileCredentialProvider->lock)) {
+        MUTEX_FREE(pFileCredentialProvider->lock);
+    }
 
     // Release the object
     MEMFREE(pFileCredentialProvider);
@@ -204,8 +239,12 @@ static STATUS priv_file_credential_provider_get(PAwsCredentialProvider pCredenti
 
     STATUS retStatus = STATUS_SUCCESS;
     PFileCredentialProvider pFileCredentialProvider = (PFileCredentialProvider) pCredentialProvider;
+    BOOL locked = FALSE;
 
     CHK(pFileCredentialProvider != NULL && ppAwsCredentials != NULL, STATUS_NULL_ARG);
+
+    MUTEX_LOCK(pFileCredentialProvider->lock);
+    locked = TRUE;
 
     // Fill the credentials
     CHK_STATUS(priv_file_credential_provider_read(pFileCredentialProvider));
@@ -213,6 +252,10 @@ static STATUS priv_file_credential_provider_get(PAwsCredentialProvider pCredenti
     *ppAwsCredentials = pFileCredentialProvider->pAwsCredentials;
 
 CleanUp:
+
+    if (locked) {
+        MUTEX_UNLOCK(pFileCredentialProvider->lock);
+    }
 
     LEAVES();
     return retStatus;
@@ -237,6 +280,7 @@ static STATUS priv_file_credential_provider_read(PFileCredentialProvider pFileCr
     PCHAR expirationStr = NULL, secretKey = NULL;
     UINT32 accessKeyIdLen = 0, secretKeyLen = 0, sessionTokenLen = 0;
     UINT64 expiration, currentTime;
+    PAwsCredentials pNewCredentials = NULL;
 
     CHK(pFileCredentialProvider != NULL && pFileCredentialProvider->credentialsFilepath != NULL, STATUS_NULL_ARG);
 
@@ -309,13 +353,10 @@ static STATUS priv_file_credential_provider_read(PFileCredentialProvider pFileCr
 
     CHK(accessKeyIdLen != 0 && secretKeyLen != 0, STATUS_INVALID_AUTH_LEN);
 
-    if (pFileCredentialProvider->pAwsCredentials != NULL) {
-        aws_credential_free(&pFileCredentialProvider->pAwsCredentials);
-        pFileCredentialProvider->pAwsCredentials = NULL;
-    }
-
+    // Build the new credentials first: a failed create keeps the ones the provider had
     CHK_STATUS(aws_credential_create(accessKeyId, accessKeyIdLen, secretKey, secretKeyLen, sessionToken, sessionTokenLen, expiration,
-                                     &pFileCredentialProvider->pAwsCredentials));
+                                     &pNewCredentials));
+    aws_credential_replace(&pFileCredentialProvider->pAwsCredentials, &pFileCredentialProvider->pPrevAwsCredentials, pNewCredentials);
 
 CleanUp:
 
@@ -339,8 +380,13 @@ STATUS freeCallbackCredentialProvider(PAwsCredentialProvider* ppCredentialProvid
     // Call is idempotent
     CHK(pCbProvider != NULL, retStatus);
 
-    // Release the underlying AWS credentials object
+    // Release the underlying AWS credentials objects
     aws_credential_free(&pCbProvider->pAwsCredentials);
+    aws_credential_free(&pCbProvider->pPrevAwsCredentials);
+
+    if (IS_VALID_MUTEX_VALUE(pCbProvider->lock)) {
+        MUTEX_FREE(pCbProvider->lock);
+    }
 
     // Release the object
     MEMFREE(pCbProvider);

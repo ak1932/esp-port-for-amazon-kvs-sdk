@@ -32,6 +32,7 @@
 #define ESP_SIGNALING_FOLLOWS_WIFI 1
 #include "esp_wifi.h"
 #endif
+#include "aws_signed_request.h"
 #include "esp_work_queue.h"
 
 #include "DataBuffer.h"
@@ -56,9 +57,8 @@
 
 // HTTP-specific constants
 #define HTTP_RESPONSE_MAX_BUFFER_SIZE (4 * 1024) // Buffer to hold complete response
-#define HTTP_RESPONSE_BUFFER_SIZE (1 * 1024) // Internal response buffer for http client
-#define HTTP_REQUEST_BUFFER_SIZE (4 * 1024) // Request buffer for http client
 #define HTTP_REQUEST_TIMEOUT_MS   5000 // 5 seconds
+#define HTTP_REQUEST_EAGAIN_RETRIES 9  // A request is performed up to 10 times while it reports EAGAIN
 
 /* WebSocket connect timeout. On an ESP32-C6 the TLS handshake plus the upgrade
  * takes about 9 s, so 10 s gave up on connects that were about to complete.
@@ -207,60 +207,6 @@ void processWebSocketMessage(void *priv_data)
     // Free message data
     SAFE_MEMFREE(pMsgData->message);
     SAFE_MEMFREE(pMsgData);
-}
-
-typedef struct {
-    PCHAR responseData;
-    PUINT32 pResponseLen;
-    UINT32 currentLen;
-    UINT32 maxLen;
-    PSignalingClient pSignalingClient;
-} HttpResponseContext;
-
-/* UTC tm-to-epoch converter (adapted from ESP-RainMaker rmaker_timegm) */
-static inline int is_leap_year(int y) {
-    return ((y % 4 == 0) && (y % 100 != 0)) || (y % 400 == 0);
-}
-
-static time_t utc_tm_to_epoch(struct tm *tm)
-{
-    int year  = tm->tm_year + 1900;
-    int month = tm->tm_mon;
-
-    /* Normalize month */
-    if (month < 0) {
-        year += (month - 11) / 12;
-        month = 12 + (month % 12);
-    } else if (month > 11) {
-        year += month / 12;
-        month %= 12;
-    }
-
-    static const int mdays_cum[12] = {0,31,59,90,120,151,181,212,243,273,304,334};
-
-    int64_t days = 0;
-    if (year >= 1970) {
-        for (int y = 1970; y < year; ++y) {
-            days += 365 + is_leap_year(y);
-        }
-    } else {
-        for (int y = year; y < 1970; ++y) {
-            days -= 365 + is_leap_year(y);
-        }
-    }
-
-    days += mdays_cum[month];
-    if (month > 1 && is_leap_year(year)) {
-        days += 1;
-    }
-    days += (tm->tm_mday - 1);
-
-    int64_t seconds = days * 86400LL
-                    + (int64_t)tm->tm_hour * 3600
-                    + (int64_t)tm->tm_min  * 60
-                    + (int64_t)tm->tm_sec;
-
-    return (time_t)seconds;
 }
 
 /* Whether the station can carry traffic. It loses that on a disconnect and
@@ -424,7 +370,7 @@ static STATUS waitForNetwork(PSignalingClient pSignalingClient)
     return STATUS_SUCCESS;
 }
 
-// Function to check for clock skew from the given time, updates the clock skew in the hash table if detected
+// Function to check for clock skew from the given time; keeps the clock skew in the hash table in step with it
 STATUS checkAndStoreClockSkew(PSignalingClient pSignalingClient, PCHAR dateHeaderValue)
 {
     STATUS retStatus = STATUS_SUCCESS;
@@ -432,82 +378,59 @@ STATUS checkAndStoreClockSkew(PSignalingClient pSignalingClient, PCHAR dateHeade
     UINT64 clockSkew = 0;
     PHashTable pClockSkewMap = NULL;
     PStateMachineState pStateMachineState = NULL;
+    BOOL stored = FALSE;
 
     CHK(dateHeaderValue != NULL && pSignalingClient != NULL, STATUS_NULL_ARG);
 
-    // Get the current time
-    UINT64 nowTime = GETTIME();
+    if (STATUS_FAILED(awsClockSkewFromDate(dateHeaderValue, GETTIME(), &clockSkew, &serverTime))) {
+        ESP_LOGW(TAG, "Failed to parse date header: %s", dateHeaderValue);
+        CHK(FALSE, retStatus);
+    }
 
-    // Parse the date header to get server time using strptime
-    // Format: "Fri, 27 Jun 2025 12:27:54 GMT"
-    struct tm tm = {0};
-    if (strptime(dateHeaderValue, "%a, %d %b %Y %H:%M:%S GMT", &tm) != NULL) {
-        /* CRITICAL: Use utc_tm_to_epoch() NOT mktime()!
-         * mktime() interprets tm as LOCAL time and applies timezone offset.
-         * Since server sends GMT/UTC time, we must interpret it as UTC.
-         */
-        time_t serverEpochTime = utc_tm_to_epoch(&tm);
-        if (serverEpochTime != -1) {
-            // Convert to 100ns units (UINT64)
-            serverTime = ((UINT64)serverEpochTime) * HUNDREDS_OF_NANOS_IN_A_SECOND;
+    if (clockSkew != 0) {
+        ESP_LOGW(TAG, "Detected Clock Skew! %s time is AHEAD of %s time by %" PRIu64 " seconds",
+                 (clockSkew & AWS_CLOCK_SKEW_DEVICE_AHEAD) ? "Device" : "Server",
+                 (clockSkew & AWS_CLOCK_SKEW_DEVICE_AHEAD) ? "Server" : "Device",
+                 (clockSkew & ~AWS_CLOCK_SKEW_DEVICE_AHEAD) / HUNDREDS_OF_NANOS_IN_A_SECOND);
+    }
 
-            // Define time skew threshold (3 minutes in 100ns units)
-            #define TIME_SKEW_THRESHOLD (3 * 60 * HUNDREDS_OF_NANOS_IN_A_SECOND)
+    // Keep the stored skew in step with the clock: replace it when the
+    // skew changes and drop it once there is none. A skew stored before
+    // SNTP set the clock would otherwise be added to the corrected
+    // time, and every signed request after that is rejected as
+    // "Signature not yet current".
+    if (pSignalingClient->pStateMachine != NULL && pSignalingClient->diagnostics.pEndpointToClockSkewHashMap != NULL) {
+        CHK_STATUS(getStateMachineCurrentState(pSignalingClient->pStateMachine, &pStateMachineState));
+        pClockSkewMap = pSignalingClient->diagnostics.pEndpointToClockSkewHashMap;
 
-            // Calculate absolute difference
-            UINT64 timeDiff;
-            if (serverTime > nowTime) {
-                timeDiff = serverTime - nowTime;
-
-                // Check if beyond threshold
-                if (timeDiff > TIME_SKEW_THRESHOLD) {
-                    // Server time is ahead
-                    clockSkew = timeDiff;
-                    ESP_LOGW(TAG, "Detected Clock Skew! Server time is AHEAD of Device time by %" PRIu64 " seconds",
-                            timeDiff / HUNDREDS_OF_NANOS_IN_A_SECOND);
-                }
-            } else {
-                timeDiff = nowTime - serverTime;
-
-                // Check if beyond threshold
-                if (timeDiff > TIME_SKEW_THRESHOLD) {
-                    // Device time is ahead - set high bit to indicate this
-                    clockSkew = timeDiff;
-                    clockSkew |= ((UINT64) (1ULL << 63));
-                    ESP_LOGW(TAG, "Detected Clock Skew! Device time is AHEAD of Server time by %" PRIu64 " seconds",
-                            timeDiff / HUNDREDS_OF_NANOS_IN_A_SECOND);
-                }
-            }
-
-            // Keep the stored skew in step with the clock: replace it when the
-            // skew changes and drop it once there is none. A skew stored before
-            // SNTP set the clock would otherwise be added to the corrected
-            // time, and every signed request after that is rejected as
-            // "Signature not yet current".
-            if (pSignalingClient->pStateMachine != NULL &&
-                pSignalingClient->diagnostics.pEndpointToClockSkewHashMap != NULL) {
-                BOOL stored = FALSE;
-
-                CHK_STATUS(getStateMachineCurrentState(pSignalingClient->pStateMachine, &pStateMachineState));
-                pClockSkewMap = pSignalingClient->diagnostics.pEndpointToClockSkewHashMap;
-
-                if (clockSkew != 0) {
-                    // Update the global time
-                    gServerTime = serverTime;
-                    CHK_STATUS(hashTableUpsert(pClockSkewMap, pStateMachineState->state, clockSkew));
-                    ESP_LOGI(TAG, "Stored clock skew in hash table for state 0x%" PRIx64, pStateMachineState->state);
-                } else if (STATUS_SUCCEEDED(hashTableContains(pClockSkewMap, pStateMachineState->state, &stored)) && stored) {
-                    CHK_STATUS(hashTableRemove(pClockSkewMap, pStateMachineState->state));
-                    ESP_LOGI(TAG, "Clock skew gone, cleared it for state 0x%" PRIx64, pStateMachineState->state);
-                }
-            }
+        if (clockSkew != 0) {
+            // Update the global time
+            gServerTime = serverTime;
+            CHK_STATUS(hashTableUpsert(pClockSkewMap, pStateMachineState->state, clockSkew));
+            ESP_LOGI(TAG, "Stored clock skew in hash table for state 0x%" PRIx64, pStateMachineState->state);
+        } else if (STATUS_SUCCEEDED(hashTableContains(pClockSkewMap, pStateMachineState->state, &stored)) && stored) {
+            CHK_STATUS(hashTableRemove(pClockSkewMap, pStateMachineState->state));
+            ESP_LOGI(TAG, "Clock skew gone, cleared it for state 0x%" PRIx64, pStateMachineState->state);
         }
-    } else {
-        ESP_LOGW(TAG, "Failed to parse date header: %s", dateHeaderValue ? dateHeaderValue : "NULL");
     }
 
 CleanUp:
     return retStatus;
+}
+
+// The skew recorded for the current state, 0 if none
+static UINT64 clockSkewForCurrentState(PSignalingClient pSignalingClient)
+{
+    PStateMachineState pStateMachineState = NULL;
+    UINT64 clockSkew = 0;
+
+    if (pSignalingClient->pStateMachine != NULL && pSignalingClient->diagnostics.pEndpointToClockSkewHashMap != NULL &&
+        STATUS_SUCCEEDED(getStateMachineCurrentState(pSignalingClient->pStateMachine, &pStateMachineState)) &&
+        STATUS_FAILED(hashTableGet(pSignalingClient->diagnostics.pEndpointToClockSkewHashMap, pStateMachineState->state, &clockSkew))) {
+        clockSkew = 0;
+    }
+
+    return clockSkew;
 }
 
 // ESP WebSocket event handler
@@ -1222,35 +1145,13 @@ STATUS checkAndCorrectForClockSkew(PSignalingClient pSignalingClient, PRequestIn
 {
     ENTERS();
     STATUS retStatus = STATUS_SUCCESS;
-
-    PStateMachineState pStateMachineState;
-    PHashTable pClockSkewMap;
-    UINT64 clockSkewOffset;
+    UINT64 clockSkew;
 
     CHK(pSignalingClient != NULL && pRequestInfo != NULL, STATUS_NULL_ARG);
 
-    // Skip if we don't have a state machine or hash table
-    if (pSignalingClient->pStateMachine == NULL ||
-        pSignalingClient->diagnostics.pEndpointToClockSkewHashMap == NULL) {
-        CHK(FALSE, retStatus);
-    }
-
-    CHK_STATUS(getStateMachineCurrentState(pSignalingClient->pStateMachine, &pStateMachineState));
-
-    pClockSkewMap = pSignalingClient->diagnostics.pEndpointToClockSkewHashMap;
-
-    // Check if we have clockSkew for this endpoint
-    if (STATUS_SUCCEEDED(hashTableGet(pClockSkewMap, pStateMachineState->state, &clockSkewOffset))) {
-        // If we made it here that means there is clock skew
-        if (clockSkewOffset & ((UINT64) (1ULL << 63))) {
-            clockSkewOffset ^= ((UINT64) (1ULL << 63));
-            ESP_LOGD(TAG, "Detected device time is AHEAD of server time!");
-            pRequestInfo->currentTime -= clockSkewOffset;
-        } else {
-            ESP_LOGD(TAG, "Detected server time is AHEAD of device time!");
-            pRequestInfo->currentTime += clockSkewOffset;
-        }
-
+    clockSkew = clockSkewForCurrentState(pSignalingClient);
+    if (clockSkew != 0) {
+        awsApplyClockSkew(pRequestInfo, clockSkew);
         ESP_LOGW(TAG, "Clockskew corrected!");
     }
 
@@ -2609,40 +2510,14 @@ CleanUp:
     return retStatus;
 }
 
-// HTTP Event Handler
-static esp_err_t httpEventHandler(esp_http_client_event_t *evt)
+static VOID onServerDate(UINT64 customData, PCHAR pDate)
 {
-    HttpResponseContext* ctx = (HttpResponseContext*)evt->user_data;
+    PSignalingClient pSignalingClient = (PSignalingClient) HANDLE_TO_POINTER(customData);
 
-    switch(evt->event_id) {
-        case HTTP_EVENT_ON_HEADER:
-            // Check if the header is Date
-            if (strcasecmp(evt->header_key, "Date") == 0) {
-                ESP_LOGI(TAG, "Date Header from server: %s", evt->header_value);
-                if (STATUS_FAILED(checkAndStoreClockSkew(ctx->pSignalingClient, evt->header_value))) {
-                    ESP_LOGE(TAG, "Failed to check and store clock skew");
-                }
-            }
-            break;
-        case HTTP_EVENT_ON_DATA:
-            if (ctx != NULL && ctx->responseData != NULL && ctx->pResponseLen != NULL) {
-                // Check if we have enough space
-                if (ctx->currentLen + evt->data_len < ctx->maxLen) {
-                    // Copy data to buffer
-                    MEMCPY(ctx->responseData + ctx->currentLen, evt->data, evt->data_len);
-                    ctx->currentLen += evt->data_len;
-                    ctx->responseData[ctx->currentLen] = '\0'; // Null terminate
-                    *ctx->pResponseLen = ctx->currentLen;
-                } else {
-                    ESP_LOGE(TAG, "HTTP response buffer too small");
-                    return ESP_FAIL;
-                }
-            }
-            break;
-        default:
-            break;
+    ESP_LOGI(TAG, "Date Header from server: %s", pDate);
+    if (STATUS_FAILED(checkAndStoreClockSkew(pSignalingClient, pDate))) {
+        ESP_LOGE(TAG, "Failed to check and store clock skew");
     }
-    return ESP_OK;
 }
 
 // Helper function to perform HTTP requests
@@ -2651,13 +2526,10 @@ STATUS performEspHttpRequest(PSignalingClient pSignalingClient, PCHAR url,
                           PCHAR* pResponseData, PUINT32 pResponseLen)
 {
     STATUS retStatus = STATUS_SUCCESS;
-    esp_http_client_handle_t client = NULL;
-    esp_http_client_config_t config = {0};
-    HttpResponseContext context = {0};
+    AwsSignedHttpRequest request = {0};
     PCHAR response = NULL;
     UINT32 responseLen = 0;
-    PRequestInfo pRequestInfo = NULL;
-    PAwsCredentials pAwsCredentials = NULL;
+    UINT32 statusCode = 0;
 
     CHK(pSignalingClient != NULL && url != NULL, STATUS_NULL_ARG);
 
@@ -2666,163 +2538,44 @@ STATUS performEspHttpRequest(PSignalingClient pSignalingClient, PCHAR url,
     // Initialize the global CA store
     CHK_STATUS(initializeGlobalCaStore());
 
-    // Allocate response buffer
-    response = (PCHAR) MEMALLOC(HTTP_RESPONSE_MAX_BUFFER_SIZE);
-    CHK(response != NULL, STATUS_NOT_ENOUGH_MEMORY);
-    response[0] = '\0';
-
     ESP_LOGD(TAG, "Sending HTTP request to %s", url);
 
-    // Set up context
-    context.responseData = response;
-    context.pResponseLen = &responseLen;
-    context.currentLen = 0;
-    context.maxLen = HTTP_RESPONSE_MAX_BUFFER_SIZE - 1; // Leave space for null terminator
-    context.pSignalingClient = pSignalingClient; // Set the signaling client pointer
+    request.pUrl = url;
+    request.verb = (method == HTTP_METHOD_GET) ? HTTP_REQUEST_VERB_GET : (method == HTTP_METHOD_PUT) ? HTTP_REQUEST_VERB_PUT : HTTP_REQUEST_VERB_POST;
+    request.pBody = body;
+    request.pRegion = pSignalingClient->pChannelInfo->pRegion;
+    request.pAwsCredentials = pSignalingClient->pAwsCredentials;
+    request.pUserAgent = (PCHAR) "KVS-ESP32";
+    request.timeoutMs = HTTP_REQUEST_TIMEOUT_MS;
+    request.maxResponseLen = HTTP_RESPONSE_MAX_BUFFER_SIZE - 1;
+    request.eagainRetries = HTTP_REQUEST_EAGAIN_RETRIES;
+    request.clockSkew = clockSkewForCurrentState(pSignalingClient);
+    request.serverDateFn = onServerDate;
+    request.customData = POINTER_TO_HANDLE(pSignalingClient);
 
-    // Create a RequestInfo structure for SigV4 signing
-    if (pSignalingClient->pAwsCredentials != NULL) {
-        pAwsCredentials = pSignalingClient->pAwsCredentials;
-
-        // Create RequestInfo for SigV4 signing
-        CHK_STATUS(createRequestInfo(
-            url,
-            body,
-            pSignalingClient->pChannelInfo->pRegion,
-            NULL, // certPath
-            NULL, // sslCertPath
-            NULL, // sslPrivateKeyPath
-            SSL_CERTIFICATE_TYPE_NOT_SPECIFIED,
-            "KVS-ESP32", // userAgent
-            HTTP_REQUEST_TIMEOUT_MS * HUNDREDS_OF_NANOS_IN_A_MILLISECOND, // connectionTimeout
-            HTTP_REQUEST_TIMEOUT_MS * HUNDREDS_OF_NANOS_IN_A_MILLISECOND, // completionTimeout
-            0, // lowSpeedLimit
-            0, // lowSpeedTimeLimit
-            pAwsCredentials,
-            &pRequestInfo));
-
-        // Set the HTTP method
-        switch (method) {
-            case HTTP_METHOD_GET:
-                pRequestInfo->verb = HTTP_REQUEST_VERB_GET;
-                break;
-            case HTTP_METHOD_POST:
-                pRequestInfo->verb = HTTP_REQUEST_VERB_POST;
-                break;
-            case HTTP_METHOD_PUT:
-                pRequestInfo->verb = HTTP_REQUEST_VERB_PUT;
-                break;
-            // case HTTP_METHOD_DELETE:
-            //     pRequestInfo->verb = HTTP_REQUEST_VERB_DELETE;
-            //     break;
-            default:
-                pRequestInfo->verb = HTTP_REQUEST_VERB_POST;
-                break;
-        }
-
-        // Check and correct for clock skew before signing
-        checkAndCorrectForClockSkew(pSignalingClient, pRequestInfo);
-
-        // Sign the request using AWS SigV4
-        CHK_STATUS(signAwsRequestInfo(pRequestInfo));
-    }
-
-    // Configure HTTP client
-    config.url = url;
-    config.method = method;
-    config.event_handler = httpEventHandler;
-    config.user_data = &context;
-    config.timeout_ms = HTTP_REQUEST_TIMEOUT_MS;
-    config.buffer_size = HTTP_RESPONSE_BUFFER_SIZE;
-    config.buffer_size_tx = HTTP_REQUEST_BUFFER_SIZE;
-    config.crt_bundle_attach = esp_crt_bundle_attach;
-
-    // Initialize HTTP client
-    client = esp_http_client_init(&config);
-    CHK(client != NULL, STATUS_INTERNAL_ERROR);
-
-    // Set common headers
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_header(client, "Accept", "application/json");
-
-    // Add AWS SigV4 headers if request was signed
-    if (pRequestInfo != NULL) {
-        PSingleListNode pCurNode = NULL;
-        PRequestHeader pRequestHeader = NULL;
-        UINT64 item;
-
-        // Get the list of headers from signed request
-        CHK_STATUS(singleListGetHeadNode(pRequestInfo->pRequestHeaders, &pCurNode));
-
-        // Add each header to the ESP HTTP client request
-        while (pCurNode != NULL) {
-            CHK_STATUS(singleListGetNodeData(pCurNode, &item));
-            // Fix the unsafe cast by using a proper macro or cast method
-            pRequestHeader = (PRequestHeader)(ULONG_PTR)item;
-
-            esp_http_client_set_header(client, pRequestHeader->pName, pRequestHeader->pValue);
-
-            CHK_STATUS(singleListGetNextNode(pCurNode, &pCurNode));
-        }
-
-        // Early cleanup of request info
-        if (pRequestInfo != NULL) {
-            freeRequestInfo(&pRequestInfo);
-        }
-    }
-
-    // Set body if provided
-    if (body != NULL) {
-        esp_http_client_set_post_field(client, body, STRLEN(body));
-    }
-
-    // Perform request
-    esp_err_t err = ESP_OK;
-    const int retryCount = 10;
-    for (int i = 0; i < retryCount; i++) {
-        err = esp_http_client_perform(client);
-        if (err == ESP_ERR_HTTP_EAGAIN) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue; // retry
-        }
-        if (err == ESP_OK) {
-            break;
-        }
-        break;
-    }
-
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "HTTP request failed with error 0x%x: %s", err, esp_err_to_name(err));
-        noteNetworkError(esp_http_client_get_errno(client));
+    retStatus = awsSignedHttpRequest(&request, &statusCode, &response, &responseLen);
+    if (retStatus == STATUS_HTTP_NO_RESPONSE) {
+        noteNetworkError(request.transportErrno);
         // Store network connection timeout as the result
-        if (pSignalingClient != NULL) {
-            ATOMIC_STORE(&pSignalingClient->result, (SIZE_T) SERVICE_CALL_NETWORK_CONNECTION_TIMEOUT);
-        }
+        ATOMIC_STORE(&pSignalingClient->result, (SIZE_T) SERVICE_CALL_NETWORK_CONNECTION_TIMEOUT);
         CHK(FALSE, STATUS_INTERNAL_ERROR);
     }
-
-    // Check status code
-    int statusCode = esp_http_client_get_status_code(client);
+    CHK_STATUS(retStatus);
 
     if (statusCode < 200 || statusCode >= 300) {
-        ESP_LOGE(TAG, "HTTP request failed with status code %d", statusCode);
-        if (response != NULL && responseLen > 0) {
+        ESP_LOGE(TAG, "HTTP request failed with status code %" PRIu32, statusCode);
+        if (responseLen > 0) {
             UINT32 previewLen = MIN(responseLen, 500);
             ESP_LOGE(TAG, "Error response (first %u bytes): %.*s", (unsigned) previewLen, (int) previewLen, response);
         }
         // Convert HTTP status code to SERVICE_CALL_RESULT and store it
-        if (pSignalingClient != NULL) {
-            SERVICE_CALL_RESULT serviceCallResult = getServiceCallResultFromHttpStatus(statusCode);
-            ATOMIC_STORE(&pSignalingClient->result, (SIZE_T) serviceCallResult);
-        }
+        ATOMIC_STORE(&pSignalingClient->result, (SIZE_T) getServiceCallResultFromHttpStatus(statusCode));
         CHK(FALSE, STATUS_INTERNAL_ERROR);
     }
 
     // HTTP request succeeded - set result to OK before parsing
     // This ensures the state machine sees a valid result even if parsing fails
-    if (pSignalingClient != NULL) {
-        ATOMIC_STORE(&pSignalingClient->result, (SIZE_T) SERVICE_CALL_RESULT_OK);
-    }
+    ATOMIC_STORE(&pSignalingClient->result, (SIZE_T) SERVICE_CALL_RESULT_OK);
 
     // Set response if requested
     if (pResponseData != NULL && pResponseLen != NULL) {
@@ -2832,14 +2585,6 @@ STATUS performEspHttpRequest(PSignalingClient pSignalingClient, PCHAR url,
     }
 
 CleanUp:
-    if (client != NULL) {
-        esp_http_client_cleanup(client);
-    }
-
-    if (pRequestInfo != NULL) {
-        freeRequestInfo(&pRequestInfo);
-    }
-
     SAFE_MEMFREE(response);
 
     return retStatus;

@@ -15,6 +15,7 @@
 
 // For callback based credentials provider
 #include "file_credential_provider.h"
+#include "credential_provider_view.h"
 
 #ifdef CONFIG_USE_ESP_WEBSOCKET_CLIENT
 #include "Signaling_esp.h"
@@ -912,8 +913,15 @@ STATUS createCredentialProvider(KvsSignalingClientData *pClientData)
     ESP_LOGI(TAG, "Credential type: %s", pClientData->config.useIotCredentials ? "IoT Core" : "Static");
 
     // Create credential provider based on type
-    if (pClientData->config.fetch_credentials_cb != NULL) {
-        // Highest precedence: callback-based credentials supplier
+    if (pClientData->config.pCredentialProvider != NULL) {
+        // Highest precedence: the application's own provider, read through a view. The SDK keeps
+        // the credentials from GET_TOKEN until it next asks; the view's copy outlives the
+        // refreshes the provider's other users cause in between.
+        CHK_STATUS(createCredentialProviderView((PAwsCredentialProvider) pClientData->config.pCredentialProvider,
+                                                &pClientData->pCredentialProvider));
+        ESP_LOGI(TAG, "Using the application's credential provider");
+    } else if (pClientData->config.fetch_credentials_cb != NULL) {
+        // Next: callback-based credentials supplier
         kvs_cred_fetch_ctx_t *ctx = (kvs_cred_fetch_ctx_t*) MEMCALLOC(1, SIZEOF(kvs_cred_fetch_ctx_t));
         CHK(ctx != NULL, STATUS_NOT_ENOUGH_MEMORY);
         ctx->cb = (kvs_fetch_credentials_cb_t) pClientData->config.fetch_credentials_cb;
@@ -1377,9 +1385,11 @@ STATUS freeKvsSignalingClient(PVOID pSignalingClient)
         }
     }
 
-    // Free the credential provider
+    // Free the credential provider; of the application's, only the view
     if (pClientData->pCredentialProvider != NULL) {
-        if (pClientData->config.fetch_credentials_cb != NULL) {
+        if (pClientData->config.pCredentialProvider != NULL) {
+            freeCredentialProviderView(&pClientData->pCredentialProvider);
+        } else if (pClientData->config.fetch_credentials_cb != NULL) {
             // Callback-based credential provider
             freeCallbackCredentialProvider(&pClientData->pCredentialProvider);
         } else if (pClientData->config.useIotCredentials) {
@@ -1413,6 +1423,11 @@ STATUS freeKvsSignalingClient(PVOID pSignalingClient)
     MEMFREE(pClientData);
 
 CleanUp:
+    // A leaked client still runs: cut it off from the application's provider, which the
+    // application may free once this returns. It signs with its copy until that expires.
+    if (STATUS_FAILED(retStatus) && pClientData != NULL && pClientData->config.pCredentialProvider != NULL) {
+        detachCredentialProviderView(pClientData->pCredentialProvider);
+    }
     return retStatus;
 }
 

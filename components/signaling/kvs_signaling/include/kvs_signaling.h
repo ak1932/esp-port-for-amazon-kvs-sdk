@@ -62,6 +62,13 @@ typedef struct {
 
     kvs_fetch_credentials_cb_t fetch_credentials_cb; //!< Application-provided callback
     uint64_t fetch_credentials_user_data;            //!< Opaque user data passed to fetch_credentials_cb
+
+    // Optional: a credential provider the application owns, e.g. one it shares with another KVS client.
+    // If set, it takes precedence over all of the above. Signaling reads it through its own view
+    // (credential_provider_view.h) and never frees it. Signaling stops using it once
+    // freeKvsSignalingClient() returns, even when that fails, so the application keeps it alive
+    // until then.
+    void *pCredentialProvider;                       //!< PAwsCredentialProvider (credential component)
 } kvs_signaling_config_t;
 
 /**

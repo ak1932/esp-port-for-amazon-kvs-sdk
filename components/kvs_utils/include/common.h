@@ -298,6 +298,33 @@ extern "C" {
 #define CONTROL_PLANE_URI_POSTFIX ".amazonaws.com"
 
 /**
+ * Regional variants: the FIPS service name and the China, ISO and dual-stack domains
+ */
+#define AWS_KVS_FIPS_ENDPOINT_POSTFIX "-fips"
+
+#define CONTROL_PLANE_URI_POSTFIX_CN ".amazonaws.com.cn"
+
+#define CONTROL_PLANE_URI_POSTFIX_ISO ".c2s.ic.gov"
+
+#define CONTROL_PLANE_URI_POSTFIX_ISO_B ".sc2s.sgov.gov"
+
+#define CONTROL_PLANE_URI_POSTFIX_DUAL_STACK ".api.aws"
+
+#define CONTROL_PLANE_URI_POSTFIX_CN_DUAL_STACK ".api.amazonwebservices.com.cn"
+
+#define CONTROL_PLANE_URI_POSTFIX_ISO_DUAL_STACK ".api.aws.ic.gov"
+
+#define CONTROL_PLANE_URI_POSTFIX_ISO_B_DUAL_STACK ".api.aws.scloud"
+
+#define AWS_ISO_B_REGION_PREFIX "us-isob-"
+
+#define AWS_ISO_REGION_PREFIX "us-iso-"
+
+#define AWS_GOV_CLOUD_REGION_PREFIX "us-gov-"
+
+#define AWS_CN_REGION_PREFIX "cn-"
+
+/**
  * Default user agent name
  */
 #define DEFAULT_USER_AGENT_NAME "AWS-SDK-KVS"

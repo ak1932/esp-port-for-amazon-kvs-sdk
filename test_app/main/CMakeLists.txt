@@ -6,6 +6,7 @@ set(srcs
     "test_crc32.c"
     "test_state_machine.c"
     "test_aws_signer_v4.c"
+    "test_kvs_control_plane_url.c"
     "test_pending_ice.c"
     "test_stale_peer_watchdog.c"
     "test_bridge_ready_query.c"

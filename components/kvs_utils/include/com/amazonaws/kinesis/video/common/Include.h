@@ -67,10 +67,7 @@ extern "C" {
  */
 #define MAX_REGION_NAME_LEN 128
 
-/**
- * Maximum allowed user agent string length
- */
-#define MAX_USER_AGENT_LEN 256
+/* MAX_USER_AGENT_LEN is in common.h. */
 
 /**
  * Maximum allowed custom user agent string length
@@ -257,44 +254,8 @@ extern "C" {
  */
 #define DEFAULT_CANONICAL_URI_STRING (PCHAR) "/"
 
-/**
- * Control plane prefix
- */
-#define CONTROL_PLANE_URI_PREFIX "https://"
-
-/**
- * KVS service name
- */
-#define KINESIS_VIDEO_SERVICE_NAME "kinesisvideo"
-
-#define AWS_KVS_FIPS_ENDPOINT_POSTFIX "-fips"
-
-/**
- * Control plane postfix
- */
-#define CONTROL_PLANE_URI_POSTFIX ".amazonaws.com"
-
-#define CONTROL_PLANE_URI_POSTFIX_CN ".amazonaws.com.cn"
-
-#define CONTROL_PLANE_URI_POSTFIX_ISO ".c2s.ic.gov"
-
-#define CONTROL_PLANE_URI_POSTFIX_ISO_B ".sc2s.sgov.gov"
-
-#define CONTROL_PLANE_URI_POSTFIX_DUAL_STACK ".api.aws"
-
-#define CONTROL_PLANE_URI_POSTFIX_CN_DUAL_STACK ".api.amazonwebservices.com.cn"
-
-#define CONTROL_PLANE_URI_POSTFIX_ISO_DUAL_STACK ".api.aws.ic.gov"
-
-#define CONTROL_PLANE_URI_POSTFIX_ISO_B_DUAL_STACK ".api.aws.scloud"
-
-#define AWS_ISO_B_REGION_PREFIX "us-isob-"
-
-#define AWS_ISO_REGION_PREFIX "us-iso-"
-
-#define AWS_GOV_CLOUD_REGION_PREFIX "us-gov-"
-
-#define AWS_CN_REGION_PREFIX "cn-"
+/* The control-plane URL parts (CONTROL_PLANE_URI_PREFIX, KINESIS_VIDEO_SERVICE_NAME,
+ * CONTROL_PLANE_URI_POSTFIX and their FIPS, China, ISO and dual-stack variants) are in common.h. */
 
 /**
  * Default user agent name
@@ -617,6 +578,18 @@ PUBLIC_API STATUS getRequestHost(PCHAR, PCHAR*, PCHAR*);
  * @return STATUS code of the execution. STATUS_SUCCESS on success
  */
 PUBLIC_API BOOL compareJsonString(PCHAR, jsmntok_t*, jsmntype_t, PCHAR);
+
+/**
+ * @brief Builds the KVS control-plane URL for a region, e.g. https://kinesisvideo.us-east-1.amazonaws.com,
+ * with the FIPS service name and the CN/ISO/ISO-B domains where they apply
+ *
+ * @param[in] PCHAR AWS region
+ * @param[out] PCHAR Buffer for the URL
+ * @param[in] UINT32 Buffer size, including the terminator
+ *
+ * @return STATUS code of the execution. STATUS_SUCCESS on success
+ */
+PUBLIC_API STATUS getKvsControlPlaneUrl(PCHAR, PCHAR, UINT32);
 
 /**
  * @brief Converts the timestamp string to time

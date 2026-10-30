@@ -105,6 +105,40 @@ BOOL compareJsonString(PCHAR pJsonStr, jsmntok_t* pToken, jsmntype_t jsmnType, P
     }
 }
 
+STATUS getKvsControlPlaneUrl(PCHAR pRegion, PCHAR pUrl, UINT32 urlLen)
+{
+    STATUS retStatus = STATUS_SUCCESS;
+    PCHAR pServiceName = (PCHAR) KINESIS_VIDEO_SERVICE_NAME;
+    PCHAR pPostfix = (PCHAR) CONTROL_PLANE_URI_POSTFIX;
+    INT32 written;
+
+    CHK(pRegion != NULL && pUrl != NULL, STATUS_NULL_ARG);
+    CHK(pRegion[0] != '\0' && urlLen > 0, STATUS_INVALID_ARG);
+
+    /* The SDK's ChannelInfo.c rules. Its dual-stack variant hangs off an environment
+     * variable, which isEnvVarEnabled() never reports on ESP-IDF. */
+    if (STRNCMP(pRegion, AWS_GOV_CLOUD_REGION_PREFIX, STRLEN(AWS_GOV_CLOUD_REGION_PREFIX)) == 0 ||
+        STRNCMP(pRegion, AWS_ISO_REGION_PREFIX, STRLEN(AWS_ISO_REGION_PREFIX)) == 0 ||
+        STRNCMP(pRegion, AWS_ISO_B_REGION_PREFIX, STRLEN(AWS_ISO_B_REGION_PREFIX)) == 0) {
+        pServiceName = (PCHAR) KINESIS_VIDEO_SERVICE_NAME AWS_KVS_FIPS_ENDPOINT_POSTFIX;
+    }
+
+    if (STRSTR(pRegion, AWS_CN_REGION_PREFIX) != NULL) {
+        pPostfix = (PCHAR) CONTROL_PLANE_URI_POSTFIX_CN;
+    } else if (STRNCMP(pRegion, AWS_ISO_REGION_PREFIX, STRLEN(AWS_ISO_REGION_PREFIX)) == 0) {
+        pPostfix = (PCHAR) CONTROL_PLANE_URI_POSTFIX_ISO;
+    } else if (STRNCMP(pRegion, AWS_ISO_B_REGION_PREFIX, STRLEN(AWS_ISO_B_REGION_PREFIX)) == 0) {
+        pPostfix = (PCHAR) CONTROL_PLANE_URI_POSTFIX_ISO_B;
+    }
+
+    written = SNPRINTF(pUrl, urlLen, "%s%s.%s%s", CONTROL_PLANE_URI_PREFIX, pServiceName, pRegion, pPostfix);
+    CHK(written > 0 && (UINT32) written < urlLen, STATUS_BUFFER_TOO_SMALL);
+
+CleanUp:
+
+    return retStatus;
+}
+
 UINT64 commonDefaultGetCurrentTimeFunc(UINT64 customData)
 {
     UNUSED_PARAM(customData);

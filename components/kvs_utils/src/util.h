@@ -36,6 +36,17 @@ UINT64 commonDefaultGetCurrentTimeFunc(UINT64);
  */
 BOOL compareJsonString(PCHAR, jsmntok_t*, jsmntype_t, PCHAR);
 /**
+ * @brief Builds the KVS control-plane URL for a region, e.g. https://kinesisvideo.us-east-1.amazonaws.com,
+ * with the FIPS service name and the CN/ISO/ISO-B domains where they apply
+ *
+ * @param[in] pRegion AWS region
+ * @param[out] pUrl Buffer for the URL
+ * @param[in] urlLen Buffer size, including the terminator
+ *
+ * @return - STATUS code of the execution
+ */
+STATUS getKvsControlPlaneUrl(PCHAR pRegion, PCHAR pUrl, UINT32 urlLen);
+/**
  * @brief Converts the timestamp string to time
  *
  * @param[in] expirationTimestampStr String to covert/compare
